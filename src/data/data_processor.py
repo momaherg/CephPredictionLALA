@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import numpy as np
 from .dataset import create_dataloaders
+from .patient_classifier import PatientClassifier
 
 class DataProcessor:
     def __init__(self, data_path, landmark_cols=None, image_size=(224, 224), apply_clahe=True):
@@ -19,6 +20,12 @@ class DataProcessor:
         self.image_size = image_size
         self.apply_clahe = apply_clahe
         self.df = None
+        
+        # Create classifier if landmark columns are provided
+        if landmark_cols:
+            self.classifier = PatientClassifier(landmark_cols)
+        else:
+            self.classifier = None
     
     def load_data(self):
         """
@@ -37,10 +44,13 @@ class DataProcessor:
         print(f"Loaded dataset with {len(self.df)} records and {len(self.df.columns)} columns")
         return self.df
     
-    def preprocess_data(self):
+    def preprocess_data(self, balance_classes=False):
         """
         Preprocess the loaded dataset
         
+        Args:
+            balance_classes (bool): Whether to balance classes based on skeletal classification
+            
         Returns:
             pandas.DataFrame: The preprocessed dataset
         """
@@ -79,9 +89,21 @@ class DataProcessor:
                 self.df = self.df[valid_images]
                 print(f"Removed invalid images. Remaining records: {len(self.df)}")
         
+        # Compute patient classes and balance if requested
+        if balance_classes and self.classifier is not None:
+            print("Computing skeletal classifications for patients...")
+            self.df = self.classifier.classify_patients(self.df)
+            
+            print("Balancing dataset by upsampling minority classes...")
+            self.df = self.classifier.balance_classes(
+                self.df, 
+                class_column='skeletal_class', 
+                balance_method='upsample'
+            )
+        
         return self.df
     
-    def create_data_loaders(self, batch_size=32, train_ratio=0.8, val_ratio=0.1, num_workers=4, root_dir=None):
+    def create_data_loaders(self, batch_size=32, train_ratio=0.8, val_ratio=0.1, num_workers=4, root_dir=None, balance_classes=False):
         """
         Create data loaders for training, validation, and testing
         
@@ -91,12 +113,13 @@ class DataProcessor:
             val_ratio (float): Ratio of data to use for validation (if 'set' column is not present)
             num_workers (int): Number of worker threads for data loading
             root_dir (str): Directory containing image files (if images are stored as files)
+            balance_classes (bool): Whether to balance classes based on skeletal classification
             
         Returns:
             tuple: (train_loader, val_loader, test_loader)
         """
-        if self.df is None:
-            self.preprocess_data()
+        if self.df is None or balance_classes:  # Re-preprocess if balancing requested
+            self.preprocess_data(balance_classes=balance_classes)
         
         # Create data loaders
         train_loader, val_loader, test_loader = create_dataloaders(
@@ -111,6 +134,54 @@ class DataProcessor:
         )
         
         return train_loader, val_loader, test_loader
+    
+    def compute_patient_classes(self):
+        """
+        Compute skeletal class for each patient based on ANB angle
+        
+        Returns:
+            pandas.DataFrame: DataFrame with added skeletal classification
+        """
+        if self.df is None:
+            self.load_data()
+        
+        if self.classifier is None:
+            if self.landmark_cols:
+                self.classifier = PatientClassifier(self.landmark_cols)
+            else:
+                raise ValueError("Landmark columns must be provided to compute patient classes")
+        
+        self.df = self.classifier.classify_patients(self.df)
+        return self.df
+    
+    def balance_dataset(self, method='upsample', class_column='skeletal_class'):
+        """
+        Balance the dataset based on a specified class column
+        
+        Args:
+            method (str): Method to balance the dataset ('upsample' or 'downsample')
+            class_column (str): Column to balance by
+            
+        Returns:
+            pandas.DataFrame: Balanced DataFrame
+        """
+        if self.df is None:
+            self.load_data()
+        
+        if class_column not in self.df.columns and class_column == 'skeletal_class':
+            print("Computing skeletal classifications before balancing...")
+            self.compute_patient_classes()
+            
+        if self.classifier is None:
+            raise ValueError("Patient classifier is required for dataset balancing")
+        
+        self.df = self.classifier.balance_classes(
+            self.df,
+            class_column=class_column, 
+            balance_method=method
+        )
+        
+        return self.df
     
     def get_data_stats(self):
         """
@@ -136,6 +207,23 @@ class DataProcessor:
         if 'class' in self.df.columns:
             class_counts = self.df['class'].value_counts().to_dict()
             stats['class_counts'] = class_counts
+        
+        # Count samples by skeletal class if available
+        if 'skeletal_class' in self.df.columns:
+            skeletal_class_counts = self.df['skeletal_class'].value_counts().to_dict()
+            stats['skeletal_class_counts'] = skeletal_class_counts
+            
+            # Add skeletal class names for clarity
+            class_names = {
+                1: "Class I (Normal)",
+                2: "Class II (Prognathic maxilla)",
+                3: "Class III (Retrognathic maxilla)"
+            }
+            
+            stats['skeletal_class_names'] = {
+                k: class_names.get(k, f"Unknown ({k})") 
+                for k in skeletal_class_counts.keys()
+            }
         
         # Get landmark statistics if available
         if self.landmark_cols:

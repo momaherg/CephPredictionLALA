@@ -46,6 +46,11 @@ def parse_args():
     parser.add_argument('--heatmap_weight', type=float, default=1.0, help='Weight for heatmap loss')
     parser.add_argument('--coord_weight', type=float, default=0.1, help='Weight for coordinate loss')
     
+    # Data balancing arguments
+    parser.add_argument('--balance_classes', action='store_true', help='Balance classes using skeletal classification')
+    parser.add_argument('--balance_method', type=str, choices=['upsample', 'downsample'], default='upsample', 
+                        help='Method to balance classes')
+    
     # Device arguments
     parser.add_argument('--use_mps', action='store_true', help='Use Metal Performance Shaders (MPS) for Mac GPU acceleration')
     parser.add_argument('--force_cpu', action='store_true', help='Force CPU usage even if GPU is available')
@@ -69,7 +74,7 @@ def set_seed(seed):
 def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16, 
                                         train_ratio=0.8, val_ratio=0.1, 
                                         apply_clahe=True, root_dir=None, 
-                                        num_workers=4):
+                                        num_workers=4, balance_classes=False):
     """
     Create train, validation, and test DataLoaders with proper augmentations
     
@@ -82,6 +87,7 @@ def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16,
         apply_clahe (bool): Whether to apply CLAHE for histogram equalization
         root_dir (str): Directory containing images (if images are stored as files)
         num_workers (int): Number of worker threads for dataloader
+        balance_classes (bool): Whether to balance training data using skeletal classification
         
     Returns:
         tuple: (train_loader, val_loader, test_loader)
@@ -106,6 +112,14 @@ def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16,
         train_df = df.iloc[train_indices]
         val_df = df.iloc[val_indices]
         test_df = df.iloc[test_indices]
+    
+    # Balance training data if requested
+    if balance_classes and 'skeletal_class' in df.columns:
+        print("Balancing training data using skeletal classification...")
+        from data.patient_classifier import PatientClassifier
+        classifier = PatientClassifier(landmark_cols)
+        train_df = classifier.balance_classes(train_df, class_column='skeletal_class', balance_method='upsample')
+        print(f"Balanced training data: {len(train_df)} samples")
     
     # Define data transformations (non-augmentation)
     base_transforms = transforms.Compose([
@@ -183,7 +197,11 @@ def main():
     )
     
     # Load and preprocess data
-    df = data_processor.preprocess_data()
+    if args.balance_classes:
+        print("Computing skeletal classifications and balancing the dataset...")
+        df = data_processor.preprocess_data(balance_classes=True)
+    else:
+        df = data_processor.preprocess_data()
     
     # Get dataset statistics
     stats = data_processor.get_data_stats()
@@ -199,6 +217,12 @@ def main():
         print("Class counts:")
         for class_name, count in stats['class_counts'].items():
             print(f"  {class_name}: {count}")
+    
+    if 'skeletal_class_counts' in stats:
+        print("Skeletal Class Distribution:")
+        for class_label, count in stats['skeletal_class_counts'].items():
+            class_name = stats['skeletal_class_names'].get(class_label, str(class_label))
+            print(f"  {class_name}: {count} patients ({count/stats['total_samples']*100:.1f}%)")
     
     # Check MPS availability for Mac users
     if args.use_mps and platform.system() == 'Darwin':
@@ -218,7 +242,8 @@ def main():
         val_ratio=0.1,
         apply_clahe=args.apply_clahe,
         root_dir=None,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        balance_classes=args.balance_classes  # Pass balance_classes parameter
     )
     
     print(f"Created data loaders:")
@@ -241,6 +266,8 @@ def main():
     if args.use_refinement:
         print(f"  Heatmap loss weight: {args.heatmap_weight}")
         print(f"  Coordinate loss weight: {args.coord_weight}")
+    if args.balance_classes:
+        print(f"  Class balancing: {args.balance_method}")
     print(f"  Device: {'MPS (Mac GPU)' if args.use_mps else 'CUDA' if torch.cuda.is_available() and not args.force_cpu else 'CPU'}")
     print(f"  Output directory: {args.output_dir}")
     
