@@ -394,7 +394,7 @@ class LandmarkTrainer:
         plt.savefig(os.path.join(self.output_dir, 'training_curves.png'))
         plt.close()
     
-    def evaluate(self, test_loader, save_visualizations=True, landmark_names=None):
+    def evaluate(self, test_loader, save_visualizations=True, landmark_names=None, landmark_cols=None):
         """
         Evaluate the model on test data
         
@@ -402,6 +402,7 @@ class LandmarkTrainer:
             test_loader (DataLoader): DataLoader for test data
             save_visualizations (bool): Whether to save visualization images
             landmark_names (list, optional): Names of landmarks for better reporting
+            landmark_cols (list, optional): List of landmark column names for skeletal classification
             
         Returns:
             dict: Evaluation results
@@ -452,7 +453,8 @@ class LandmarkTrainer:
             targets=all_targets,
             landmark_names=landmark_names,
             output_dir=report_dir,
-            thresholds=[2.0, 4.0, 6.0]
+            thresholds=[2.0, 4.0, 6.0],
+            landmark_cols=landmark_cols  # Pass landmark_cols for skeletal classification
         )
         
         # Create results dictionary
@@ -476,6 +478,15 @@ class LandmarkTrainer:
         for i, (idx, med_val) in enumerate(zip(worst_landmarks, worst_med)):
             name = landmark_names[idx] if landmark_names else f"Landmark {idx+1}"
             print(f"  {i+1}. {name}: {med_val:.2f} pixels")
+        
+        # Print skeletal classification results if available
+        if 'classification' in detailed_report:
+            class_results = detailed_report['classification']
+            print("\nSkeletal Classification Results:")
+            print(f"  Classification Accuracy: {class_results['accuracy']*100:.2f}%")
+            print(f"  Mean ANB Angle Error: {class_results['ANB_error_mean']:.2f}°")
+            print(f"  Mean SNA Angle Error: {class_results['SNA_error_mean']:.2f}°")
+            print(f"  Mean SNB Angle Error: {class_results['SNB_error_mean']:.2f}°")
         
         print(f"\nDetailed report saved to: {report_dir}")
         

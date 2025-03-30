@@ -47,9 +47,10 @@ def parse_args():
     parser.add_argument('--coord_weight', type=float, default=0.1, help='Weight for coordinate loss')
     
     # Data balancing arguments
-    parser.add_argument('--balance_classes', action='store_true', help='Balance classes using skeletal classification')
+    parser.add_argument('--balance_classes', action='store_true', 
+                       help='Balance training data based on skeletal classification (preserves validation and test distributions)')
     parser.add_argument('--balance_method', type=str, choices=['upsample', 'downsample'], default='upsample', 
-                        help='Method to balance classes')
+                        help='Method to balance training data classes (upsample: duplicate minority classes, downsample: reduce majority class)')
     
     # Device arguments
     parser.add_argument('--use_mps', action='store_true', help='Use Metal Performance Shaders (MPS) for Mac GPU acceleration')
@@ -94,9 +95,9 @@ def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16,
     """
     # If 'set' column is already present, use it for splitting
     if 'set' in df.columns:
-        train_df = df[df['set'] == 'train']
-        val_df = df[df['set'] == 'dev']
-        test_df = df[df['set'] == 'test']
+        train_df = df[df['set'] == 'train'].copy()
+        val_df = df[df['set'] == 'dev'].copy()
+        test_df = df[df['set'] == 'test'].copy()
     else:
         # Randomly split the data
         n = len(df)
@@ -109,17 +110,43 @@ def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16,
         val_indices = indices[train_size:train_size + val_size]
         test_indices = indices[train_size + val_size:]
         
-        train_df = df.iloc[train_indices]
-        val_df = df.iloc[val_indices]
-        test_df = df.iloc[test_indices]
+        train_df = df.iloc[train_indices].copy()
+        val_df = df.iloc[val_indices].copy()
+        test_df = df.iloc[test_indices].copy()
     
-    # Balance training data if requested
+    # Display original class distribution before balancing
     if balance_classes and 'skeletal_class' in df.columns:
+        # Count classes in original training data
+        if 'skeletal_class' in train_df.columns:
+            train_class_counts = train_df['skeletal_class'].value_counts().sort_index()
+            print("Original training class distribution:")
+            for label, count in train_class_counts.items():
+                class_name = {1: "Class I", 2: "Class II", 3: "Class III"}.get(label, f"Class {label}")
+                print(f"  {class_name}: {count} samples ({count/len(train_df)*100:.1f}%)")
+    
+    # Balance ONLY the training data if requested
+    if balance_classes:
+        # First, make sure we have skeletal class information
+        if 'skeletal_class' not in train_df.columns:
+            print("Computing skeletal classifications for the training set...")
+            from data.patient_classifier import PatientClassifier
+            classifier = PatientClassifier(landmark_cols)
+            train_df = classifier.classify_patients(train_df)
+        
+        # Now balance the training data
         print("Balancing training data using skeletal classification...")
         from data.patient_classifier import PatientClassifier
         classifier = PatientClassifier(landmark_cols)
         train_df = classifier.balance_classes(train_df, class_column='skeletal_class', balance_method='upsample')
         print(f"Balanced training data: {len(train_df)} samples")
+        
+        # Show balanced distribution
+        if 'skeletal_class' in train_df.columns:
+            train_class_counts = train_df['skeletal_class'].value_counts().sort_index()
+            print("Balanced training class distribution:")
+            for label, count in train_class_counts.items():
+                class_name = {1: "Class I", 2: "Class II", 3: "Class III"}.get(label, f"Class {label}")
+                print(f"  {class_name}: {count} samples ({count/len(train_df)*100:.1f}%)")
     
     # Define data transformations (non-augmentation)
     base_transforms = transforms.Compose([
@@ -203,12 +230,14 @@ def main():
         apply_clahe=args.apply_clahe
     )
     
-    # Load and preprocess data
-    if args.balance_classes:
-        print("Computing skeletal classifications and balancing the dataset...")
-        df = data_processor.preprocess_data(balance_classes=True)
-    else:
-        df = data_processor.preprocess_data()
+    # Load and preprocess data - but DON'T balance here!
+    # We only want to balance the training set, not all data
+    df = data_processor.preprocess_data(balance_classes=False)
+    
+    # Compute skeletal classifications for reporting, if class balancing is requested
+    if args.balance_classes and df is not None:
+        print("Computing skeletal classifications for reporting purposes...")
+        df = data_processor.compute_patient_classes()
     
     # Get dataset statistics
     stats = data_processor.get_data_stats()
@@ -226,7 +255,7 @@ def main():
             print(f"  {class_name}: {count}")
     
     if 'skeletal_class_counts' in stats:
-        print("Skeletal Class Distribution:")
+        print("Overall Skeletal Class Distribution:")
         for class_label, count in stats['skeletal_class_counts'].items():
             class_name = stats['skeletal_class_names'].get(class_label, str(class_label))
             print(f"  {class_name}: {count} patients ({count/stats['total_samples']*100:.1f}%)")
@@ -239,7 +268,7 @@ def main():
             print("WARNING: MPS requested but not available. Falling back to CPU.")
             args.use_mps = False
     
-    # Create data loaders with augmentation (only for training set)
+    # Create data loaders with augmentation (only balance the training set)
     print("Creating dataloaders with augmentation for training set...")
     train_loader, val_loader, test_loader = create_dataloader_with_augmentations(
         df=df,
@@ -250,13 +279,13 @@ def main():
         apply_clahe=args.apply_clahe,
         root_dir=None,
         num_workers=args.num_workers,
-        balance_classes=args.balance_classes  # Pass balance_classes parameter
+        balance_classes=args.balance_classes  # Only the training set will be balanced
     )
     
     print(f"Created data loaders:")
-    print(f"  Training samples: {len(train_loader.dataset)}")
-    print(f"  Validation samples: {len(val_loader.dataset)}")
-    print(f"  Test samples: {len(test_loader.dataset)}")
+    print(f"  Training samples: {len(train_loader.dataset)} {'(balanced)' if args.balance_classes else ''}")
+    print(f"  Validation samples: {len(val_loader.dataset)} (original distribution)")
+    print(f"  Test samples: {len(test_loader.dataset)} (original distribution)")
     
     # Determine device
     device = None
@@ -274,7 +303,7 @@ def main():
         print(f"  Heatmap loss weight: {args.heatmap_weight}")
         print(f"  Coordinate loss weight: {args.coord_weight}")
     if args.balance_classes:
-        print(f"  Class balancing: {args.balance_method}")
+        print(f"  Training data balance method: {args.balance_method} (validation and test sets maintain original distribution)")
     print(f"  Device: {'MPS (Mac GPU)' if args.use_mps else 'CUDA' if torch.cuda.is_available() and not args.force_cpu else 'CPU'}")
     print(f"  Output directory: {args.output_dir}")
     
@@ -305,7 +334,8 @@ def main():
     results = trainer.evaluate(
         test_loader, 
         save_visualizations=True,
-        landmark_names=landmark_names
+        landmark_names=landmark_names,
+        landmark_cols=landmark_cols  # Pass landmark columns for skeletal classification
     )
     
     # Print evaluation results
