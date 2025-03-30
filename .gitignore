@@ -63,7 +63,7 @@ wandb/
 
 # Exceptions - add data files you want to include
 !requirements.txt
-!*/*/data/__init__.py
-!*/*/data/dataset.py
-!*/*/data/data_processor.py
-!*/*/data/data_augmentation.py 
+# !*/*/data/__init__.py
+# !*/*/data/dataset.py
+# !*/*/data/data_processor.py
+# !*/*/data/data_augmentation.py 
