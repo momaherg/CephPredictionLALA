@@ -37,7 +37,7 @@ ENV/
 # Project specific
 outputs*
 checkpoints/
-data/
+
 *.pkl
 *.pth
 *.pt
@@ -60,6 +60,7 @@ wandb/
 *.gif
 *.tiff
 *.pdf
+*.pkl
 
 # Exceptions - add data files you want to include
 !requirements.txt
