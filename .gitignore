@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.env
+.venv
+venv/
+ENV/
+.python-version
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Project specific
+outputs*
+checkpoints/
+data/
+*.pkl
+*.pth
+*.pt
+*.h5
+*.onnx
+logs/
+wandb/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# MacOS
+.DS_Store
+
+# Datasets
+*.csv
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.tiff
+*.pdf
+
+# Exceptions - add data files you want to include
+!requirements.txt
+!*/*/data/__init__.py
+!*/*/data/dataset.py
+!*/*/data/data_processor.py
+!*/*/data/data_augmentation.py 
