@@ -16,6 +16,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')
 from .hrnet import create_hrnet_model
 from .losses import AdaptiveWingLoss, GaussianHeatmapGenerator, soft_argmax, CombinedLoss
 from src.utils.metrics import mean_euclidean_distance, landmark_success_rate, per_landmark_metrics
+from src.utils.landmark_evaluation import generate_landmark_evaluation_report
 
 class LandmarkTrainer:
     """
@@ -393,13 +394,14 @@ class LandmarkTrainer:
         plt.savefig(os.path.join(self.output_dir, 'training_curves.png'))
         plt.close()
     
-    def evaluate(self, test_loader, save_visualizations=True):
+    def evaluate(self, test_loader, save_visualizations=True, landmark_names=None):
         """
         Evaluate the model on test data
         
         Args:
             test_loader (DataLoader): DataLoader for test data
             save_visualizations (bool): Whether to save visualization images
+            landmark_names (list, optional): Names of landmarks for better reporting
             
         Returns:
             dict: Evaluation results
@@ -408,9 +410,12 @@ class LandmarkTrainer:
         all_predictions = []
         all_targets = []
         
-        # Create output directory for visualizations
+        # Create output directory for visualizations and reports
+        eval_dir = os.path.join(self.output_dir, 'evaluation')
+        os.makedirs(eval_dir, exist_ok=True)
+        
         if save_visualizations:
-            vis_dir = os.path.join(self.output_dir, 'visualizations')
+            vis_dir = os.path.join(eval_dir, 'visualizations')
             os.makedirs(vis_dir, exist_ok=True)
         
         with torch.no_grad():
@@ -435,19 +440,44 @@ class LandmarkTrainer:
         all_predictions = torch.cat(all_predictions, dim=0)
         all_targets = torch.cat(all_targets, dim=0)
         
-        # Compute metrics
+        # Compute standard metrics
         med = mean_euclidean_distance(all_predictions, all_targets)
         success_rate_2mm = landmark_success_rate(all_predictions, all_targets, threshold=2.0)
         success_rate_4mm = landmark_success_rate(all_predictions, all_targets, threshold=4.0)
-        per_landmark_stats = per_landmark_metrics(all_predictions, all_targets)
+        
+        # Compute per-landmark metrics using our new functions
+        report_dir = os.path.join(eval_dir, 'reports')
+        detailed_report = generate_landmark_evaluation_report(
+            predictions=all_predictions,
+            targets=all_targets,
+            landmark_names=landmark_names,
+            output_dir=report_dir,
+            thresholds=[2.0, 4.0, 6.0]
+        )
         
         # Create results dictionary
         results = {
             'mean_euclidean_distance': med,
             'success_rate_2mm': success_rate_2mm,
             'success_rate_4mm': success_rate_4mm,
-            'per_landmark_stats': per_landmark_stats
+            'per_landmark_metrics': detailed_report
         }
+        
+        # Print detailed results
+        print("\nDetailed Evaluation Results:")
+        print(f"Overall Mean Euclidean Distance (MED): {med:.2f} pixels")
+        print(f"Success Rate (2mm): {success_rate_2mm * 100:.2f}%")
+        print(f"Success Rate (4mm): {success_rate_4mm * 100:.2f}%")
+        
+        # Print worst performing landmarks
+        print("\nTop 3 Worst Performing Landmarks:")
+        worst_landmarks = detailed_report['worst_landmarks']
+        worst_med = detailed_report['worst_landmarks_med']
+        for i, (idx, med_val) in enumerate(zip(worst_landmarks, worst_med)):
+            name = landmark_names[idx] if landmark_names else f"Landmark {idx+1}"
+            print(f"  {i+1}. {name}: {med_val:.2f} pixels")
+        
+        print(f"\nDetailed report saved to: {report_dir}")
         
         return results
     

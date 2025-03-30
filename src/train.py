@@ -188,6 +188,13 @@ def main():
        'Lower lip_y', 'ST Pogonion_x', 'ST Pogonion_y', 'gnathion_x',
        'gnathion_y']
     
+    # Extract landmark names for evaluation
+    landmark_names = []
+    for i in range(0, len(landmark_cols), 2):
+        # Extract name from column (removing _x or _y suffix)
+        name = landmark_cols[i].replace('_x', '')
+        landmark_names.append(name)
+    
     # Initialize data processor
     data_processor = DataProcessor(
         data_path=args.data_path,
@@ -295,13 +302,20 @@ def main():
     
     # Evaluate model on test set
     print("Evaluating model on test set...")
-    results = trainer.evaluate(test_loader, save_visualizations=True)
+    results = trainer.evaluate(
+        test_loader, 
+        save_visualizations=True,
+        landmark_names=landmark_names
+    )
     
     # Print evaluation results
     print("\nEvaluation Results:")
     print(f"Mean Euclidean Distance: {results['mean_euclidean_distance']:.2f} pixels")
     print(f"Success Rate (2mm): {results['success_rate_2mm'] * 100:.2f}%")
     print(f"Success Rate (4mm): {results['success_rate_4mm'] * 100:.2f}%")
+    
+    print("\nDetailed per-landmark metrics have been saved to:")
+    print(f"  {os.path.join(args.output_dir, 'evaluation', 'reports')}")
     
     print("\nTraining completed successfully!")
 
