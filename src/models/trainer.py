@@ -30,7 +30,8 @@ class LandmarkTrainer:
                  use_refinement=True,
                  heatmap_weight=1.0,
                  coord_weight=1.0,
-                 use_mps=False):
+                 use_mps=False,
+                 hrnet_type='w32'):
         """
         Initialize trainer
         
@@ -44,6 +45,7 @@ class LandmarkTrainer:
             heatmap_weight (float): Weight for heatmap loss
             coord_weight (float): Weight for coordinate loss
             use_mps (bool): Whether to use MPS device on Mac
+            hrnet_type (str): HRNet variant to use ('w32' or 'w48')
         """
         # Set device
         if device is not None:
@@ -61,7 +63,12 @@ class LandmarkTrainer:
                 print("Using CPU device")
         
         # Create model
-        self.model = create_hrnet_model(num_landmarks=num_landmarks, pretrained=True, use_refinement=use_refinement)
+        self.model = create_hrnet_model(
+            num_landmarks=num_landmarks, 
+            pretrained=True, 
+            use_refinement=use_refinement,
+            hrnet_type=hrnet_type
+        )
         self.model = self.model.to(self.device)
         
         # Create optimizer

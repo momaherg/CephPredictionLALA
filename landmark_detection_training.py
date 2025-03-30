@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 import time
 from tqdm.notebook import tqdm
 import platform
+from torchvision import transforms
 
 # Add the src directory to the path for imports
 import sys
@@ -49,6 +50,14 @@ set_seed(42)
 # ## 2. Configure Training Parameters
 # 
 # Here we define all the customizable hyperparameters for our training.
+# 
+# Key parameters:
+# - `NUM_LANDMARKS`: Number of landmarks to detect (19 by default)
+# - `USE_REFINEMENT`: Whether to use coordinate refinement MLP
+# - `HRNET_TYPE`: HRNet backbone variant ('w32' or 'w48'). W48 is larger and may be more accurate but requires more memory.
+# - `BALANCE_CLASSES`: Whether to balance training data based on skeletal classification
+# - `BALANCE_METHOD`: Method to balance classes ('upsample' or 'downsample')
+# - `LEARNING_RATE`, `BATCH_SIZE`, etc.: Standard training parameters
 
 # %%
 # Data parameters
@@ -61,10 +70,15 @@ NUM_LANDMARKS = 19
 PRETRAINED = True
 USE_REFINEMENT = True  # Whether to use refinement MLP
 MAX_DELTA = 2.0  # Maximum allowed delta for refinement
+HRNET_TYPE = 'w32'  # HRNet variant: 'w32' (default) or 'w48' (larger model)
 
 # Loss parameters
 HEATMAP_WEIGHT = 1.0  # Weight for heatmap loss
 COORD_WEIGHT = 0.1  # Weight for coordinate loss
+
+# Class balancing parameters
+BALANCE_CLASSES = True  # Whether to balance training data based on skeletal classes
+BALANCE_METHOD = 'upsample'  # 'upsample' or 'downsample'
 
 # Training parameters
 BATCH_SIZE = 16
@@ -128,7 +142,14 @@ except Exception as e:
     synthetic_data = []
     
     for i in range(num_samples):
-        sample = {'image_path': f'synthetic_image_{i}.jpg', 'set': 'train' if i < 70 else ('dev' if i < 85 else 'test')}
+        # Create sample with required columns for CephalometricDataset
+        patient_id = f'patient_{i:03d}'
+        sample = {
+            'image_path': f'synthetic_image_{i}.jpg',
+            'set': 'train' if i < 70 else ('dev' if i < 85 else 'test'),
+            'patient': patient_id,  # Add patient ID column
+            'patient_id': patient_id  # Also add patient_id for consistency
+        }
         # Add random landmark coordinates
         for col in landmark_cols:
             sample[col] = np.random.randint(0, 224)
@@ -139,6 +160,12 @@ except Exception as e:
 
 # %% [markdown]
 # ## 5. Create DataLoaders with Augmentation
+# 
+# In this section, we:
+# 1. Define the data transformations for image preprocessing
+# 2. Split the dataset into train/validation/test sets
+# 3. Optionally balance the training data using skeletal classification
+# 4. Create PyTorch DataLoaders for model training and evaluation
 
 # %%
 # Define a class for training transforms that can be pickled
@@ -154,10 +181,10 @@ class TrainTransform:
         return self.base_transforms(augmented)
 
 # Define data transformations
-base_transforms = torch.nn.Sequential(
+base_transforms = transforms.Compose([
     ToTensor(),
     Normalize()
-)
+])
 
 # Get training transformations with augmentations
 train_augmentations = get_train_transforms(include_horizontal_flip=False)
@@ -169,6 +196,36 @@ train_transform = TrainTransform(train_augmentations, base_transforms)
 train_df = df[df['set'] == 'train'] if 'set' in df.columns else df.sample(frac=0.7)
 val_df = df[df['set'] == 'dev'] if 'set' in df.columns else df[~df.index.isin(train_df.index)].sample(frac=0.5)
 test_df = df[df['set'] == 'test'] if 'set' in df.columns else df[~df.index.isin(train_df.index) & ~df.index.isin(val_df.index)]
+
+# Optional: Balance training data classes
+if BALANCE_CLASSES and 'skeletal_class' not in train_df.columns:
+    print("Computing skeletal classifications for the training set...")
+    from src.data.patient_classifier import PatientClassifier
+    classifier = PatientClassifier(landmark_cols)
+    train_df = classifier.classify_patients(train_df)
+
+if BALANCE_CLASSES and 'skeletal_class' in train_df.columns:
+    print("Balancing training data using skeletal classification...")
+    from src.data.patient_classifier import PatientClassifier
+    classifier = PatientClassifier(landmark_cols)
+    
+    # Show original class distribution
+    train_class_counts = train_df['skeletal_class'].value_counts().sort_index()
+    print("Original training class distribution:")
+    for label, count in train_class_counts.items():
+        class_name = {1: "Class I", 2: "Class II", 3: "Class III"}.get(label, f"Class {label}")
+        print(f"  {class_name}: {count} samples ({count/len(train_df)*100:.1f}%)")
+    
+    # Balance classes using the specified method
+    train_df = classifier.balance_classes(train_df, class_column='skeletal_class', balance_method=BALANCE_METHOD)
+    print(f"Balanced training data using {BALANCE_METHOD}: {len(train_df)} samples")
+    
+    # Show balanced distribution
+    train_class_counts = train_df['skeletal_class'].value_counts().sort_index()
+    print("Balanced training class distribution:")
+    for label, count in train_class_counts.items():
+        class_name = {1: "Class I", 2: "Class II", 3: "Class III"}.get(label, f"Class {label}")
+        print(f"  {class_name}: {count} samples ({count/len(train_df)*100:.1f}%)")
 
 # Create datasets
 train_dataset = CephalometricDataset(
@@ -221,7 +278,8 @@ trainer = LandmarkTrainer(
     use_refinement=USE_REFINEMENT,
     heatmap_weight=HEATMAP_WEIGHT,
     coord_weight=COORD_WEIGHT,
-    use_mps=USE_MPS
+    use_mps=USE_MPS,
+    hrnet_type=HRNET_TYPE
 )
 
 # Custom max_delta setting for the refinement MLP if needed
@@ -232,7 +290,12 @@ if USE_REFINEMENT and hasattr(trainer.model, 'refinement_mlp'):
 # Print model summary
 total_params = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
 print(f"Model created with {total_params:,} trainable parameters")
+print(f"HRNet type: {HRNET_TYPE.upper()}")
 print(f"Refinement MLP: {'Enabled' if USE_REFINEMENT else 'Disabled'}")
+if BALANCE_CLASSES:
+    print(f"Class balancing: Enabled (method: {BALANCE_METHOD})")
+else:
+    print(f"Class balancing: Disabled")
 
 # %% [markdown]
 # ## 7. Train the Model
@@ -388,6 +451,7 @@ model_config = {
     'num_landmarks': NUM_LANDMARKS,
     'use_refinement': USE_REFINEMENT,
     'max_delta': MAX_DELTA,
+    'hrnet_type': HRNET_TYPE,
     'heatmap_weight': HEATMAP_WEIGHT,
     'coord_weight': COORD_WEIGHT,
     'learning_rate': LEARNING_RATE,
@@ -396,6 +460,8 @@ model_config = {
     'num_epochs': NUM_EPOCHS,
     'output_size': (64, 64),
     'image_size': (224, 224),
+    'balance_classes': BALANCE_CLASSES,
+    'balance_method': BALANCE_METHOD,
     'train_samples': len(train_dataset),
     'val_samples': len(val_dataset),
     'test_samples': len(test_dataset),

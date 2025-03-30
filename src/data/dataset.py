@@ -50,9 +50,16 @@ class CephalometricDataset(Dataset):
             else:
                 img_array = img_data
         else:
-            # If images are stored as files
-            img_name = os.path.join(self.root_dir, self.data_frame.iloc[idx]['patient'] + '.jpg')
-            img_array = np.array(Image.open(img_name))
+            # For synthetic data when no actual images are available, create a blank image
+            if self.root_dir is None or 'image_path' in self.data_frame.columns:
+                # Create a synthetic image for demonstration
+                img_array = np.zeros((224, 224, 3), dtype=np.uint8)
+                # Add some random noise to make it more realistic
+                img_array = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
+            else:
+                # If images are stored as files
+                img_name = os.path.join(self.root_dir, self.data_frame.iloc[idx]['patient'] + '.jpg')
+                img_array = np.array(Image.open(img_name))
         
         # Ensure image is in the right format (uint8) for OpenCV operations
         if img_array.dtype != np.uint8:

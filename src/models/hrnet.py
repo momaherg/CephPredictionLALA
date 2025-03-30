@@ -107,30 +107,29 @@ class HighResolutionModule(nn.Module):
         return out
 
 
-class HRNetW32(nn.Module):
+class HRNet(nn.Module):
     """
     High-Resolution Network (HRNet) for landmark detection
     
-    Uses the W32 variant of HRNet, which maintains high resolution throughout
-    the network and is particularly suited for keypoint detection.
+    Supports different HRNet variants (W32, W48, etc.)
     """
-    def __init__(self, pretrained=True):
-        super(HRNetW32, self).__init__()
+    def __init__(self, pretrained=True, hrnet_type='w32'):
+        super(HRNet, self).__init__()
         
-        # Load pretrained HRNet-W32 model
+        # Load pretrained HRNet model
         if pretrained:
             try:
                 if not TIMM_AVAILABLE:
                     raise ImportError("timm package is not installed")
                 
                 # Use timm to load pretrained HRNet
-                model_name = 'hrnet_w32'
+                model_name = f'hrnet_{hrnet_type}'
                 self.backbone = timm.create_model(model_name, pretrained=True, features_only=True)
                 print(f"Successfully loaded pretrained {model_name} using timm.")
             except Exception as e:
                 # Fallback to a simplified backbone if pretrained model is not available
-                logging.warning(f"Error loading pretrained HRNet-W32: {str(e)}")
-                print("Warning: Pretrained HRNet-W32 not available. Using simplified backbone.")
+                logging.warning(f"Error loading pretrained HRNet-{hrnet_type.upper()}: {str(e)}")
+                print(f"Warning: Pretrained HRNet-{hrnet_type.upper()} not available. Using simplified backbone.")
                 print("To fix this issue, install timm: pip install timm")
                 self.backbone = self._create_simplified_backbone()
         else:
@@ -139,7 +138,7 @@ class HRNetW32(nn.Module):
     
     def _create_simplified_backbone(self):
         # Simplified backbone as a placeholder
-        # In practice, this would be a full implementation of HRNet-W32
+        # In practice, this would be a full implementation of HRNet
         backbone = nn.Sequential(
             nn.Conv2d(3, 64, 3, 2, 1),
             nn.BatchNorm2d(64),
@@ -234,20 +233,21 @@ class LandmarkHeatmapNet(nn.Module):
     Landmark detection network using heatmap regression with refinement MLP
     
     Architecture:
-    1. HRNet-W32 backbone
-    2. 1x1 convolution to output 19 heatmaps (one per landmark)
+    1. HRNet backbone (W32 or W48)
+    2. 1x1 convolution to output heatmaps (one per landmark)
     3. Coordinate extraction from heatmaps
     4. Refinement MLP to improve coordinate predictions
     """
-    def __init__(self, num_landmarks=19, output_size=(64, 64), pretrained=True, use_refinement=True):
+    def __init__(self, num_landmarks=19, output_size=(64, 64), pretrained=True, use_refinement=True, hrnet_type='w32'):
         super(LandmarkHeatmapNet, self).__init__()
         
         self.num_landmarks = num_landmarks
         self.output_size = output_size
         self.use_refinement = use_refinement
+        self.hrnet_type = hrnet_type
         
         # HRNet backbone
-        self.hrnet = HRNetW32(pretrained=pretrained)
+        self.hrnet = HRNet(pretrained=pretrained, hrnet_type=hrnet_type)
         
         # We'll create the heatmap layer after we know the channel size
         self.heatmap_layer = None
@@ -376,7 +376,7 @@ class LandmarkHeatmapNet(nn.Module):
         return coords
 
 
-def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True):
+def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, hrnet_type='w32'):
     """
     Create a HRNet-based landmark detection model
     
@@ -384,6 +384,7 @@ def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True):
         num_landmarks (int): Number of landmarks to detect
         pretrained (bool): Whether to use pretrained weights for the backbone
         use_refinement (bool): Whether to use refinement MLP
+        hrnet_type (str): HRNet variant to use ('w32' or 'w48')
         
     Returns:
         LandmarkHeatmapNet: The created model
@@ -392,6 +393,7 @@ def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True):
         num_landmarks=num_landmarks,
         output_size=(64, 64),
         pretrained=pretrained,
-        use_refinement=use_refinement
+        use_refinement=use_refinement,
+        hrnet_type=hrnet_type
     )
     return model 
