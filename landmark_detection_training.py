@@ -121,9 +121,10 @@ NESTEROV = True  # Whether to use Nesterov momentum for SGD optimizer
 # LR Range Test parameters
 RUN_LR_RANGE_TEST = True  # Whether to run the LR Range Test before training
 LR_TEST_START = 1e-7      # Starting learning rate for the test
-LR_TEST_END = 1.0         # Ending learning rate for the test
+LR_TEST_END = 0.01        # Ending learning rate for the test (reduced from 1.0 to 0.01)
 LR_TEST_NUM_ITER = 100    # Number of iterations to run (0 for full epoch)
 LR_TEST_STEP_MODE = 'exp' # 'exp' or 'linear'
+LR_TEST_DIVERGE_TH = 10.0 # Divergence threshold (increased from default 5.0)
 
 # %% [markdown]
 # ## 3. Set Up Device
@@ -392,7 +393,8 @@ if RUN_LR_RANGE_TEST:
         start_lr=LR_TEST_START,
         end_lr=LR_TEST_END,
         num_iter=LR_TEST_NUM_ITER,
-        step_mode=LR_TEST_STEP_MODE
+        step_mode=LR_TEST_STEP_MODE,
+        diverge_threshold=LR_TEST_DIVERGE_TH
     )
     
     # Plot and get suggested learning rate

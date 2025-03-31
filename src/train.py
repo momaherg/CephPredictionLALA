@@ -60,9 +60,10 @@ def parse_args():
     # LR Range Test arguments
     parser.add_argument('--run_lr_test', action='store_true', help='Run Learning Rate Range Test before training')
     parser.add_argument('--lr_test_start', type=float, default=1e-7, help='Starting learning rate for the test')
-    parser.add_argument('--lr_test_end', type=float, default=1.0, help='Ending learning rate for the test')
+    parser.add_argument('--lr_test_end', type=float, default=0.01, help='Ending learning rate for the test (reduced from 1.0 to be more reasonable)')
     parser.add_argument('--lr_test_iter', type=int, default=100, help='Number of iterations for LR test (0 for full epoch)')
     parser.add_argument('--lr_test_mode', type=str, choices=['exp', 'linear'], default='exp', help='LR increase mode for test')
+    parser.add_argument('--lr_test_div_th', type=float, default=10.0, help='Divergence threshold for early stopping in LR test')
     
     # Other arguments
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
@@ -413,7 +414,8 @@ def main():
             start_lr=args.lr_test_start,
             end_lr=args.lr_test_end,
             num_iter=args.lr_test_iter if args.lr_test_iter > 0 else None,
-            step_mode=args.lr_test_mode
+            step_mode=args.lr_test_mode,
+            diverge_threshold=args.lr_test_div_th
         )
         
         # Plot and get suggested learning rate
