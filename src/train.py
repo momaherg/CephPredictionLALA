@@ -11,6 +11,7 @@ from data.data_processor import DataProcessor
 from data.dataset import CephalometricDataset, ToTensor, Normalize
 from data.data_augmentation import get_train_transforms
 from models.trainer import LandmarkTrainer
+from utils.lr_finder import LRFinder
 
 # Define TrainTransform as a top-level class so it can be pickled
 class TrainTransform:
@@ -43,16 +44,37 @@ def parse_args():
     parser.add_argument('--num_landmarks', type=int, default=19, help='Number of landmarks to detect')
     parser.add_argument('--pretrained', action='store_true', help='Use pretrained HRNet backbone')
     parser.add_argument('--use_refinement', action='store_true', help='Use refinement MLP for coordinate regression')
-    parser.add_argument('--heatmap_weight', type=float, default=1.0, help='Weight for heatmap loss (when not using weight scheduling)')
-    parser.add_argument('--coord_weight', type=float, default=0.1, help='Weight for coordinate loss (when not using weight scheduling)')
+    parser.add_argument('--heatmap_weight', type=float, default=1.0, help='Weight for heatmap loss')
+    parser.add_argument('--coord_weight', type=float, default=0.1, help='Weight for coordinate loss')
     
-    # Weight scheduling arguments
-    parser.add_argument('--use_weight_schedule', action='store_true', help='Use dynamic weight scheduling between heatmap and coordinate losses')
-    parser.add_argument('--initial_heatmap_weight', type=float, default=1.0, help='Initial weight for heatmap loss in schedule')
-    parser.add_argument('--initial_coord_weight', type=float, default=0.1, help='Initial weight for coordinate loss in schedule')
-    parser.add_argument('--final_heatmap_weight', type=float, default=0.5, help='Final weight for heatmap loss in schedule')
-    parser.add_argument('--final_coord_weight', type=float, default=1.0, help='Final weight for coordinate loss in schedule')
-    parser.add_argument('--weight_schedule_epochs', type=int, default=30, help='Number of epochs to transition from initial to final weights')
+    # Data balancing arguments
+    parser.add_argument('--balance_classes', action='store_true', 
+                       help='Balance training data based on skeletal classification (preserves validation and test distributions)')
+    parser.add_argument('--balance_method', type=str, choices=['upsample', 'downsample'], default='upsample', 
+                        help='Method to balance training data classes (upsample: duplicate minority classes, downsample: reduce majority class)')
+    
+    # Device arguments
+    parser.add_argument('--use_mps', action='store_true', help='Use Metal Performance Shaders (MPS) for Mac GPU acceleration')
+    parser.add_argument('--force_cpu', action='store_true', help='Force CPU usage even if GPU is available')
+    
+    # LR Range Test arguments
+    parser.add_argument('--run_lr_test', action='store_true', help='Run Learning Rate Range Test before training')
+    parser.add_argument('--lr_test_start', type=float, default=1e-7, help='Starting learning rate for the test')
+    parser.add_argument('--lr_test_end', type=float, default=1.0, help='Ending learning rate for the test')
+    parser.add_argument('--lr_test_iter', type=int, default=100, help='Number of iterations for LR test (0 for full epoch)')
+    parser.add_argument('--lr_test_mode', type=str, choices=['exp', 'linear'], default='exp', help='LR increase mode for test')
+    
+    # Other arguments
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--num_workers', type=int, default=0, help='Number of worker threads for dataloader (0 for single process)')
+    
+    # Weight scheduling parameters
+    parser.add_argument('--use_weight_schedule', action='store_true', help='Use weight scheduling for losses')
+    parser.add_argument('--initial_heatmap_weight', type=float, default=1.0, help='Initial heatmap loss weight (if scheduling)')
+    parser.add_argument('--initial_coord_weight', type=float, default=0.01, help='Initial coordinate loss weight (if scheduling)')
+    parser.add_argument('--final_heatmap_weight', type=float, default=0.1, help='Final heatmap loss weight (if scheduling)')
+    parser.add_argument('--final_coord_weight', type=float, default=1.0, help='Final coordinate loss weight (if scheduling)')
+    parser.add_argument('--weight_schedule_epochs', type=int, default=20, help='Number of epochs for weight transition')
     
     # Learning rate scheduler arguments
     parser.add_argument('--scheduler', type=str, choices=['cosine', 'plateau', 'onecycle', 'none'], default='none', 
@@ -67,19 +89,13 @@ def parse_args():
     parser.add_argument('--div_factor', type=float, default=25.0, help='Initial learning rate division factor for OneCycleLR')
     parser.add_argument('--final_div_factor', type=float, default=1e4, help='Final learning rate division factor for OneCycleLR')
     
-    # Data balancing arguments
-    parser.add_argument('--balance_classes', action='store_true', 
-                       help='Balance training data based on skeletal classification (preserves validation and test distributions)')
-    parser.add_argument('--balance_method', type=str, choices=['upsample', 'downsample'], default='upsample', 
-                        help='Method to balance training data classes (upsample: duplicate minority classes, downsample: reduce majority class)')
-    
-    # Device arguments
-    parser.add_argument('--use_mps', action='store_true', help='Use Metal Performance Shaders (MPS) for Mac GPU acceleration')
-    parser.add_argument('--force_cpu', action='store_true', help='Force CPU usage even if GPU is available')
-    
-    # Other arguments
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--num_workers', type=int, default=0, help='Number of worker threads for dataloader (0 for single process)')
+    # Optimizer arguments
+    parser.add_argument('--optimizer', type=str, choices=['adam', 'adamw', 'sgd'], default='adam',
+                        help='Optimizer type to use for training')
+    parser.add_argument('--momentum', type=float, default=0.9, 
+                        help='Momentum factor for SGD optimizer')
+    parser.add_argument('--nesterov', action='store_true',
+                        help='Enable Nesterov momentum for SGD optimizer')
     
     return parser.parse_args()
 
@@ -314,42 +330,29 @@ def main():
         device = torch.device('cpu')
         print("Using CPU as requested with --force_cpu")
     
+    # Set default max_lr if not specified and using OneCycleLR
+    max_lr = args.max_lr
+    if args.scheduler == 'onecycle' and max_lr is None:
+        max_lr = args.learning_rate * 10  # Default to 10x base learning rate
+        print(f"Setting default max_lr for OneCycleLR to {max_lr} (10x base learning rate)")
+    
     # Log training configuration
     print("\nTraining Configuration:")
     print(f"  Model: HRNet-W32 with{'' if args.use_refinement else 'out'} refinement MLP")
+    
+    # Log optimizer info
+    print(f"  Optimizer: {args.optimizer.upper()}")
+    if args.optimizer == 'sgd':
+        print(f"    Momentum: {args.momentum}")
+        print(f"    Nesterov: {args.nesterov}")
     print(f"  Learning rate: {args.learning_rate}")
+    print(f"  Weight decay: {args.weight_decay}")
+    
     print(f"  Batch size: {args.batch_size}")
     print(f"  Number of epochs: {args.num_epochs}")
-    
-    # Log learning rate scheduler info
-    if args.scheduler != 'none':
-        print(f"  Learning rate scheduler: {args.scheduler}")
-        if args.scheduler == 'cosine':
-            print(f"    T_max: {args.lr_t_max if args.lr_t_max > 0 else args.num_epochs // 2}")
-            print(f"    Min LR: {args.lr_min}")
-        elif args.scheduler == 'plateau':
-            print(f"    Patience: {args.lr_patience}")
-            print(f"    Factor: {args.lr_factor}")
-            print(f"    Min LR: {args.lr_min}")
-        elif args.scheduler == 'onecycle':
-            max_lr = args.max_lr if args.max_lr is not None else args.learning_rate * 10
-            print(f"    Max LR: {max_lr}")
-            print(f"    Pct Start: {args.pct_start} (% of training in warm-up phase)")
-            print(f"    Div Factor: {args.div_factor} (initial LR = max_lr/div_factor)")
-            print(f"    Final Div Factor: {args.final_div_factor} (final LR = initial_lr/final_div_factor)")
-    else:
-        print(f"  Learning rate scheduler: Disabled")
-    
     if args.use_refinement:
-        if args.use_weight_schedule:
-            print(f"  Loss weight scheduling: Enabled")
-            print(f"    Initial weights - Heatmap: {args.initial_heatmap_weight}, Coordinate: {args.initial_coord_weight}")
-            print(f"    Final weights   - Heatmap: {args.final_heatmap_weight}, Coordinate: {args.final_coord_weight}")
-            print(f"    Transition period: {args.weight_schedule_epochs} epochs")
-        else:
-            print(f"  Loss weight scheduling: Disabled")
-            print(f"  Heatmap loss weight: {args.heatmap_weight}")
-            print(f"  Coordinate loss weight: {args.coord_weight}")
+        print(f"  Heatmap loss weight: {args.heatmap_weight}")
+        print(f"  Coordinate loss weight: {args.coord_weight}")
     if args.balance_classes:
         print(f"  Training data balance method: {args.balance_method} (validation and test sets maintain original distribution)")
     print(f"  Device: {'MPS (Mac GPU)' if args.use_mps else 'CUDA' if torch.cuda.is_available() and not args.force_cpu else 'CPU'}")
@@ -380,11 +383,88 @@ def main():
         lr_min=args.lr_min,
         lr_t_max=args.lr_t_max if args.lr_t_max > 0 else args.num_epochs // 2,
         # OneCycleLR parameters
-        max_lr=args.max_lr,
+        max_lr=max_lr,
         pct_start=args.pct_start,
         div_factor=args.div_factor,
-        final_div_factor=args.final_div_factor
+        final_div_factor=args.final_div_factor,
+        # Optimizer parameters
+        optimizer_type=args.optimizer,
+        momentum=args.momentum,
+        nesterov=args.nesterov
     )
+    
+    # Run Learning Rate Range Test if requested
+    if args.run_lr_test:
+        print("\n" + "="*50)
+        print("Running Learning Rate Range Test to find optimal learning rate")
+        print("="*50)
+        
+        # Create LR Finder
+        lr_finder = LRFinder(
+            model=trainer.model,
+            optimizer=trainer.optimizer,
+            criterion=trainer.criterion,
+            device=trainer.device
+        )
+        
+        # Run the range test
+        history = lr_finder.range_test(
+            train_loader=train_loader,
+            start_lr=args.lr_test_start,
+            end_lr=args.lr_test_end,
+            num_iter=args.lr_test_iter if args.lr_test_iter > 0 else None,
+            step_mode=args.lr_test_mode
+        )
+        
+        # Plot and get suggested learning rate
+        suggested_lr = lr_finder.plot(
+            output_dir=args.output_dir,
+            skip_start=5,
+            skip_end=5
+        )
+        
+        # Use the suggested learning rate if available and we're using OneCycleLR
+        if suggested_lr is not None and args.scheduler == 'onecycle':
+            print(f"Updating max_lr from {max_lr} to {suggested_lr}")
+            max_lr = suggested_lr
+            
+            # Recreate the trainer with the new max_lr
+            trainer = LandmarkTrainer(
+                num_landmarks=args.num_landmarks,
+                learning_rate=args.learning_rate,
+                weight_decay=args.weight_decay,
+                device=device,  # Auto-select or forced CPU
+                output_dir=args.output_dir,
+                use_refinement=args.use_refinement,
+                heatmap_weight=args.heatmap_weight,
+                coord_weight=args.coord_weight,
+                use_mps=args.use_mps,
+                # Weight scheduling parameters
+                use_weight_schedule=args.use_weight_schedule,
+                initial_heatmap_weight=args.initial_heatmap_weight,
+                initial_coord_weight=args.initial_coord_weight,
+                final_heatmap_weight=args.final_heatmap_weight,
+                final_coord_weight=args.final_coord_weight,
+                weight_schedule_epochs=args.weight_schedule_epochs,
+                # Learning rate scheduler parameters
+                scheduler_type=None if args.scheduler == 'none' else args.scheduler,
+                lr_patience=args.lr_patience,
+                lr_factor=args.lr_factor,
+                lr_min=args.lr_min,
+                lr_t_max=args.lr_t_max if args.lr_t_max > 0 else args.num_epochs // 2,
+                # OneCycleLR parameters
+                max_lr=max_lr,
+                pct_start=args.pct_start,
+                div_factor=args.div_factor,
+                final_div_factor=args.final_div_factor,
+                # Optimizer parameters
+                optimizer_type=args.optimizer,
+                momentum=args.momentum,
+                nesterov=args.nesterov
+            )
+        
+        print("Learning Rate Range Test completed")
+        print("="*50)
     
     # Train model
     print("\nStarting training...")

@@ -33,6 +33,7 @@ from src.models.trainer import LandmarkTrainer
 from src.data.dataset import CephalometricDataset, ToTensor, Normalize
 from src.data.data_augmentation import get_train_transforms
 from src.data.data_processor import DataProcessor
+from src.utils.lr_finder import LRFinder
 
 # Set random seed for reproducibility
 def set_seed(seed=42):
@@ -84,19 +85,6 @@ FINAL_HEATMAP_WEIGHT = 0.5  # Final weight for heatmap loss in schedule
 FINAL_COORD_WEIGHT = 1.0  # Final weight for coordinate loss in schedule
 WEIGHT_SCHEDULE_EPOCHS = 30  # Number of epochs to transition from initial to final weights
 
-# Learning rate scheduler parameters
-SCHEDULER_TYPE = 'cosine'  # 'cosine', 'plateau', 'onecycle', or None
-LR_PATIENCE = 5  # Patience for ReduceLROnPlateau
-LR_FACTOR = 0.5  # Factor to reduce learning rate for ReduceLROnPlateau
-LR_MIN = 1e-6  # Minimum learning rate for schedulers
-LR_T_MAX = 25  # T_max parameter for CosineAnnealingLR (half of total epochs)
-
-# OneCycleLR specific parameters
-MAX_LR = 1e-3  # Maximum learning rate for OneCycleLR (typically 3-10x base learning rate)
-PCT_START = 0.3  # Percentage of training to increase learning rate (30% is typical)
-DIV_FACTOR = 25.0  # Initial learning rate division factor (initial_lr = max_lr/div_factor)
-FINAL_DIV_FACTOR = 1e4  # Final learning rate division factor (final_lr = initial_lr/final_div_factor)
-
 # Class balancing parameters
 BALANCE_CLASSES = True  # Whether to balance training data based on skeletal classes
 BALANCE_METHOD = 'upsample'  # 'upsample' or 'downsample'
@@ -111,6 +99,31 @@ SAVE_FREQ = 5  # Frequency of saving checkpoints
 # Hardware parameters
 USE_MPS = (platform.system() == 'Darwin')  # Automatically use MPS for Mac
 NUM_WORKERS = 0  # Use 0 for single process (more stable)
+
+# Learning rate scheduler parameters
+SCHEDULER_TYPE = 'cosine'  # 'cosine', 'plateau', 'onecycle', or None
+LR_PATIENCE = 5  # Patience for ReduceLROnPlateau
+LR_FACTOR = 0.5  # Factor to reduce learning rate for ReduceLROnPlateau
+LR_MIN = 1e-6  # Minimum learning rate for schedulers
+LR_T_MAX = 25  # T_max parameter for CosineAnnealingLR (half of total epochs)
+
+# OneCycleLR specific parameters
+MAX_LR = 1e-3  # Maximum learning rate for OneCycleLR (typically 3-10x base learning rate)
+PCT_START = 0.3  # Percentage of training to increase learning rate (30% is typical)
+DIV_FACTOR = 25.0  # Initial learning rate division factor (initial_lr = max_lr/div_factor)
+FINAL_DIV_FACTOR = 1e4  # Final learning rate division factor (final_lr = initial_lr/final_div_factor)
+
+# Optimizer parameters
+OPTIMIZER_TYPE = 'adam'  # 'adam', 'adamw', or 'sgd'
+MOMENTUM = 0.9  # Momentum factor for SGD optimizer
+NESTEROV = True  # Whether to use Nesterov momentum for SGD optimizer
+
+# LR Range Test parameters
+RUN_LR_RANGE_TEST = True  # Whether to run the LR Range Test before training
+LR_TEST_START = 1e-7      # Starting learning rate for the test
+LR_TEST_END = 1.0         # Ending learning rate for the test
+LR_TEST_NUM_ITER = 100    # Number of iterations to run (0 for full epoch)
+LR_TEST_STEP_MODE = 'exp' # 'exp' or 'linear'
 
 # %% [markdown]
 # ## 3. Set Up Device
@@ -314,11 +327,15 @@ trainer = LandmarkTrainer(
     lr_factor=LR_FACTOR,
     lr_min=LR_MIN,
     lr_t_max=LR_T_MAX,
-    # OneCycleLR specific parameters
+    # OneCycleLR parameters
     max_lr=MAX_LR,
     pct_start=PCT_START,
     div_factor=DIV_FACTOR,
-    final_div_factor=FINAL_DIV_FACTOR
+    final_div_factor=FINAL_DIV_FACTOR,
+    # Optimizer parameters
+    optimizer_type=OPTIMIZER_TYPE,
+    momentum=MOMENTUM,
+    nesterov=NESTEROV
 )
 
 # Custom max_delta setting for the refinement MLP if needed
@@ -332,39 +349,106 @@ print(f"Model created with {total_params:,} trainable parameters")
 print(f"HRNet type: {HRNET_TYPE.upper()}")
 print(f"Refinement MLP: {'Enabled' if USE_REFINEMENT else 'Disabled'}")
 
-# Print learning rate scheduler info
-if SCHEDULER_TYPE:
-    print(f"Learning rate scheduler: {SCHEDULER_TYPE}")
-    if SCHEDULER_TYPE == 'cosine':
-        print(f"  T_max: {LR_T_MAX}")
-        print(f"  Min LR: {LR_MIN}")
-    elif SCHEDULER_TYPE == 'plateau':
-        print(f"  Patience: {LR_PATIENCE}")
-        print(f"  Factor: {LR_FACTOR}")
-        print(f"  Min LR: {LR_MIN}")
-    elif SCHEDULER_TYPE == 'onecycle':
-        print(f"  Max LR: {MAX_LR}")
-        print(f"  Pct Start: {PCT_START}")
-        print(f"  Div Factor: {DIV_FACTOR}")
-        print(f"  Final Div Factor: {FINAL_DIV_FACTOR}")
-else:
-    print(f"Learning rate scheduler: Disabled")
+# Print optimizer info
+print(f"Optimizer: {OPTIMIZER_TYPE.upper()}")
+if OPTIMIZER_TYPE == 'sgd':
+    print(f"  Momentum: {MOMENTUM}")
+    print(f"  Nesterov: {NESTEROV}")
+print(f"Learning rate: {LEARNING_RATE}")
+print(f"Weight decay: {WEIGHT_DECAY}")
 
-# Print loss weight configuration
-if USE_REFINEMENT:
-    if USE_WEIGHT_SCHEDULE:
-        print(f"Loss weight scheduling: Enabled")
-        print(f"  Initial weights - Heatmap: {INITIAL_HEATMAP_WEIGHT}, Coordinate: {INITIAL_COORD_WEIGHT}")
-        print(f"  Final weights   - Heatmap: {FINAL_HEATMAP_WEIGHT}, Coordinate: {FINAL_COORD_WEIGHT}")
-        print(f"  Transition period: {WEIGHT_SCHEDULE_EPOCHS} epochs")
-    else:
-        print(f"Loss weight scheduling: Disabled")
-        print(f"  Fixed weights - Heatmap: {HEATMAP_WEIGHT}, Coordinate: {COORD_WEIGHT}")
+# Print learning rate scheduler info
+if USE_WEIGHT_SCHEDULE:
+    print(f"Loss weight scheduling: Enabled")
+    print(f"  Initial weights - Heatmap: {INITIAL_HEATMAP_WEIGHT}, Coordinate: {INITIAL_COORD_WEIGHT}")
+    print(f"  Final weights   - Heatmap: {FINAL_HEATMAP_WEIGHT}, Coordinate: {FINAL_COORD_WEIGHT}")
+    print(f"  Transition period: {WEIGHT_SCHEDULE_EPOCHS} epochs")
+else:
+    print(f"Loss weight scheduling: Disabled")
+    print(f"  Fixed weights - Heatmap: {HEATMAP_WEIGHT}, Coordinate: {COORD_WEIGHT}")
 
 if BALANCE_CLASSES:
     print(f"Class balancing: Enabled (method: {BALANCE_METHOD})")
 else:
     print(f"Class balancing: Disabled")
+
+# Run Learning Rate Range Test if requested
+if RUN_LR_RANGE_TEST:
+    print("\n" + "="*50)
+    print("Running Learning Rate Range Test to find optimal learning rate")
+    print("="*50)
+    
+    # Create LR Finder
+    lr_finder = LRFinder(
+        model=trainer.model,
+        optimizer=trainer.optimizer,
+        criterion=trainer.criterion,
+        device=device
+    )
+    
+    # Run the range test
+    history = lr_finder.range_test(
+        train_loader=train_loader,
+        start_lr=LR_TEST_START,
+        end_lr=LR_TEST_END,
+        num_iter=LR_TEST_NUM_ITER,
+        step_mode=LR_TEST_STEP_MODE
+    )
+    
+    # Plot and get suggested learning rate
+    suggested_lr = lr_finder.plot(
+        output_dir=OUTPUT_DIR,
+        skip_start=5,
+        skip_end=5
+    )
+    
+    # Use the suggested learning rate if available and we're using OneCycleLR
+    if suggested_lr is not None and SCHEDULER_TYPE == 'onecycle':
+        print(f"Updating MAX_LR from {MAX_LR} to {suggested_lr}")
+        MAX_LR = suggested_lr
+        
+        # Recreate the trainer with the new MAX_LR
+        trainer = LandmarkTrainer(
+            num_landmarks=NUM_LANDMARKS,
+            learning_rate=LEARNING_RATE,
+            weight_decay=WEIGHT_DECAY,
+            device=device,
+            output_dir=OUTPUT_DIR,
+            use_refinement=USE_REFINEMENT,
+            heatmap_weight=HEATMAP_WEIGHT,
+            coord_weight=COORD_WEIGHT,
+            use_mps=USE_MPS,
+            hrnet_type=HRNET_TYPE,
+            # Weight scheduling parameters
+            use_weight_schedule=USE_WEIGHT_SCHEDULE,
+            initial_heatmap_weight=INITIAL_HEATMAP_WEIGHT,
+            initial_coord_weight=INITIAL_COORD_WEIGHT,
+            final_heatmap_weight=FINAL_HEATMAP_WEIGHT,
+            final_coord_weight=FINAL_COORD_WEIGHT,
+            weight_schedule_epochs=WEIGHT_SCHEDULE_EPOCHS,
+            # Learning rate scheduler parameters
+            scheduler_type=SCHEDULER_TYPE,
+            lr_patience=LR_PATIENCE,
+            lr_factor=LR_FACTOR,
+            lr_min=LR_MIN,
+            lr_t_max=LR_T_MAX,
+            # OneCycleLR parameters
+            max_lr=MAX_LR,
+            pct_start=PCT_START,
+            div_factor=DIV_FACTOR,
+            final_div_factor=FINAL_DIV_FACTOR,
+            # Optimizer parameters
+            optimizer_type=OPTIMIZER_TYPE,
+            momentum=MOMENTUM,
+            nesterov=NESTEROV
+        )
+        
+        # Set refinement MLP max_delta if needed
+        if USE_REFINEMENT and hasattr(trainer.model, 'refinement_mlp'):
+            trainer.model.refinement_mlp.max_delta = MAX_DELTA
+    
+    print("Learning Rate Range Test completed")
+    print("="*50)
 
 # %% [markdown]
 # ## 7. Train the Model
@@ -447,18 +531,6 @@ if USE_REFINEMENT:
         plt.legend()
         plt.grid(True)
         plt.savefig(os.path.join(OUTPUT_DIR, 'weight_schedule.png'))
-        plt.show()
-    
-    # Plot learning rate if available
-    if 'learning_rate' in history and len(history['learning_rate']) > 0:
-        plt.figure(figsize=(10, 6))
-        plt.plot(history['learning_rate'])
-        plt.xlabel('Epoch')
-        plt.ylabel('Learning Rate')
-        plt.title(f'Learning Rate Schedule ({SCHEDULER_TYPE if SCHEDULER_TYPE else "None"})')
-        plt.yscale('log')  # Use log scale to better visualize the changes
-        plt.grid(True)
-        plt.savefig(os.path.join(OUTPUT_DIR, 'learning_rate_schedule.png'))
         plt.show()
 
 plt.tight_layout()
@@ -582,7 +654,10 @@ model_config = {
     'max_lr': MAX_LR,
     'pct_start': PCT_START,
     'div_factor': DIV_FACTOR,
-    'final_div_factor': FINAL_DIV_FACTOR
+    'final_div_factor': FINAL_DIV_FACTOR,
+    'optimizer_type': OPTIMIZER_TYPE,
+    'momentum': MOMENTUM,
+    'nesterov': NESTEROV
 }
 
 save_model_config(OUTPUT_DIR, model_config)
