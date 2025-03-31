@@ -1,17 +1,43 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Cephalometric Landmark Detection Training Script
+
+This script provides a command-line interface for training
+landmark detection models on cephalometric X-ray images.
+"""
+
 import os
+import sys
 import argparse
 import torch
 import numpy as np
 import pandas as pd
-from torch.utils.data import DataLoader
-from torchvision import transforms
+import matplotlib.pyplot as plt
+import time
 import platform
+from torch.utils.data import DataLoader
+import logging
+from tqdm import tqdm
+from torchvision import transforms
 
-from data.data_processor import DataProcessor
-from data.dataset import CephalometricDataset, ToTensor, Normalize
-from data.data_augmentation import get_train_transforms
-from models.trainer import LandmarkTrainer
-from utils.lr_finder import LRFinder
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Add parent directory to path for local imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import model and training components
+from src.models.trainer import LandmarkTrainer
+from src.data.dataset import CephalometricDataset, ToTensor, Normalize
+from src.data.data_augmentation import get_train_transforms
+from src.data.data_processor import DataProcessor
+from src.data.patient_classifier import PatientClassifier
 
 # Define TrainTransform as a top-level class so it can be pickled
 class TrainTransform:
@@ -57,25 +83,9 @@ def parse_args():
     parser.add_argument('--use_mps', action='store_true', help='Use Metal Performance Shaders (MPS) for Mac GPU acceleration')
     parser.add_argument('--force_cpu', action='store_true', help='Force CPU usage even if GPU is available')
     
-    # LR Range Test arguments
-    parser.add_argument('--run_lr_test', action='store_true', help='Run Learning Rate Range Test before training')
-    parser.add_argument('--lr_test_start', type=float, default=1e-7, help='Starting learning rate for the test')
-    parser.add_argument('--lr_test_end', type=float, default=0.01, help='Ending learning rate for the test (reduced from 1.0 to be more reasonable)')
-    parser.add_argument('--lr_test_iter', type=int, default=100, help='Number of iterations for LR test (0 for full epoch)')
-    parser.add_argument('--lr_test_mode', type=str, choices=['exp', 'linear'], default='exp', help='LR increase mode for test')
-    parser.add_argument('--lr_test_div_th', type=float, default=10.0, help='Divergence threshold for early stopping in LR test')
-    
     # Other arguments
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--num_workers', type=int, default=0, help='Number of worker threads for dataloader (0 for single process)')
-    
-    # Weight scheduling parameters
-    parser.add_argument('--use_weight_schedule', action='store_true', help='Use weight scheduling for losses')
-    parser.add_argument('--initial_heatmap_weight', type=float, default=1.0, help='Initial heatmap loss weight (if scheduling)')
-    parser.add_argument('--initial_coord_weight', type=float, default=0.01, help='Initial coordinate loss weight (if scheduling)')
-    parser.add_argument('--final_heatmap_weight', type=float, default=0.1, help='Final heatmap loss weight (if scheduling)')
-    parser.add_argument('--final_coord_weight', type=float, default=1.0, help='Final coordinate loss weight (if scheduling)')
-    parser.add_argument('--weight_schedule_epochs', type=int, default=20, help='Number of epochs for weight transition')
     
     # Learning rate scheduler arguments
     parser.add_argument('--scheduler', type=str, choices=['cosine', 'plateau', 'onecycle', 'none'], default='none', 
@@ -89,6 +99,12 @@ def parse_args():
     parser.add_argument('--pct_start', type=float, default=0.3, help='Percentage of training to increase learning rate for OneCycleLR')
     parser.add_argument('--div_factor', type=float, default=25.0, help='Initial learning rate division factor for OneCycleLR')
     parser.add_argument('--final_div_factor', type=float, default=1e4, help='Final learning rate division factor for OneCycleLR')
+    
+    # LR Range Test parameters
+    parser.add_argument('--run_lr_range_test', action='store_true', help='Run learning rate range test before training')
+    parser.add_argument('--lr_test_start', type=float, default=1e-7, help='Starting learning rate for range test')
+    parser.add_argument('--lr_test_end', type=float, default=1.0, help='End learning rate for range test')
+    parser.add_argument('--lr_test_iterations', type=int, default=100, help='Number of iterations for range test')
     
     # Optimizer arguments
     parser.add_argument('--optimizer', type=str, choices=['adam', 'adamw', 'sgd'], default='adam',
@@ -167,13 +183,11 @@ def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16,
         # First, make sure we have skeletal class information
         if 'skeletal_class' not in train_df.columns:
             print("Computing skeletal classifications for the training set...")
-            from data.patient_classifier import PatientClassifier
             classifier = PatientClassifier(landmark_cols)
             train_df = classifier.classify_patients(train_df)
         
         # Now balance the training data
         print("Balancing training data using skeletal classification...")
-        from data.patient_classifier import PatientClassifier
         classifier = PatientClassifier(landmark_cols)
         train_df = classifier.balance_classes(train_df, class_column='skeletal_class', balance_method='upsample')
         print(f"Balanced training data: {len(train_df)} samples")
@@ -331,12 +345,6 @@ def main():
         device = torch.device('cpu')
         print("Using CPU as requested with --force_cpu")
     
-    # Set default max_lr if not specified and using OneCycleLR
-    max_lr = args.max_lr
-    if args.scheduler == 'onecycle' and max_lr is None:
-        max_lr = args.learning_rate * 10  # Default to 10x base learning rate
-        print(f"Setting default max_lr for OneCycleLR to {max_lr} (10x base learning rate)")
-    
     # Log training configuration
     print("\nTraining Configuration:")
     print(f"  Model: HRNet-W32 with{'' if args.use_refinement else 'out'} refinement MLP")
@@ -358,6 +366,88 @@ def main():
         print(f"  Training data balance method: {args.balance_method} (validation and test sets maintain original distribution)")
     print(f"  Device: {'MPS (Mac GPU)' if args.use_mps else 'CUDA' if torch.cuda.is_available() and not args.force_cpu else 'CPU'}")
     print(f"  Output directory: {args.output_dir}")
+    
+    # Run LR Range Test if requested (for OneCycleLR only)
+    if args.run_lr_range_test and args.scheduler == 'onecycle':
+        from src.utils.lr_range_test import lr_range_test
+        from src.models.losses import CombinedLoss
+        from src.models.hrnet import create_hrnet_model
+        
+        print("\nRunning Learning Rate Range Test to find optimal max_lr for OneCycleLR...")
+        
+        # Create a temporary model for the test (same architecture as for training)
+        temp_model = create_hrnet_model(
+            num_landmarks=args.num_landmarks,
+            pretrained=args.pretrained,
+            use_refinement=args.use_refinement
+        )
+        
+        # Create loss function
+        test_criterion = CombinedLoss(
+            heatmap_weight=args.heatmap_weight,
+            coord_weight=args.coord_weight
+        )
+        
+        # Create optimizer
+        if args.optimizer == 'adam':
+            test_optimizer = torch.optim.Adam(
+                temp_model.parameters(), 
+                lr=args.learning_rate, 
+                weight_decay=args.weight_decay
+            )
+        elif args.optimizer == 'adamw':
+            test_optimizer = torch.optim.AdamW(
+                temp_model.parameters(), 
+                lr=args.learning_rate, 
+                weight_decay=args.weight_decay
+            )
+        elif args.optimizer == 'sgd':
+            test_optimizer = torch.optim.SGD(
+                temp_model.parameters(), 
+                lr=args.learning_rate, 
+                momentum=args.momentum,
+                weight_decay=args.weight_decay,
+                nesterov=args.nesterov
+            )
+        
+        # Move model to device
+        if args.use_mps and platform.system() == 'Darwin' and torch.backends.mps.is_available():
+            device = torch.device('mps')
+        elif torch.cuda.is_available() and not args.force_cpu:
+            device = torch.device('cuda')
+        else:
+            device = torch.device('cpu')
+        
+        temp_model.to(device)
+        
+        # Run the LR Range Test
+        lr_test_results = lr_range_test(
+            model=temp_model,
+            train_loader=train_loader,
+            criterion=test_criterion,
+            optimizer=test_optimizer,
+            device=device,
+            start_lr=args.lr_test_start,
+            end_lr=args.lr_test_end,
+            num_iterations=args.lr_test_iterations,
+            smooth_window=0.05,
+            diverge_threshold=5.0,
+            output_dir=args.output_dir
+        )
+        
+        # Update max_lr based on the test results
+        old_max_lr = args.max_lr if args.max_lr else (args.learning_rate * 10)
+        args.max_lr = lr_test_results['suggested_max_lr']
+        
+        print(f"\nLR Range Test completed. Results:")
+        print(f"  - Steepest gradient LR: {lr_test_results['steepest_slope_lr']:.6f}")
+        print(f"  - Min loss LR: {lr_test_results['min_loss_lr']:.6f}")
+        print(f"  - Suggested max_lr: {args.max_lr:.6f} (previous: {old_max_lr})")
+        
+        # Clean up memory
+        del temp_model, test_optimizer, test_criterion
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     # Create trainer
     trainer = LandmarkTrainer(
@@ -384,7 +474,7 @@ def main():
         lr_min=args.lr_min,
         lr_t_max=args.lr_t_max if args.lr_t_max > 0 else args.num_epochs // 2,
         # OneCycleLR parameters
-        max_lr=max_lr,
+        max_lr=args.max_lr,
         pct_start=args.pct_start,
         div_factor=args.div_factor,
         final_div_factor=args.final_div_factor,
@@ -393,80 +483,6 @@ def main():
         momentum=args.momentum,
         nesterov=args.nesterov
     )
-    
-    # Run Learning Rate Range Test if requested
-    if args.run_lr_test:
-        print("\n" + "="*50)
-        print("Running Learning Rate Range Test to find optimal learning rate")
-        print("="*50)
-        
-        # Create LR Finder
-        lr_finder = LRFinder(
-            model=trainer.model,
-            optimizer=trainer.optimizer,
-            criterion=trainer.criterion,
-            device=trainer.device
-        )
-        
-        # Run the range test
-        history = lr_finder.range_test(
-            train_loader=train_loader,
-            start_lr=args.lr_test_start,
-            end_lr=args.lr_test_end,
-            num_iter=args.lr_test_iter if args.lr_test_iter > 0 else None,
-            step_mode=args.lr_test_mode,
-            diverge_threshold=args.lr_test_div_th
-        )
-        
-        # Plot and get suggested learning rate
-        suggested_lr = lr_finder.plot(
-            output_dir=args.output_dir,
-            skip_start=5,
-            skip_end=5
-        )
-        
-        # Use the suggested learning rate if available and we're using OneCycleLR
-        if suggested_lr is not None and args.scheduler == 'onecycle':
-            print(f"Updating max_lr from {max_lr} to {suggested_lr}")
-            max_lr = suggested_lr
-            
-            # Recreate the trainer with the new max_lr
-            trainer = LandmarkTrainer(
-                num_landmarks=args.num_landmarks,
-                learning_rate=args.learning_rate,
-                weight_decay=args.weight_decay,
-                device=device,  # Auto-select or forced CPU
-                output_dir=args.output_dir,
-                use_refinement=args.use_refinement,
-                heatmap_weight=args.heatmap_weight,
-                coord_weight=args.coord_weight,
-                use_mps=args.use_mps,
-                # Weight scheduling parameters
-                use_weight_schedule=args.use_weight_schedule,
-                initial_heatmap_weight=args.initial_heatmap_weight,
-                initial_coord_weight=args.initial_coord_weight,
-                final_heatmap_weight=args.final_heatmap_weight,
-                final_coord_weight=args.final_coord_weight,
-                weight_schedule_epochs=args.weight_schedule_epochs,
-                # Learning rate scheduler parameters
-                scheduler_type=None if args.scheduler == 'none' else args.scheduler,
-                lr_patience=args.lr_patience,
-                lr_factor=args.lr_factor,
-                lr_min=args.lr_min,
-                lr_t_max=args.lr_t_max if args.lr_t_max > 0 else args.num_epochs // 2,
-                # OneCycleLR parameters
-                max_lr=max_lr,
-                pct_start=args.pct_start,
-                div_factor=args.div_factor,
-                final_div_factor=args.final_div_factor,
-                # Optimizer parameters
-                optimizer_type=args.optimizer,
-                momentum=args.momentum,
-                nesterov=args.nesterov
-            )
-        
-        print("Learning Rate Range Test completed")
-        print("="*50)
     
     # Train model
     print("\nStarting training...")

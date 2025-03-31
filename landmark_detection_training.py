@@ -33,7 +33,6 @@ from src.models.trainer import LandmarkTrainer
 from src.data.dataset import CephalometricDataset, ToTensor, Normalize
 from src.data.data_augmentation import get_train_transforms
 from src.data.data_processor import DataProcessor
-from src.utils.lr_finder import LRFinder
 
 # Set random seed for reproducibility
 def set_seed(seed=42):
@@ -117,14 +116,6 @@ FINAL_DIV_FACTOR = 1e4  # Final learning rate division factor (final_lr = initia
 OPTIMIZER_TYPE = 'adam'  # 'adam', 'adamw', or 'sgd'
 MOMENTUM = 0.9  # Momentum factor for SGD optimizer
 NESTEROV = True  # Whether to use Nesterov momentum for SGD optimizer
-
-# LR Range Test parameters
-RUN_LR_RANGE_TEST = True  # Whether to run the LR Range Test before training
-LR_TEST_START = 1e-7      # Starting learning rate for the test
-LR_TEST_END = 0.01        # Ending learning rate for the test (reduced from 1.0 to 0.01)
-LR_TEST_NUM_ITER = 100    # Number of iterations to run (0 for full epoch)
-LR_TEST_STEP_MODE = 'exp' # 'exp' or 'linear'
-LR_TEST_DIVERGE_TH = 10.0 # Divergence threshold (increased from default 5.0)
 
 # %% [markdown]
 # ## 3. Set Up Device
@@ -300,6 +291,81 @@ print(f"  Validation samples: {len(val_dataset)}")
 print(f"  Test samples: {len(test_dataset)}")
 
 # %% [markdown]
+# ## 5.5 Perform Learning Rate Range Test
+# 
+# Before we start training, we'll run a Learning Rate Range Test to find the optimal maximum learning rate for the OneCycleLR scheduler.
+# This test trains the model for a few batches while increasing the learning rate exponentially and monitoring the loss.
+# The point where the loss starts to diverge or plateau gives us insights on a good learning rate to use.
+
+# %%
+# Import the Learning Rate Range Test utility
+from src.utils.lr_range_test import lr_range_test
+
+# Flag to determine whether to run the LR Range Test
+RUN_LR_RANGE_TEST = True  # Set to False to skip the test if you already know a good max_lr value
+
+if RUN_LR_RANGE_TEST and SCHEDULER_TYPE == 'onecycle':
+    print("\nRunning Learning Rate Range Test to find optimal max_lr for OneCycleLR...")
+    
+    # Create a temporary model for the LR Range Test (using the same architecture as the training model)
+    temp_model = create_hrnet_model(
+        num_landmarks=NUM_LANDMARKS,
+        pretrained=PRETRAINED,
+        use_refinement=USE_REFINEMENT,
+        hrnet_type=HRNET_TYPE
+    )
+    temp_model.to(device)
+    
+    # Create a loss function for the LR Range Test
+    from src.models.losses import CombinedLoss
+    criterion = CombinedLoss(
+        heatmap_weight=HEATMAP_WEIGHT, 
+        coord_weight=COORD_WEIGHT
+    )
+    
+    # Create an optimizer for the LR Range Test
+    if OPTIMIZER_TYPE == 'adam':
+        optimizer = torch.optim.Adam(temp_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    elif OPTIMIZER_TYPE == 'adamw':
+        optimizer = torch.optim.AdamW(temp_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    elif OPTIMIZER_TYPE == 'sgd':
+        optimizer = torch.optim.SGD(
+            temp_model.parameters(), 
+            lr=LEARNING_RATE, 
+            momentum=MOMENTUM, 
+            weight_decay=WEIGHT_DECAY,
+            nesterov=NESTEROV
+        )
+    
+    # Run the LR Range Test
+    lr_test_results = lr_range_test(
+        model=temp_model,
+        train_loader=train_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        device=device,
+        start_lr=1e-7,
+        end_lr=1.0,
+        num_iterations=100,  # Limit to 100 iterations for speed
+        smooth_window=0.05,
+        diverge_threshold=5.0,
+        output_dir=OUTPUT_DIR
+    )
+    
+    # Update the MAX_LR based on the test results
+    old_max_lr = MAX_LR
+    MAX_LR = lr_test_results['suggested_max_lr']
+    
+    print(f"\nLR Range Test completed. Results:")
+    print(f"  - Steepest gradient LR: {lr_test_results['steepest_slope_lr']:.6f}")
+    print(f"  - Min loss LR: {lr_test_results['min_loss_lr']:.6f}")
+    print(f"  - Suggested max_lr: {MAX_LR:.6f} (previous: {old_max_lr})")
+    
+    # Clean up to free memory
+    del temp_model, optimizer, criterion
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+# %% [markdown]
 # ## 6. Create and Train the Model
 
 # %%
@@ -372,85 +438,6 @@ if BALANCE_CLASSES:
     print(f"Class balancing: Enabled (method: {BALANCE_METHOD})")
 else:
     print(f"Class balancing: Disabled")
-
-# Run Learning Rate Range Test if requested
-if RUN_LR_RANGE_TEST:
-    print("\n" + "="*50)
-    print("Running Learning Rate Range Test to find optimal learning rate")
-    print("="*50)
-    
-    # Create LR Finder
-    lr_finder = LRFinder(
-        model=trainer.model,
-        optimizer=trainer.optimizer,
-        criterion=trainer.criterion,
-        device=device
-    )
-    
-    # Run the range test
-    history = lr_finder.range_test(
-        train_loader=train_loader,
-        start_lr=LR_TEST_START,
-        end_lr=LR_TEST_END,
-        num_iter=LR_TEST_NUM_ITER,
-        step_mode=LR_TEST_STEP_MODE,
-        diverge_threshold=LR_TEST_DIVERGE_TH
-    )
-    
-    # Plot and get suggested learning rate
-    suggested_lr = lr_finder.plot(
-        output_dir=OUTPUT_DIR,
-        skip_start=5,
-        skip_end=5
-    )
-    
-    # Use the suggested learning rate if available and we're using OneCycleLR
-    if suggested_lr is not None and SCHEDULER_TYPE == 'onecycle':
-        print(f"Updating MAX_LR from {MAX_LR} to {suggested_lr}")
-        MAX_LR = suggested_lr
-        
-        # Recreate the trainer with the new MAX_LR
-        trainer = LandmarkTrainer(
-            num_landmarks=NUM_LANDMARKS,
-            learning_rate=LEARNING_RATE,
-            weight_decay=WEIGHT_DECAY,
-            device=device,
-            output_dir=OUTPUT_DIR,
-            use_refinement=USE_REFINEMENT,
-            heatmap_weight=HEATMAP_WEIGHT,
-            coord_weight=COORD_WEIGHT,
-            use_mps=USE_MPS,
-            hrnet_type=HRNET_TYPE,
-            # Weight scheduling parameters
-            use_weight_schedule=USE_WEIGHT_SCHEDULE,
-            initial_heatmap_weight=INITIAL_HEATMAP_WEIGHT,
-            initial_coord_weight=INITIAL_COORD_WEIGHT,
-            final_heatmap_weight=FINAL_HEATMAP_WEIGHT,
-            final_coord_weight=FINAL_COORD_WEIGHT,
-            weight_schedule_epochs=WEIGHT_SCHEDULE_EPOCHS,
-            # Learning rate scheduler parameters
-            scheduler_type=SCHEDULER_TYPE,
-            lr_patience=LR_PATIENCE,
-            lr_factor=LR_FACTOR,
-            lr_min=LR_MIN,
-            lr_t_max=LR_T_MAX,
-            # OneCycleLR parameters
-            max_lr=MAX_LR,
-            pct_start=PCT_START,
-            div_factor=DIV_FACTOR,
-            final_div_factor=FINAL_DIV_FACTOR,
-            # Optimizer parameters
-            optimizer_type=OPTIMIZER_TYPE,
-            momentum=MOMENTUM,
-            nesterov=NESTEROV
-        )
-        
-        # Set refinement MLP max_delta if needed
-        if USE_REFINEMENT and hasattr(trainer.model, 'refinement_mlp'):
-            trainer.model.refinement_mlp.max_delta = MAX_DELTA
-    
-    print("Learning Rate Range Test completed")
-    print("="*50)
 
 # %% [markdown]
 # ## 7. Train the Model
