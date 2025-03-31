@@ -43,6 +43,12 @@ class LandmarkTrainer:
                  lr_factor=0.5,
                  lr_min=1e-6,
                  lr_t_max=10,
+                 # OneCycleLR parameters
+                 max_lr=None,
+                 pct_start=0.3,
+                 div_factor=25.0,
+                 final_div_factor=1e4,
+                 # Optimizer parameters
                  optimizer_type='adam',
                  momentum=0.9,
                  nesterov=True):
@@ -71,6 +77,10 @@ class LandmarkTrainer:
             lr_factor (float): Factor by which to reduce learning rate for ReduceLROnPlateau
             lr_min (float): Minimum learning rate for schedulers
             lr_t_max (int): T_max parameter for CosineAnnealingLR (usually set to num_epochs/2)
+            max_lr (float): Maximum learning rate for OneCycleLR (defaults to 10x learning_rate if None)
+            pct_start (float): Percentage of training to increase learning rate for OneCycleLR
+            div_factor (float): Initial learning rate division factor for OneCycleLR
+            final_div_factor (float): Final learning rate division factor for OneCycleLR
             optimizer_type (str): Type of optimizer to use ('adam', 'adamw', 'sgd')
             momentum (float): Momentum factor for SGD optimizer
             nesterov (bool): Whether to use Nesterov momentum for SGD
@@ -82,7 +92,7 @@ class LandmarkTrainer:
             # Check for MPS (Mac GPU) availability
             if use_mps and torch.backends.mps.is_available() and platform.system() == 'Darwin':
                 self.device = torch.device('mps')
-                print("Using MPS device (Apple Silicon GPU)")
+                print("Using MPS (Metal Performance Shaders) for Mac GPU acceleration")
             elif torch.cuda.is_available():
                 self.device = torch.device('cuda')
                 print("Using CUDA device")
@@ -134,6 +144,17 @@ class LandmarkTrainer:
             raise ValueError(f"Unsupported optimizer type: {optimizer_type}. "
                             "Choose from 'adam', 'adamw', or 'sgd'.")
         
+        # Store OneCycleLR parameters
+        if max_lr is None:
+            max_lr = learning_rate * 10  # Default to 10x base learning rate
+        
+        self.onecycle_params = {
+            'max_lr': max_lr,
+            'pct_start': pct_start,
+            'div_factor': div_factor,
+            'final_div_factor': final_div_factor
+        }
+        
         # Learning rate scheduler parameters
         self.scheduler_type = scheduler_type
         self.scheduler = None
@@ -148,6 +169,10 @@ class LandmarkTrainer:
                 patience=lr_patience, verbose=True, min_lr=lr_min
             )
             print(f"Using ReduceLROnPlateau scheduler with patience={lr_patience}, factor={lr_factor}, min_lr={lr_min}")
+        elif scheduler_type == 'onecycle':
+            # OneCycleLR scheduler will be initialized in the train method when we know total_steps
+            print(f"Will use OneCycleLR scheduler with max_lr={max_lr}, pct_start={pct_start}")
+            print(f"  div_factor={div_factor}, final_div_factor={final_div_factor}")
         
         # Weight scheduling parameters
         self.use_weight_schedule = use_weight_schedule
