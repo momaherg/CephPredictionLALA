@@ -126,7 +126,10 @@ class LRFinder:
             # Get current learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
             
-            # Compute smoothed loss
+            # Initialize smoothed_loss with current loss value
+            smoothed_loss = loss.item()
+            
+            # Compute smoothed loss using exponential moving average if requested
             if loss_smoothing:
                 if iteration == 0:
                     avg_loss = loss.item()
@@ -134,8 +137,6 @@ class LRFinder:
                     avg_loss = beta * avg_loss + (1 - beta) * loss.item()
                     # Bias correction
                     smoothed_loss = avg_loss / (1 - beta ** (iteration + 1))
-            else:
-                smoothed_loss = loss.item()
             
             # Record lr and loss
             self.history['lr'].append(current_lr)
