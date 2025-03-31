@@ -385,7 +385,9 @@ def main():
         # Create loss function
         test_criterion = CombinedLoss(
             heatmap_weight=args.heatmap_weight,
-            coord_weight=args.coord_weight
+            coord_weight=args.coord_weight,
+            output_size=(64, 64),   # Heatmap size
+            image_size=(224, 224)   # Original image size
         )
         
         # Create optimizer

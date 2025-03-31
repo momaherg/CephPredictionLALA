@@ -320,7 +320,9 @@ if RUN_LR_RANGE_TEST and SCHEDULER_TYPE == 'onecycle':
     from src.models.losses import CombinedLoss
     criterion = CombinedLoss(
         heatmap_weight=HEATMAP_WEIGHT, 
-        coord_weight=COORD_WEIGHT
+        coord_weight=COORD_WEIGHT,
+        output_size=(64, 64),   # Heatmap size
+        image_size=(224, 224)   # Original image size
     )
     
     # Create an optimizer for the LR Range Test
