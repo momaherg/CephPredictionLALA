@@ -31,7 +31,23 @@ class LandmarkTrainer:
                  heatmap_weight=1.0,
                  coord_weight=1.0,
                  use_mps=False,
-                 hrnet_type='w32'):
+                 hrnet_type='w32',
+                 use_weight_schedule=False,
+                 initial_heatmap_weight=1.0,
+                 initial_coord_weight=0.1,
+                 final_heatmap_weight=0.5,
+                 final_coord_weight=1.0,
+                 weight_schedule_epochs=30,
+                 scheduler_type=None,
+                 lr_patience=5,
+                 lr_factor=0.5,
+                 lr_min=1e-6,
+                 lr_t_max=10,
+                 total_steps=None,
+                 max_lr=None,
+                 pct_start=0.3,
+                 div_factor=25.0,
+                 final_div_factor=1e4):
         """
         Initialize trainer
         
@@ -42,10 +58,26 @@ class LandmarkTrainer:
             device (torch.device): Device to use for training
             output_dir (str): Directory to save outputs
             use_refinement (bool): Whether to use refinement MLP
-            heatmap_weight (float): Weight for heatmap loss
-            coord_weight (float): Weight for coordinate loss
+            heatmap_weight (float): Weight for heatmap loss (used when use_weight_schedule=False)
+            coord_weight (float): Weight for coordinate loss (used when use_weight_schedule=False)
             use_mps (bool): Whether to use MPS device on Mac
             hrnet_type (str): HRNet variant to use ('w32' or 'w48')
+            use_weight_schedule (bool): Whether to use dynamic weight scheduling
+            initial_heatmap_weight (float): Initial weight for heatmap loss in schedule
+            initial_coord_weight (float): Initial weight for coordinate loss in schedule
+            final_heatmap_weight (float): Final weight for heatmap loss in schedule
+            final_coord_weight (float): Final weight for coordinate loss in schedule
+            weight_schedule_epochs (int): Number of epochs to transition from initial to final weights
+            scheduler_type (str): Type of learning rate scheduler to use ('cosine', 'plateau', 'onecycle', or None)
+            lr_patience (int): Patience for ReduceLROnPlateau scheduler
+            lr_factor (float): Factor by which to reduce learning rate for ReduceLROnPlateau
+            lr_min (float): Minimum learning rate for schedulers
+            lr_t_max (int): T_max parameter for CosineAnnealingLR (usually set to num_epochs/2)
+            total_steps (int): Total number of training steps for OneCycleLR (epochs * steps_per_epoch)
+            max_lr (float): Maximum learning rate for OneCycleLR (defaults to 10x learning_rate if None)
+            pct_start (float): Percentage of training spent increasing learning rate for OneCycleLR
+            div_factor (float): Initial learning rate division factor for OneCycleLR
+            final_div_factor (float): Final learning rate division factor for OneCycleLR
         """
         # Set device
         if device is not None:
@@ -74,11 +106,64 @@ class LandmarkTrainer:
         # Create optimizer
         self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         
+        # Learning rate scheduler parameters
+        self.scheduler_type = scheduler_type
+        self.scheduler = None
+        
+        if scheduler_type == 'cosine':
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=lr_t_max, eta_min=lr_min
+            )
+            print(f"Using CosineAnnealingLR scheduler with T_max={lr_t_max}, min_lr={lr_min}")
+        
+        elif scheduler_type == 'plateau':
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='min', factor=lr_factor, 
+                patience=lr_patience, verbose=True, min_lr=lr_min
+            )
+            print(f"Using ReduceLROnPlateau scheduler with patience={lr_patience}, factor={lr_factor}, min_lr={lr_min}")
+        
+        elif scheduler_type == 'onecycle':
+            # If max_lr not specified, use 10x the base learning rate
+            if max_lr is None:
+                max_lr = learning_rate * 10
+            
+            # If total_steps not provided, it will be set during training when we know steps_per_epoch
+            if total_steps:
+                self.scheduler = optim.lr_scheduler.OneCycleLR(
+                    self.optimizer, max_lr=max_lr, total_steps=total_steps,
+                    pct_start=pct_start, div_factor=div_factor, 
+                    final_div_factor=final_div_factor
+                )
+                print(f"Using OneCycleLR scheduler with max_lr={max_lr}, total_steps={total_steps}, "
+                      f"pct_start={pct_start}, div_factor={div_factor}, final_div_factor={final_div_factor}")
+            else:
+                # Store parameters for later initialization
+                self.onecycle_params = {
+                    'max_lr': max_lr,
+                    'pct_start': pct_start,
+                    'div_factor': div_factor,
+                    'final_div_factor': final_div_factor
+                }
+                print(f"OneCycleLR scheduler will be initialized during training with max_lr={max_lr}")
+        
+        # Weight scheduling parameters
+        self.use_weight_schedule = use_weight_schedule
+        self.initial_heatmap_weight = initial_heatmap_weight
+        self.initial_coord_weight = initial_coord_weight
+        self.final_heatmap_weight = final_heatmap_weight
+        self.final_coord_weight = final_coord_weight
+        self.weight_schedule_epochs = weight_schedule_epochs
+        
+        # Set current weights (will be updated if scheduling is used)
+        self.current_heatmap_weight = initial_heatmap_weight if use_weight_schedule else heatmap_weight
+        self.current_coord_weight = initial_coord_weight if use_weight_schedule else coord_weight
+        
         # Create loss function
         if use_refinement:
             self.criterion = CombinedLoss(
-                heatmap_weight=heatmap_weight, 
-                coord_weight=coord_weight,
+                heatmap_weight=self.current_heatmap_weight, 
+                coord_weight=self.current_coord_weight,
                 output_size=(64, 64),   # Heatmap size
                 image_size=(224, 224)   # Original image size
             )
@@ -107,7 +192,10 @@ class LandmarkTrainer:
             'train_coord_loss': [],
             'val_coord_loss': [],
             'train_med': [],  # Mean Euclidean Distance
-            'val_med': []     # Mean Euclidean Distance
+            'val_med': [],    # Mean Euclidean Distance
+            'heatmap_weight': [],
+            'coord_weight': [],
+            'learning_rate': []  # Track learning rate changes
         }
     
     def train_epoch(self, train_loader):
@@ -155,9 +243,17 @@ class LandmarkTrainer:
             loss.backward()
             self.optimizer.step()
             
+            # Step OneCycleLR scheduler if used
+            if self.scheduler_type == 'onecycle':
+                self.scheduler.step()
+                # Update progress bar to show current learning rate
+                current_lr = self.optimizer.param_groups[0]['lr']
+                pbar.set_postfix(loss=loss.item(), lr=f"{current_lr:.2e}")
+            else:
+                pbar.set_postfix(loss=loss.item())
+            
             # Update statistics
             epoch_loss += loss.item()
-            pbar.set_postfix(loss=loss.item())
             
             # Get landmark predictions for metrics
             with torch.no_grad():
@@ -249,66 +345,113 @@ class LandmarkTrainer:
             val_loader (DataLoader): DataLoader for validation data
             num_epochs (int): Number of epochs to train
             save_freq (int): Frequency of saving model checkpoints
-            
-        Returns:
-            dict: Training history
         """
-        # Create output directory
-        os.makedirs(os.path.join(self.output_dir, 'checkpoints'), exist_ok=True)
-        
-        # Training loop
         best_val_loss = float('inf')
+        best_val_med = float('inf')  # Also track best validation MED
+        start_time = time.time()
+        
+        # Initialize OneCycleLR scheduler if needed (requires knowing steps_per_epoch)
+        if self.scheduler_type == 'onecycle' and self.scheduler is None:
+            steps_per_epoch = len(train_loader)
+            total_steps = steps_per_epoch * num_epochs
+            self.scheduler = optim.lr_scheduler.OneCycleLR(
+                self.optimizer, 
+                max_lr=self.onecycle_params['max_lr'],
+                total_steps=total_steps,
+                pct_start=self.onecycle_params['pct_start'],
+                div_factor=self.onecycle_params['div_factor'],
+                final_div_factor=self.onecycle_params['final_div_factor']
+            )
+            print(f"OneCycleLR scheduler initialized with total_steps={total_steps}")
+        
+        print(f"Starting training for {num_epochs} epochs...")
+        print(f"Initial weights: heatmap={self.current_heatmap_weight:.2f}, coord={self.current_coord_weight:.2f}")
         
         for epoch in range(num_epochs):
-            # Train for one epoch
+            # Update loss weights if using weight schedule
+            if self.use_weight_schedule and self.use_refinement:
+                if epoch < self.weight_schedule_epochs:
+                    # Linear interpolation between initial and final weights
+                    progress = epoch / self.weight_schedule_epochs
+                    self.current_heatmap_weight = self.initial_heatmap_weight + progress * (self.final_heatmap_weight - self.initial_heatmap_weight)
+                    self.current_coord_weight = self.initial_coord_weight + progress * (self.final_coord_weight - self.initial_coord_weight)
+                else:
+                    # Use final weights after transition period
+                    self.current_heatmap_weight = self.final_heatmap_weight
+                    self.current_coord_weight = self.final_coord_weight
+                
+                # Update the loss function weights
+                self.criterion.heatmap_weight = self.current_heatmap_weight
+                self.criterion.coord_weight = self.current_coord_weight
+                
+                print(f"Epoch {epoch+1}/{num_epochs}: Updated weights - heatmap={self.current_heatmap_weight:.2f}, coord={self.current_coord_weight:.2f}")
+            
+            # Train one epoch
             train_loss, train_heatmap_loss, train_coord_loss, train_med = self.train_epoch(train_loader)
             
             # Validate
             val_loss, val_heatmap_loss, val_coord_loss, val_med = self.validate(val_loader)
             
+            # Get current learning rate
+            current_lr = self.optimizer.param_groups[0]['lr']
+            
             # Update history
             self.history['train_loss'].append(train_loss)
             self.history['val_loss'].append(val_loss)
-            
-            if self.use_refinement:
-                self.history['train_heatmap_loss'].append(train_heatmap_loss)
-                self.history['val_heatmap_loss'].append(val_heatmap_loss)
-                self.history['train_coord_loss'].append(train_coord_loss)
-                self.history['val_coord_loss'].append(val_coord_loss)
-            
+            self.history['train_heatmap_loss'].append(train_heatmap_loss)
+            self.history['val_heatmap_loss'].append(val_heatmap_loss)
+            self.history['train_coord_loss'].append(train_coord_loss)
+            self.history['val_coord_loss'].append(val_coord_loss)
             self.history['train_med'].append(train_med)
             self.history['val_med'].append(val_med)
+            self.history['heatmap_weight'].append(self.current_heatmap_weight)
+            self.history['coord_weight'].append(self.current_coord_weight)
+            self.history['learning_rate'].append(current_lr)
+            
+            # Update learning rate scheduler (except OneCycleLR which is updated per batch)
+            if self.scheduler_type == 'cosine':
+                self.scheduler.step()
+                print(f"Learning rate updated to {self.optimizer.param_groups[0]['lr']:.2e}")
+            elif self.scheduler_type == 'plateau':
+                # For ReduceLROnPlateau, we use validation MED as the metric to monitor
+                self.scheduler.step(val_med)
             
             # Print progress
-            if self.use_refinement:
-                print(f"Epoch {epoch+1}/{num_epochs} - "
-                      f"Train Loss: {train_loss:.6f} (Heatmap: {train_heatmap_loss:.6f}, Coord: {train_coord_loss:.6f}), Train MED: {train_med:.2f} - "
-                      f"Val Loss: {val_loss:.6f} (Heatmap: {val_heatmap_loss:.6f}, Coord: {val_coord_loss:.6f}), Val MED: {val_med:.2f}")
-            else:
-                print(f"Epoch {epoch+1}/{num_epochs} - "
-                      f"Train Loss: {train_loss:.6f}, Train MED: {train_med:.2f} - "
-                      f"Val Loss: {val_loss:.6f}, Val MED: {val_med:.2f}")
+            elapsed_time = time.time() - start_time
+            print(f"Epoch {epoch+1}/{num_epochs} - "
+                  f"Loss: {train_loss:.4f}/{val_loss:.4f} "
+                  f"(train/val) - MED: {train_med:.2f}/{val_med:.2f} pixels - "
+                  f"LR: {current_lr:.2e} - "
+                  f"Time: {elapsed_time:.2f}s")
             
-            # Save checkpoint
-            if (epoch + 1) % save_freq == 0:
-                checkpoint_path = os.path.join(self.output_dir, 'checkpoints', f'checkpoint_epoch_{epoch+1}.pth')
-                self.save_checkpoint(checkpoint_path)
-            
-            # Save best model
+            # Save if best validation loss
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                best_model_path = os.path.join(self.output_dir, 'best_model.pth')
-                self.save_checkpoint(best_model_path)
-                print(f"Saved best model with validation loss: {val_loss:.6f}")
+                self.save_checkpoint(os.path.join(self.output_dir, 'best_model_loss.pth'))
+                print(f"Saved best model (by loss) with validation loss: {val_loss:.4f}")
             
-            # Plot and save training curves
-            self.plot_training_curves()
+            # Also save if best validation MED (this might be a better metric for landmark detection)
+            if val_med < best_val_med:
+                best_val_med = val_med
+                self.save_checkpoint(os.path.join(self.output_dir, 'best_model_med.pth'))
+                print(f"Saved best model (by MED) with validation MED: {val_med:.2f} pixels")
+            
+            # Save checkpoint periodically
+            if (epoch + 1) % save_freq == 0:
+                self.save_checkpoint(os.path.join(self.output_dir, f'checkpoint_epoch_{epoch+1}.pth'))
+                print(f"Saved checkpoint at epoch {epoch+1}")
+                
+                # Plot training curves at checkpoint epochs
+                self.plot_training_curves()
         
         # Save final model
-        final_model_path = os.path.join(self.output_dir, 'final_model.pth')
-        self.save_checkpoint(final_model_path)
+        self.save_checkpoint(os.path.join(self.output_dir, 'final_model.pth'))
+        print(f"Saved final model checkpoint after {num_epochs} epochs")
         
-        return self.history
+        # Plot final training curves
+        self.plot_training_curves()
+        
+        print(f"Training completed in {time.time() - start_time:.2f} seconds")
     
     def save_checkpoint(self, path):
         """
@@ -321,8 +464,16 @@ class LandmarkTrainer:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'history': self.history,
-            'use_refinement': self.use_refinement
+            'use_refinement': self.use_refinement,
+            'current_heatmap_weight': self.current_heatmap_weight,
+            'current_coord_weight': self.current_coord_weight,
+            'scheduler_type': self.scheduler_type
         }
+        
+        # Save scheduler state if it exists
+        if self.scheduler is not None:
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+        
         torch.save(checkpoint, path)
     
     def load_checkpoint(self, path):
@@ -337,69 +488,104 @@ class LandmarkTrainer:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.history = checkpoint['history']
         self.use_refinement = checkpoint.get('use_refinement', False)
+        
+        # Load loss weights
+        self.current_heatmap_weight = checkpoint.get('current_heatmap_weight', 1.0)
+        self.current_coord_weight = checkpoint.get('current_coord_weight', 1.0)
+        
+        # Update loss function weights if using refinement
+        if self.use_refinement:
+            self.criterion.heatmap_weight = self.current_heatmap_weight
+            self.criterion.coord_weight = self.current_coord_weight
+        
+        # Load scheduler state if it exists and matches current config
+        if 'scheduler_state_dict' in checkpoint and self.scheduler is not None:
+            # Check if scheduler types match
+            if checkpoint.get('scheduler_type') == self.scheduler_type:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print(f"Loaded scheduler state with current learning rate: {self.optimizer.param_groups[0]['lr']:.2e}")
     
     def plot_training_curves(self):
         """
         Plot and save training curves
         """
-        # Create figure with more subplots if using refinement
-        if self.use_refinement:
-            plt.figure(figsize=(12, 12))
-            
-            # Plot total loss curves
-            plt.subplot(3, 1, 1)
-            plt.plot(self.history['train_loss'], label='Train Loss')
-            plt.plot(self.history['val_loss'], label='Validation Loss')
-            plt.title('Total Loss')
-            plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.legend()
-            
-            # Plot component loss curves
-            plt.subplot(3, 1, 2)
-            plt.plot(self.history['train_heatmap_loss'], label='Train Heatmap Loss')
-            plt.plot(self.history['val_heatmap_loss'], label='Val Heatmap Loss')
-            plt.plot(self.history['train_coord_loss'], label='Train Coord Loss')
-            plt.plot(self.history['val_coord_loss'], label='Val Coord Loss')
-            plt.title('Component Losses')
-            plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.legend()
-            
-            # Plot MED curves
-            plt.subplot(3, 1, 3)
-            plt.plot(self.history['train_med'], label='Train MED')
-            plt.plot(self.history['val_med'], label='Validation MED')
-            plt.title('Mean Euclidean Distance')
-            plt.xlabel('Epoch')
-            plt.ylabel('Pixels')
-            plt.legend()
-        else:
-            # Standard plot for non-refinement model
-            plt.figure(figsize=(12, 8))
-            
-            # Plot loss curves
-            plt.subplot(2, 1, 1)
-            plt.plot(self.history['train_loss'], label='Train Loss')
-            plt.plot(self.history['val_loss'], label='Validation Loss')
-            plt.title('Loss Curves')
-            plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.legend()
-            
-            # Plot MED curves
-            plt.subplot(2, 1, 2)
-            plt.plot(self.history['train_med'], label='Train MED')
-            plt.plot(self.history['val_med'], label='Validation MED')
-            plt.title('Mean Euclidean Distance')
-            plt.xlabel('Epoch')
-            plt.ylabel('Pixels')
-            plt.legend()
+        # Create figures directory
+        figures_dir = os.path.join(self.output_dir, 'figures')
+        os.makedirs(figures_dir, exist_ok=True)
         
-        # Adjust layout and save figure
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, 'training_curves.png'))
+        # Plot loss curves
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.history['train_loss'], label='Train Loss')
+        plt.plot(self.history['val_loss'], label='Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training and Validation Loss')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(figures_dir, 'loss_curves.png'))
         plt.close()
+        
+        if self.use_refinement:
+            # Plot heatmap loss curves
+            plt.figure(figsize=(10, 6))
+            plt.plot(self.history['train_heatmap_loss'], label='Train Heatmap Loss')
+            plt.plot(self.history['val_heatmap_loss'], label='Validation Heatmap Loss')
+            plt.xlabel('Epoch')
+            plt.ylabel('Heatmap Loss')
+            plt.title('Heatmap Loss')
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(figures_dir, 'heatmap_loss_curves.png'))
+            plt.close()
+            
+            # Plot coordinate loss curves
+            plt.figure(figsize=(10, 6))
+            plt.plot(self.history['train_coord_loss'], label='Train Coordinate Loss')
+            plt.plot(self.history['val_coord_loss'], label='Validation Coordinate Loss')
+            plt.xlabel('Epoch')
+            plt.ylabel('Coordinate Loss')
+            plt.title('Coordinate Loss')
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(figures_dir, 'coord_loss_curves.png'))
+            plt.close()
+        
+        # Plot MED curves
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.history['train_med'], label='Train MED')
+        plt.plot(self.history['val_med'], label='Validation MED')
+        plt.xlabel('Epoch')
+        plt.ylabel('Mean Euclidean Distance (pixels)')
+        plt.title('Mean Euclidean Distance (MED)')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(figures_dir, 'med_curves.png'))
+        plt.close()
+        
+        # Plot weight schedule if using it
+        if self.use_weight_schedule and len(self.history['heatmap_weight']) > 0:
+            plt.figure(figsize=(10, 6))
+            plt.plot(self.history['heatmap_weight'], label='Heatmap Weight')
+            plt.plot(self.history['coord_weight'], label='Coordinate Weight')
+            plt.xlabel('Epoch')
+            plt.ylabel('Weight Value')
+            plt.title('Loss Weight Schedule')
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(figures_dir, 'weight_schedule.png'))
+            plt.close()
+        
+        # Plot learning rate
+        if len(self.history['learning_rate']) > 0:
+            plt.figure(figsize=(10, 6))
+            plt.plot(self.history['learning_rate'])
+            plt.xlabel('Epoch')
+            plt.ylabel('Learning Rate')
+            plt.title(f'Learning Rate Schedule ({self.scheduler_type if self.scheduler_type else "None"})')
+            plt.yscale('log')  # Use log scale to better visualize the changes
+            plt.grid(True)
+            plt.savefig(os.path.join(figures_dir, 'learning_rate_schedule.png'))
+            plt.close()
     
     def evaluate(self, test_loader, save_visualizations=True, landmark_names=None, landmark_cols=None):
         """

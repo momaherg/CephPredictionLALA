@@ -43,8 +43,29 @@ def parse_args():
     parser.add_argument('--num_landmarks', type=int, default=19, help='Number of landmarks to detect')
     parser.add_argument('--pretrained', action='store_true', help='Use pretrained HRNet backbone')
     parser.add_argument('--use_refinement', action='store_true', help='Use refinement MLP for coordinate regression')
-    parser.add_argument('--heatmap_weight', type=float, default=1.0, help='Weight for heatmap loss')
-    parser.add_argument('--coord_weight', type=float, default=0.1, help='Weight for coordinate loss')
+    parser.add_argument('--heatmap_weight', type=float, default=1.0, help='Weight for heatmap loss (when not using weight scheduling)')
+    parser.add_argument('--coord_weight', type=float, default=0.1, help='Weight for coordinate loss (when not using weight scheduling)')
+    
+    # Weight scheduling arguments
+    parser.add_argument('--use_weight_schedule', action='store_true', help='Use dynamic weight scheduling between heatmap and coordinate losses')
+    parser.add_argument('--initial_heatmap_weight', type=float, default=1.0, help='Initial weight for heatmap loss in schedule')
+    parser.add_argument('--initial_coord_weight', type=float, default=0.1, help='Initial weight for coordinate loss in schedule')
+    parser.add_argument('--final_heatmap_weight', type=float, default=0.5, help='Final weight for heatmap loss in schedule')
+    parser.add_argument('--final_coord_weight', type=float, default=1.0, help='Final weight for coordinate loss in schedule')
+    parser.add_argument('--weight_schedule_epochs', type=int, default=30, help='Number of epochs to transition from initial to final weights')
+    
+    # Learning rate scheduler arguments
+    parser.add_argument('--scheduler', type=str, choices=['cosine', 'plateau', 'onecycle', 'none'], default='none', 
+                        help='Learning rate scheduler type')
+    parser.add_argument('--lr_patience', type=int, default=5, help='Patience for ReduceLROnPlateau scheduler')
+    parser.add_argument('--lr_factor', type=float, default=0.5, help='Factor to reduce learning rate for ReduceLROnPlateau')
+    parser.add_argument('--lr_min', type=float, default=1e-6, help='Minimum learning rate for schedulers')
+    parser.add_argument('--lr_t_max', type=int, default=10, help='T_max parameter for CosineAnnealingLR (defaults to num_epochs/2 if not specified)')
+    # OneCycleLR specific parameters
+    parser.add_argument('--max_lr', type=float, default=None, help='Maximum learning rate for OneCycleLR (defaults to 10x learning_rate if None)')
+    parser.add_argument('--pct_start', type=float, default=0.3, help='Percentage of training to increase learning rate for OneCycleLR')
+    parser.add_argument('--div_factor', type=float, default=25.0, help='Initial learning rate division factor for OneCycleLR')
+    parser.add_argument('--final_div_factor', type=float, default=1e4, help='Final learning rate division factor for OneCycleLR')
     
     # Data balancing arguments
     parser.add_argument('--balance_classes', action='store_true', 
@@ -299,9 +320,36 @@ def main():
     print(f"  Learning rate: {args.learning_rate}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Number of epochs: {args.num_epochs}")
+    
+    # Log learning rate scheduler info
+    if args.scheduler != 'none':
+        print(f"  Learning rate scheduler: {args.scheduler}")
+        if args.scheduler == 'cosine':
+            print(f"    T_max: {args.lr_t_max if args.lr_t_max > 0 else args.num_epochs // 2}")
+            print(f"    Min LR: {args.lr_min}")
+        elif args.scheduler == 'plateau':
+            print(f"    Patience: {args.lr_patience}")
+            print(f"    Factor: {args.lr_factor}")
+            print(f"    Min LR: {args.lr_min}")
+        elif args.scheduler == 'onecycle':
+            max_lr = args.max_lr if args.max_lr is not None else args.learning_rate * 10
+            print(f"    Max LR: {max_lr}")
+            print(f"    Pct Start: {args.pct_start} (% of training in warm-up phase)")
+            print(f"    Div Factor: {args.div_factor} (initial LR = max_lr/div_factor)")
+            print(f"    Final Div Factor: {args.final_div_factor} (final LR = initial_lr/final_div_factor)")
+    else:
+        print(f"  Learning rate scheduler: Disabled")
+    
     if args.use_refinement:
-        print(f"  Heatmap loss weight: {args.heatmap_weight}")
-        print(f"  Coordinate loss weight: {args.coord_weight}")
+        if args.use_weight_schedule:
+            print(f"  Loss weight scheduling: Enabled")
+            print(f"    Initial weights - Heatmap: {args.initial_heatmap_weight}, Coordinate: {args.initial_coord_weight}")
+            print(f"    Final weights   - Heatmap: {args.final_heatmap_weight}, Coordinate: {args.final_coord_weight}")
+            print(f"    Transition period: {args.weight_schedule_epochs} epochs")
+        else:
+            print(f"  Loss weight scheduling: Disabled")
+            print(f"  Heatmap loss weight: {args.heatmap_weight}")
+            print(f"  Coordinate loss weight: {args.coord_weight}")
     if args.balance_classes:
         print(f"  Training data balance method: {args.balance_method} (validation and test sets maintain original distribution)")
     print(f"  Device: {'MPS (Mac GPU)' if args.use_mps else 'CUDA' if torch.cuda.is_available() and not args.force_cpu else 'CPU'}")
@@ -317,7 +365,25 @@ def main():
         use_refinement=args.use_refinement,
         heatmap_weight=args.heatmap_weight,
         coord_weight=args.coord_weight,
-        use_mps=args.use_mps
+        use_mps=args.use_mps,
+        # Weight scheduling parameters
+        use_weight_schedule=args.use_weight_schedule,
+        initial_heatmap_weight=args.initial_heatmap_weight,
+        initial_coord_weight=args.initial_coord_weight,
+        final_heatmap_weight=args.final_heatmap_weight,
+        final_coord_weight=args.final_coord_weight,
+        weight_schedule_epochs=args.weight_schedule_epochs,
+        # Learning rate scheduler parameters
+        scheduler_type=None if args.scheduler == 'none' else args.scheduler,
+        lr_patience=args.lr_patience,
+        lr_factor=args.lr_factor,
+        lr_min=args.lr_min,
+        lr_t_max=args.lr_t_max if args.lr_t_max > 0 else args.num_epochs // 2,
+        # OneCycleLR parameters
+        max_lr=args.max_lr,
+        pct_start=args.pct_start,
+        div_factor=args.div_factor,
+        final_div_factor=args.final_div_factor
     )
     
     # Train model

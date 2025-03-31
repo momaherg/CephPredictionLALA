@@ -73,8 +73,29 @@ MAX_DELTA = 2.0  # Maximum allowed delta for refinement
 HRNET_TYPE = 'w32'  # HRNet variant: 'w32' (default) or 'w48' (larger model)
 
 # Loss parameters
-HEATMAP_WEIGHT = 1.0  # Weight for heatmap loss
-COORD_WEIGHT = 0.1  # Weight for coordinate loss
+HEATMAP_WEIGHT = 1.0  # Weight for heatmap loss (used when not using weight scheduling)
+COORD_WEIGHT = 0.1  # Weight for coordinate loss (used when not using weight scheduling)
+
+# Weight scheduling parameters
+USE_WEIGHT_SCHEDULE = True  # Whether to use dynamic weight scheduling
+INITIAL_HEATMAP_WEIGHT = 1.0  # Initial weight for heatmap loss in schedule
+INITIAL_COORD_WEIGHT = 0.1  # Initial weight for coordinate loss in schedule
+FINAL_HEATMAP_WEIGHT = 0.5  # Final weight for heatmap loss in schedule
+FINAL_COORD_WEIGHT = 1.0  # Final weight for coordinate loss in schedule
+WEIGHT_SCHEDULE_EPOCHS = 30  # Number of epochs to transition from initial to final weights
+
+# Learning rate scheduler parameters
+SCHEDULER_TYPE = 'cosine'  # 'cosine', 'plateau', 'onecycle', or None
+LR_PATIENCE = 5  # Patience for ReduceLROnPlateau
+LR_FACTOR = 0.5  # Factor to reduce learning rate for ReduceLROnPlateau
+LR_MIN = 1e-6  # Minimum learning rate for schedulers
+LR_T_MAX = 25  # T_max parameter for CosineAnnealingLR (half of total epochs)
+
+# OneCycleLR specific parameters
+MAX_LR = 1e-3  # Maximum learning rate for OneCycleLR (typically 3-10x base learning rate)
+PCT_START = 0.3  # Percentage of training to increase learning rate (30% is typical)
+DIV_FACTOR = 25.0  # Initial learning rate division factor (initial_lr = max_lr/div_factor)
+FINAL_DIV_FACTOR = 1e4  # Final learning rate division factor (final_lr = initial_lr/final_div_factor)
 
 # Class balancing parameters
 BALANCE_CLASSES = True  # Whether to balance training data based on skeletal classes
@@ -279,7 +300,25 @@ trainer = LandmarkTrainer(
     heatmap_weight=HEATMAP_WEIGHT,
     coord_weight=COORD_WEIGHT,
     use_mps=USE_MPS,
-    hrnet_type=HRNET_TYPE
+    hrnet_type=HRNET_TYPE,
+    # Weight scheduling parameters
+    use_weight_schedule=USE_WEIGHT_SCHEDULE,
+    initial_heatmap_weight=INITIAL_HEATMAP_WEIGHT,
+    initial_coord_weight=INITIAL_COORD_WEIGHT,
+    final_heatmap_weight=FINAL_HEATMAP_WEIGHT,
+    final_coord_weight=FINAL_COORD_WEIGHT,
+    weight_schedule_epochs=WEIGHT_SCHEDULE_EPOCHS,
+    # Learning rate scheduler parameters
+    scheduler_type=SCHEDULER_TYPE,
+    lr_patience=LR_PATIENCE,
+    lr_factor=LR_FACTOR,
+    lr_min=LR_MIN,
+    lr_t_max=LR_T_MAX,
+    # OneCycleLR specific parameters
+    max_lr=MAX_LR,
+    pct_start=PCT_START,
+    div_factor=DIV_FACTOR,
+    final_div_factor=FINAL_DIV_FACTOR
 )
 
 # Custom max_delta setting for the refinement MLP if needed
@@ -292,6 +331,36 @@ total_params = sum(p.numel() for p in trainer.model.parameters() if p.requires_g
 print(f"Model created with {total_params:,} trainable parameters")
 print(f"HRNet type: {HRNET_TYPE.upper()}")
 print(f"Refinement MLP: {'Enabled' if USE_REFINEMENT else 'Disabled'}")
+
+# Print learning rate scheduler info
+if SCHEDULER_TYPE:
+    print(f"Learning rate scheduler: {SCHEDULER_TYPE}")
+    if SCHEDULER_TYPE == 'cosine':
+        print(f"  T_max: {LR_T_MAX}")
+        print(f"  Min LR: {LR_MIN}")
+    elif SCHEDULER_TYPE == 'plateau':
+        print(f"  Patience: {LR_PATIENCE}")
+        print(f"  Factor: {LR_FACTOR}")
+        print(f"  Min LR: {LR_MIN}")
+    elif SCHEDULER_TYPE == 'onecycle':
+        print(f"  Max LR: {MAX_LR}")
+        print(f"  Pct Start: {PCT_START}")
+        print(f"  Div Factor: {DIV_FACTOR}")
+        print(f"  Final Div Factor: {FINAL_DIV_FACTOR}")
+else:
+    print(f"Learning rate scheduler: Disabled")
+
+# Print loss weight configuration
+if USE_REFINEMENT:
+    if USE_WEIGHT_SCHEDULE:
+        print(f"Loss weight scheduling: Enabled")
+        print(f"  Initial weights - Heatmap: {INITIAL_HEATMAP_WEIGHT}, Coordinate: {INITIAL_COORD_WEIGHT}")
+        print(f"  Final weights   - Heatmap: {FINAL_HEATMAP_WEIGHT}, Coordinate: {FINAL_COORD_WEIGHT}")
+        print(f"  Transition period: {WEIGHT_SCHEDULE_EPOCHS} epochs")
+    else:
+        print(f"Loss weight scheduling: Disabled")
+        print(f"  Fixed weights - Heatmap: {HEATMAP_WEIGHT}, Coordinate: {COORD_WEIGHT}")
+
 if BALANCE_CLASSES:
     print(f"Class balancing: Enabled (method: {BALANCE_METHOD})")
 else:
@@ -366,6 +435,31 @@ if USE_REFINEMENT:
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
+
+    # Add a figure for weight schedule visualization if using weight scheduling
+    if USE_WEIGHT_SCHEDULE and 'heatmap_weight' in history and 'coord_weight' in history:
+        plt.figure(figsize=(10, 6))
+        plt.plot(history['heatmap_weight'], label='Heatmap Weight')
+        plt.plot(history['coord_weight'], label='Coordinate Weight')
+        plt.title('Loss Weight Schedule')
+        plt.xlabel('Epoch')
+        plt.ylabel('Weight Value')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(OUTPUT_DIR, 'weight_schedule.png'))
+        plt.show()
+    
+    # Plot learning rate if available
+    if 'learning_rate' in history and len(history['learning_rate']) > 0:
+        plt.figure(figsize=(10, 6))
+        plt.plot(history['learning_rate'])
+        plt.xlabel('Epoch')
+        plt.ylabel('Learning Rate')
+        plt.title(f'Learning Rate Schedule ({SCHEDULER_TYPE if SCHEDULER_TYPE else "None"})')
+        plt.yscale('log')  # Use log scale to better visualize the changes
+        plt.grid(True)
+        plt.savefig(os.path.join(OUTPUT_DIR, 'learning_rate_schedule.png'))
+        plt.show()
 
 plt.tight_layout()
 plt.savefig(os.path.join(OUTPUT_DIR, 'training_results.png'))
@@ -454,6 +548,12 @@ model_config = {
     'hrnet_type': HRNET_TYPE,
     'heatmap_weight': HEATMAP_WEIGHT,
     'coord_weight': COORD_WEIGHT,
+    'use_weight_schedule': USE_WEIGHT_SCHEDULE,
+    'initial_heatmap_weight': INITIAL_HEATMAP_WEIGHT if USE_WEIGHT_SCHEDULE else None,
+    'initial_coord_weight': INITIAL_COORD_WEIGHT if USE_WEIGHT_SCHEDULE else None,
+    'final_heatmap_weight': FINAL_HEATMAP_WEIGHT if USE_WEIGHT_SCHEDULE else None,
+    'final_coord_weight': FINAL_COORD_WEIGHT if USE_WEIGHT_SCHEDULE else None,
+    'weight_schedule_epochs': WEIGHT_SCHEDULE_EPOCHS if USE_WEIGHT_SCHEDULE else None,
     'learning_rate': LEARNING_RATE,
     'weight_decay': WEIGHT_DECAY,
     'batch_size': BATCH_SIZE,
@@ -473,7 +573,16 @@ model_config = {
     'test_success_rate_2mm': results['success_rate_2mm'],
     'test_success_rate_4mm': results['success_rate_4mm'],
     'device': str(device),
-    'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+    'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+    'scheduler_type': SCHEDULER_TYPE,
+    'lr_patience': LR_PATIENCE,
+    'lr_factor': LR_FACTOR,
+    'lr_min': LR_MIN,
+    'lr_t_max': LR_T_MAX,
+    'max_lr': MAX_LR,
+    'pct_start': PCT_START,
+    'div_factor': DIV_FACTOR,
+    'final_div_factor': FINAL_DIV_FACTOR
 }
 
 save_model_config(OUTPUT_DIR, model_config)
