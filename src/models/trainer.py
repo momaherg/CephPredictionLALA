@@ -43,9 +43,16 @@ class LandmarkTrainer:
                  lr_factor=0.5,
                  lr_min=1e-6,
                  lr_t_max=10,
+                 # OneCycleLR specific parameters
+                 max_lr=None,
+                 pct_start=0.3,
+                 div_factor=25.0,
+                 final_div_factor=1e4,
+                 # Optimizer parameters
                  optimizer_type='adam',
                  momentum=0.9,
-                 nesterov=True):
+                 nesterov=True,
+                 total_steps=None): # Added total_steps for OneCycleLR pre-initialization
         """
         Initialize trainer
         
@@ -71,9 +78,14 @@ class LandmarkTrainer:
             lr_factor (float): Factor by which to reduce learning rate for ReduceLROnPlateau
             lr_min (float): Minimum learning rate for schedulers
             lr_t_max (int): T_max parameter for CosineAnnealingLR (usually set to num_epochs/2)
+            max_lr (float): Maximum learning rate for OneCycleLR (defaults to 10x learning_rate if None)
+            pct_start (float): Percentage of training spent increasing learning rate for OneCycleLR
+            div_factor (float): Initial learning rate division factor for OneCycleLR
+            final_div_factor (float): Final learning rate division factor for OneCycleLR
             optimizer_type (str): Type of optimizer to use ('adam', 'adamw', 'sgd')
             momentum (float): Momentum factor for SGD optimizer
             nesterov (bool): Whether to use Nesterov momentum for SGD
+            total_steps (int, optional): Total number of training steps, required for OneCycleLR if initialized directly.
         """
         # Set device
         if device is not None:
@@ -142,12 +154,36 @@ class LandmarkTrainer:
                 self.optimizer, T_max=lr_t_max, eta_min=lr_min
             )
             print(f"Using CosineAnnealingLR scheduler with T_max={lr_t_max}, min_lr={lr_min}")
+        
         elif scheduler_type == 'plateau':
             self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer, mode='min', factor=lr_factor, 
                 patience=lr_patience, verbose=True, min_lr=lr_min
             )
             print(f"Using ReduceLROnPlateau scheduler with patience={lr_patience}, factor={lr_factor}, min_lr={lr_min}")
+            
+        elif scheduler_type == 'onecycle':
+            # If max_lr not specified, use 10x the base learning rate
+            if max_lr is None:
+                max_lr = learning_rate * 10
+            
+            # If total_steps provided (e.g., from external calculation), initialize now
+            if total_steps:
+                self.scheduler = optim.lr_scheduler.OneCycleLR(
+                    self.optimizer, max_lr=max_lr, total_steps=total_steps,
+                    pct_start=pct_start, div_factor=div_factor, 
+                    final_div_factor=final_div_factor
+                )
+                print(f"Using OneCycleLR scheduler initialized directly with total_steps={total_steps}, max_lr={max_lr}")
+            else:
+                # Store parameters for later initialization in train() when total_steps is known
+                self.onecycle_params = {
+                    'max_lr': max_lr,
+                    'pct_start': pct_start,
+                    'div_factor': div_factor,
+                    'final_div_factor': final_div_factor
+                }
+                print(f"OneCycleLR scheduler will be initialized during training with max_lr={max_lr}")
         
         # Weight scheduling parameters
         self.use_weight_schedule = use_weight_schedule
