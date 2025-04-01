@@ -289,6 +289,21 @@ class CombinedLoss(nn.Module):
             
             # Compute total loss using normalized components and weights
             total_loss = self.heatmap_weight * norm_heatmap_loss + self.coord_weight * norm_coord_loss
+            
+            # --- Debug Logging --- 
+            if int(self.norm_updates.item()) % 100 == 0: # Log every 100 steps
+                print("\n--- Loss Debug (Step: {}) ---".format(int(self.norm_updates.item())))
+                print(f"  Raw Heatmap Loss:  {raw_heatmap_loss.item():.6f}")
+                print(f"  Raw Coord Loss:    {raw_coord_loss.item():.6f}")
+                print(f"  Avg Heatmap Loss:  {avg_heatmap_corrected.item():.6f}")
+                print(f"  Avg Coord Loss:    {avg_coord_corrected.item():.6f}")
+                print(f"  Norm Heatmap Loss: {norm_heatmap_loss.item():.6f}")
+                print(f"  Norm Coord Loss:   {norm_coord_loss.item():.6f}")
+                print(f"  Weighted Norm Heatmap: {self.heatmap_weight * norm_heatmap_loss.item():.6f} (Weight: {self.heatmap_weight:.2f})")
+                print(f"  Weighted Norm Coord:   {self.coord_weight * norm_coord_loss.item():.6f} (Weight: {self.coord_weight:.2f})")
+                print(f"  Final Total Loss:  {total_loss.item():.6f}")
+                print("---------------------------")
+            # --- End Debug Logging ---
         
         else: # Not using normalization or in evaluation mode
              # Compute total loss using raw components and weights
