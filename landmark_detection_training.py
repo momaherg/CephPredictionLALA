@@ -33,6 +33,7 @@ from src.models.trainer import LandmarkTrainer
 from src.data.dataset import CephalometricDataset, ToTensor, Normalize
 from src.data.data_augmentation import get_train_transforms
 from src.data.data_processor import DataProcessor
+from src.utils.lr_finder import LRFinder
 
 # Set random seed for reproducibility
 def set_seed(seed=42):
@@ -116,6 +117,15 @@ FINAL_DIV_FACTOR = 1e4  # Final learning rate division factor (final_lr = initia
 OPTIMIZER_TYPE = 'adam'  # 'adam', 'adamw', or 'sgd'
 MOMENTUM = 0.9  # Momentum factor for SGD optimizer
 NESTEROV = True  # Whether to use Nesterov momentum for SGD optimizer
+
+# LR Range Test parameters
+RUN_LR_FINDER = True  # Set to True to run the LR range test before training
+LR_FINDER_START_LR = 1e-7
+LR_FINDER_END_LR = 0.1
+LR_FINDER_NUM_ITER = 200  # Increase for smoother curve
+LR_FINDER_STEP_MODE = 'exp' # 'exp' or 'linear'
+LR_FINDER_SMOOTH_F = 0.05
+LR_FINDER_DIVERGE_TH = 5
 
 # %% [markdown]
 # ## 3. Set Up Device
@@ -291,83 +301,6 @@ print(f"  Validation samples: {len(val_dataset)}")
 print(f"  Test samples: {len(test_dataset)}")
 
 # %% [markdown]
-# ## 5.5 Perform Learning Rate Range Test
-# 
-# Before we start training, we'll run a Learning Rate Range Test to find the optimal maximum learning rate for the OneCycleLR scheduler.
-# This test trains the model for a few batches while increasing the learning rate exponentially and monitoring the loss.
-# The point where the loss starts to diverge or plateau gives us insights on a good learning rate to use.
-
-# %%
-# Import the Learning Rate Range Test utility
-from src.utils.lr_range_test import lr_range_test
-
-# Flag to determine whether to run the LR Range Test
-RUN_LR_RANGE_TEST = True  # Set to False to skip the test if you already know a good max_lr value
-
-if RUN_LR_RANGE_TEST and SCHEDULER_TYPE == 'onecycle':
-    print("\nRunning Learning Rate Range Test to find optimal max_lr for OneCycleLR...")
-    
-    # Create a temporary model for the LR Range Test (using the same architecture as the training model)
-    temp_model = create_hrnet_model(
-        num_landmarks=NUM_LANDMARKS,
-        pretrained=PRETRAINED,
-        use_refinement=USE_REFINEMENT,
-        hrnet_type=HRNET_TYPE
-    )
-    temp_model.to(device)
-    
-    # Create a loss function for the LR Range Test
-    from src.models.losses import CombinedLoss
-    criterion = CombinedLoss(
-        heatmap_weight=HEATMAP_WEIGHT, 
-        coord_weight=COORD_WEIGHT,
-        output_size=(64, 64),   # Heatmap size
-        image_size=(224, 224)   # Original image size
-    )
-    
-    # Create an optimizer for the LR Range Test
-    if OPTIMIZER_TYPE == 'adam':
-        optimizer = torch.optim.Adam(temp_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    elif OPTIMIZER_TYPE == 'adamw':
-        optimizer = torch.optim.AdamW(temp_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    elif OPTIMIZER_TYPE == 'sgd':
-        optimizer = torch.optim.SGD(
-            temp_model.parameters(), 
-            lr=LEARNING_RATE, 
-            momentum=MOMENTUM, 
-            weight_decay=WEIGHT_DECAY,
-            nesterov=NESTEROV
-        )
-    
-    # Run the LR Range Test
-    lr_test_results = lr_range_test(
-        model=temp_model,
-        train_loader=train_loader,
-        criterion=criterion,
-        optimizer=optimizer,
-        device=device,
-        start_lr=1e-7,
-        end_lr=1.0,
-        num_iterations=100,  # Limit to 100 iterations for speed
-        smooth_window=0.05,
-        diverge_threshold=5.0,
-        output_dir=OUTPUT_DIR
-    )
-    
-    # Update the MAX_LR based on the test results
-    old_max_lr = MAX_LR
-    MAX_LR = lr_test_results['suggested_max_lr']
-    
-    print(f"\nLR Range Test completed. Results:")
-    print(f"  - Steepest gradient LR: {lr_test_results['steepest_slope_lr']:.6f}")
-    print(f"  - Min loss LR: {lr_test_results['min_loss_lr']:.6f}")
-    print(f"  - Suggested max_lr: {MAX_LR:.6f} (previous: {old_max_lr})")
-    
-    # Clean up to free memory
-    del temp_model, optimizer, criterion
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-# %% [markdown]
 # ## 6. Create and Train the Model
 
 # %%
@@ -442,7 +375,72 @@ else:
     print(f"Class balancing: Disabled")
 
 # %% [markdown]
-# ## 7. Train the Model
+# ## 7. (Optional) Learning Rate Range Test
+# 
+# If `RUN_LR_FINDER` is set to `True`, we perform an LR range test
+# to find a good maximum learning rate for the OneCycleLR scheduler.
+# The test trains the model for a few iterations, gradually increasing
+# the learning rate, and plots the loss against the LR.
+
+# %%
+if RUN_LR_FINDER:
+    print("\nRunning Learning Rate Range Test...")
+    
+    # Create a temporary trainer instance JUST for the LR finder
+    # Use a base learning rate, it will be overridden by the finder
+    temp_trainer_for_finder = LandmarkTrainer(
+        num_landmarks=NUM_LANDMARKS,
+        learning_rate=LR_FINDER_START_LR, # Start LR for the finder
+        weight_decay=WEIGHT_DECAY,
+        device=device,
+        output_dir=os.path.join(OUTPUT_DIR, 'lr_finder_temp'), # Use a temp output dir
+        use_refinement=USE_REFINEMENT,
+        heatmap_weight=HEATMAP_WEIGHT, # Use initial weights
+        coord_weight=COORD_WEIGHT,
+        use_mps=USE_MPS,
+        hrnet_type=HRNET_TYPE,
+        optimizer_type=OPTIMIZER_TYPE,
+        momentum=MOMENTUM,
+        nesterov=NESTEROV
+        # Schedulers and weight scheduling are not needed for the finder itself
+    )
+    
+    # Initialize the LRFinder
+    # Note: The LRFinder requires the model, optimizer, criterion, and device.
+    # It needs a criterion instance, which is created inside the trainer.
+    lr_finder = LRFinder(
+        temp_trainer_for_finder.model, 
+        temp_trainer_for_finder.optimizer, 
+        temp_trainer_for_finder.criterion, 
+        device
+    )
+    
+    # Run the range test
+    lr_finder.range_test(
+        train_loader, 
+        start_lr=LR_FINDER_START_LR, 
+        end_lr=LR_FINDER_END_LR, 
+        num_iter=LR_FINDER_NUM_ITER, 
+        step_mode=LR_FINDER_STEP_MODE, 
+        smooth_f=LR_FINDER_SMOOTH_F,
+        diverge_th=LR_FINDER_DIVERGE_TH
+    )
+    
+    # Plot the results
+    lr_finder_plot_path = os.path.join(OUTPUT_DIR, 'lr_finder_plot.png')
+    lr_finder.plot(skip_start=10, skip_end=10, log_lr=True, save_path=lr_finder_plot_path)
+    
+    # Reset the state of the main trainer's model and optimizer
+    # This is crucial because the LR finder modifies the model state.
+    # We create the *real* trainer after this step to ensure it starts fresh.
+    print("LR Range Test finished. Proceeding to create the final trainer and start training.")
+    # It's generally safer to re-create the trainer after the LR test to ensure clean state
+    # rather than trying to reset the temp_trainer_for_finder.
+else:
+    print("Skipping LR Range Test.")
+
+# %% [markdown]
+# ## 8. Train the Model
 
 # %%
 # Train the model
@@ -455,7 +453,7 @@ history = trainer.train(
 )
 
 # %% [markdown]
-# ## 8. Evaluate the Model
+# ## 9. Evaluate the Model
 
 # %%
 # Evaluate the model on the test set
@@ -469,7 +467,7 @@ print(f"Success Rate (2mm): {results['success_rate_2mm'] * 100:.2f}%")
 print(f"Success Rate (4mm): {results['success_rate_4mm'] * 100:.2f}%")
 
 # %% [markdown]
-# ## 9. Visualize Results
+# ## 10. Visualize Results
 
 # %%
 # Plot training history
@@ -529,7 +527,7 @@ plt.savefig(os.path.join(OUTPUT_DIR, 'training_results.png'))
 plt.show()
 
 # %% [markdown]
-# ## 10. Visualize Predictions
+# ## 11. Visualize Predictions
 # 
 # Let's visualize some predictions on the test set.
 
@@ -588,7 +586,7 @@ except Exception as e:
     print(f"Error visualizing predictions: {str(e)}")
 
 # %% [markdown]
-# ## 11. Save a Custom Model Configuration
+# ## 12. Save a Custom Model Configuration
 
 # %%
 # Function to save a custom model configuration
@@ -656,7 +654,7 @@ save_model_config(OUTPUT_DIR, model_config)
 print("\nTraining completed successfully!")
 
 # %% [markdown]
-# ## 12. Additional Analysis: Per-Landmark Performance
+# ## 13. Additional Analysis: Per-Landmark Performance
 
 # %%
 # Plot per-landmark performance

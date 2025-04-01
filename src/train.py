@@ -1,43 +1,16 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Cephalometric Landmark Detection Training Script
-
-This script provides a command-line interface for training
-landmark detection models on cephalometric X-ray images.
-"""
-
 import os
-import sys
 import argparse
 import torch
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import time
-import platform
 from torch.utils.data import DataLoader
-import logging
-from tqdm import tqdm
 from torchvision import transforms
+import platform
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Add parent directory to path for local imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Import model and training components
-from src.models.trainer import LandmarkTrainer
-from src.data.dataset import CephalometricDataset, ToTensor, Normalize
-from src.data.data_augmentation import get_train_transforms
-from src.data.data_processor import DataProcessor
-from src.data.patient_classifier import PatientClassifier
+from data.data_processor import DataProcessor
+from data.dataset import CephalometricDataset, ToTensor, Normalize
+from data.data_augmentation import get_train_transforms
+from models.trainer import LandmarkTrainer
 
 # Define TrainTransform as a top-level class so it can be pickled
 class TrainTransform:
@@ -99,12 +72,6 @@ def parse_args():
     parser.add_argument('--pct_start', type=float, default=0.3, help='Percentage of training to increase learning rate for OneCycleLR')
     parser.add_argument('--div_factor', type=float, default=25.0, help='Initial learning rate division factor for OneCycleLR')
     parser.add_argument('--final_div_factor', type=float, default=1e4, help='Final learning rate division factor for OneCycleLR')
-    
-    # LR Range Test parameters
-    parser.add_argument('--run_lr_range_test', action='store_true', help='Run learning rate range test before training')
-    parser.add_argument('--lr_test_start', type=float, default=1e-7, help='Starting learning rate for range test')
-    parser.add_argument('--lr_test_end', type=float, default=1.0, help='End learning rate for range test')
-    parser.add_argument('--lr_test_iterations', type=int, default=100, help='Number of iterations for range test')
     
     # Optimizer arguments
     parser.add_argument('--optimizer', type=str, choices=['adam', 'adamw', 'sgd'], default='adam',
@@ -183,11 +150,13 @@ def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16,
         # First, make sure we have skeletal class information
         if 'skeletal_class' not in train_df.columns:
             print("Computing skeletal classifications for the training set...")
+            from data.patient_classifier import PatientClassifier
             classifier = PatientClassifier(landmark_cols)
             train_df = classifier.classify_patients(train_df)
         
         # Now balance the training data
         print("Balancing training data using skeletal classification...")
+        from data.patient_classifier import PatientClassifier
         classifier = PatientClassifier(landmark_cols)
         train_df = classifier.balance_classes(train_df, class_column='skeletal_class', balance_method='upsample')
         print(f"Balanced training data: {len(train_df)} samples")
@@ -366,90 +335,6 @@ def main():
         print(f"  Training data balance method: {args.balance_method} (validation and test sets maintain original distribution)")
     print(f"  Device: {'MPS (Mac GPU)' if args.use_mps else 'CUDA' if torch.cuda.is_available() and not args.force_cpu else 'CPU'}")
     print(f"  Output directory: {args.output_dir}")
-    
-    # Run LR Range Test if requested (for OneCycleLR only)
-    if args.run_lr_range_test and args.scheduler == 'onecycle':
-        from src.utils.lr_range_test import lr_range_test
-        from src.models.losses import CombinedLoss
-        from src.models.hrnet import create_hrnet_model
-        
-        print("\nRunning Learning Rate Range Test to find optimal max_lr for OneCycleLR...")
-        
-        # Create a temporary model for the test (same architecture as for training)
-        temp_model = create_hrnet_model(
-            num_landmarks=args.num_landmarks,
-            pretrained=args.pretrained,
-            use_refinement=args.use_refinement
-        )
-        
-        # Create loss function
-        test_criterion = CombinedLoss(
-            heatmap_weight=args.heatmap_weight,
-            coord_weight=args.coord_weight,
-            output_size=(64, 64),   # Heatmap size
-            image_size=(224, 224)   # Original image size
-        )
-        
-        # Create optimizer
-        if args.optimizer == 'adam':
-            test_optimizer = torch.optim.Adam(
-                temp_model.parameters(), 
-                lr=args.learning_rate, 
-                weight_decay=args.weight_decay
-            )
-        elif args.optimizer == 'adamw':
-            test_optimizer = torch.optim.AdamW(
-                temp_model.parameters(), 
-                lr=args.learning_rate, 
-                weight_decay=args.weight_decay
-            )
-        elif args.optimizer == 'sgd':
-            test_optimizer = torch.optim.SGD(
-                temp_model.parameters(), 
-                lr=args.learning_rate, 
-                momentum=args.momentum,
-                weight_decay=args.weight_decay,
-                nesterov=args.nesterov
-            )
-        
-        # Move model to device
-        if args.use_mps and platform.system() == 'Darwin' and torch.backends.mps.is_available():
-            device = torch.device('mps')
-        elif torch.cuda.is_available() and not args.force_cpu:
-            device = torch.device('cuda')
-        else:
-            device = torch.device('cpu')
-        
-        temp_model.to(device)
-        
-        # Run the LR Range Test
-        lr_test_results = lr_range_test(
-            model=temp_model,
-            train_loader=train_loader,
-            criterion=test_criterion,
-            optimizer=test_optimizer,
-            device=device,
-            start_lr=args.lr_test_start,
-            end_lr=args.lr_test_end,
-            num_iterations=args.lr_test_iterations,
-            smooth_window=0.05,
-            diverge_threshold=5.0,
-            output_dir=args.output_dir
-        )
-        
-        # Update max_lr based on the test results
-        old_max_lr = args.max_lr if args.max_lr else (args.learning_rate * 10)
-        args.max_lr = lr_test_results['suggested_max_lr']
-        
-        print(f"\nLR Range Test completed. Results:")
-        print(f"  - Steepest gradient LR: {lr_test_results['steepest_slope_lr']:.6f}")
-        print(f"  - Min loss LR: {lr_test_results['min_loss_lr']:.6f}")
-        print(f"  - Suggested max_lr: {args.max_lr:.6f} (previous: {old_max_lr})")
-        
-        # Clean up memory
-        del temp_model, test_optimizer, test_criterion
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
     
     # Create trainer
     trainer = LandmarkTrainer(
