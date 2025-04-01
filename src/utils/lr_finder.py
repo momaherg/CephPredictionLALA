@@ -92,7 +92,7 @@ class LRFinder:
             # Assuming target heatmaps are needed for the criterion
             if 'landmarks' in batch: # Need to generate heatmaps for loss
                 from src.models.losses import GaussianHeatmapGenerator
-                heatmap_gen = GaussianHeatmapGenerator().to(self.device) # Temporary generator
+                heatmap_gen = GaussianHeatmapGenerator() # Temporary generator - remove .to(self.device)
                 targets = heatmap_gen.generate_heatmaps(batch['landmarks']).to(self.device)
                 target_coords = batch['landmarks'].to(self.device)
             else:
