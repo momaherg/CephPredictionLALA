@@ -118,7 +118,7 @@ class LRFinder:
             self.optimizer.step()
 
             # Get current learning rate
-            current_lr = lr_schedule.get_lr()[0]
+            current_lr = lr_schedule.get_lr()
             self.history["lr"].append(current_lr)
 
             # Update smoothed loss
