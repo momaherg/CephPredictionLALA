@@ -81,6 +81,14 @@ def parse_args():
     parser.add_argument('--nesterov', action='store_true',
                         help='Enable Nesterov momentum for SGD optimizer')
     
+    # Loss Normalization arguments
+    parser.add_argument('--no_loss_norm', action='store_true',
+                        help='Disable running average loss normalization in CombinedLoss')
+    parser.add_argument('--loss_norm_decay', type=float, default=0.99,
+                        help='Decay factor for loss normalization running average')
+    parser.add_argument('--loss_norm_epsilon', type=float, default=1e-6,
+                        help='Epsilon for loss normalization stability')
+    
     return parser.parse_args()
 
 def set_seed(seed):
@@ -368,7 +376,11 @@ def main():
         # Optimizer parameters
         optimizer_type=args.optimizer,
         momentum=args.momentum,
-        nesterov=args.nesterov
+        nesterov=args.nesterov,
+        # Loss normalization parameters
+        use_loss_normalization=not args.no_loss_norm,
+        norm_decay=args.loss_norm_decay,
+        norm_epsilon=args.loss_norm_epsilon
     )
     
     # Train model

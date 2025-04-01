@@ -52,6 +52,10 @@ class LandmarkTrainer:
                  optimizer_type='adam',
                  momentum=0.9,
                  nesterov=True,
+                 # Loss normalization parameters
+                 use_loss_normalization=True,
+                 norm_decay=0.99,
+                 norm_epsilon=1e-6,
                  total_steps=None): # Added total_steps for OneCycleLR pre-initialization
         """
         Initialize trainer
@@ -85,6 +89,9 @@ class LandmarkTrainer:
             optimizer_type (str): Type of optimizer to use ('adam', 'adamw', 'sgd')
             momentum (float): Momentum factor for SGD optimizer
             nesterov (bool): Whether to use Nesterov momentum for SGD
+            use_loss_normalization (bool): Normalize loss components before weighting.
+            norm_decay (float): Decay factor for loss normalization running average.
+            norm_epsilon (float): Epsilon for loss normalization stability.
             total_steps (int, optional): Total number of training steps, required for OneCycleLR if initialized directly.
         """
         # Set device
@@ -203,7 +210,10 @@ class LandmarkTrainer:
                 heatmap_weight=self.current_heatmap_weight, 
                 coord_weight=self.current_coord_weight,
                 output_size=(64, 64),   # Heatmap size
-                image_size=(224, 224)   # Original image size
+                image_size=(224, 224),  # Original image size
+                use_loss_normalization=use_loss_normalization,
+                norm_decay=norm_decay,
+                norm_epsilon=norm_epsilon
             )
         else:
             self.criterion = AdaptiveWingLoss()

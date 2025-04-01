@@ -118,6 +118,11 @@ OPTIMIZER_TYPE = 'adam'  # 'adam', 'adamw', or 'sgd'
 MOMENTUM = 0.9  # Momentum factor for SGD optimizer
 NESTEROV = True  # Whether to use Nesterov momentum for SGD optimizer
 
+# Loss Normalization parameters
+USE_LOSS_NORMALIZATION = True  # Normalize losses before weighting
+NORM_DECAY = 0.99  # Decay factor for running average
+NORM_EPSILON = 1e-6  # Epsilon for numerical stability
+
 # LR Range Test parameters
 RUN_LR_FINDER = True  # Set to True to run the LR range test before training
 LR_FINDER_START_LR = 1e-7
@@ -337,7 +342,11 @@ trainer = LandmarkTrainer(
     # Optimizer parameters
     optimizer_type=OPTIMIZER_TYPE,
     momentum=MOMENTUM,
-    nesterov=NESTEROV
+    nesterov=NESTEROV,
+    # Loss normalization parameters
+    use_loss_normalization=USE_LOSS_NORMALIZATION,
+    norm_decay=NORM_DECAY,
+    norm_epsilon=NORM_EPSILON
 )
 
 # Custom max_delta setting for the refinement MLP if needed
@@ -646,7 +655,10 @@ model_config = {
     'final_div_factor': FINAL_DIV_FACTOR,
     'optimizer_type': OPTIMIZER_TYPE,
     'momentum': MOMENTUM,
-    'nesterov': NESTEROV
+    'nesterov': NESTEROV,
+    'use_loss_normalization': USE_LOSS_NORMALIZATION,
+    'norm_decay': NORM_DECAY,
+    'norm_epsilon': NORM_EPSILON
 }
 
 save_model_config(OUTPUT_DIR, model_config)

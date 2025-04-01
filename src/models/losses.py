@@ -190,9 +190,12 @@ class CombinedLoss(nn.Module):
     """
     Combined loss function for heatmap and coordinate regression
     
-    Combines Adaptive Wing Loss for heatmaps with Wing Loss for coordinates
+    Combines Adaptive Wing Loss for heatmaps with Wing Loss for coordinates.
+    Optionally normalizes loss components based on running averages before applying weights.
     """
-    def __init__(self, heatmap_weight=1.0, coord_weight=1.0, output_size=(64, 64), image_size=(224, 224)):
+    def __init__(self, heatmap_weight=1.0, coord_weight=1.0, 
+                 output_size=(64, 64), image_size=(224, 224),
+                 use_loss_normalization=True, norm_decay=0.99, norm_epsilon=1e-6):
         """
         Initialize combined loss
         
@@ -201,6 +204,9 @@ class CombinedLoss(nn.Module):
             coord_weight (float): Weight for coordinate loss
             output_size (tuple): Size of heatmap output (height, width)
             image_size (tuple): Size of original image (height, width)
+            use_loss_normalization (bool): Whether to normalize losses before weighting.
+            norm_decay (float): Decay factor for running average normalization.
+            norm_epsilon (float): Epsilon for numerical stability in normalization.
         """
         super(CombinedLoss, self).__init__()
         self.heatmap_weight = heatmap_weight
@@ -208,11 +214,22 @@ class CombinedLoss(nn.Module):
         self.output_size = output_size
         self.image_size = image_size
         
+        self.use_loss_normalization = use_loss_normalization
+        self.norm_decay = norm_decay
+        self.norm_epsilon = norm_epsilon
+        
         # Calculate scale factor
         self.scale_factor = image_size[0] / output_size[0]  # Assuming square aspect ratio
         
-        self.heatmap_loss = AdaptiveWingLoss()
-        self.coord_loss = WingLoss()
+        self.heatmap_loss_fn = AdaptiveWingLoss()
+        self.coord_loss_fn = WingLoss()
+        
+        # Buffers for running average normalization
+        if self.use_loss_normalization:
+            self.register_buffer('running_avg_heatmap', torch.tensor(1.0))
+            self.register_buffer('running_avg_coord', torch.tensor(1.0))
+            # Counter to track updates (useful for initial phase)
+            self.register_buffer('norm_updates', torch.tensor(0.0))
     
     def forward(self, pred_dict, target_heatmaps, target_coords, mask=None):
         """
@@ -225,25 +242,60 @@ class CombinedLoss(nn.Module):
             mask (torch.Tensor, optional): Mask for valid landmarks
             
         Returns:
-            tuple: (total_loss, heatmap_loss, coord_loss)
+            tuple: (total_loss, original_heatmap_loss, original_coord_loss)
+                   Note: The returned component losses are the original, unnormalized values.
+                   The total_loss is calculated using normalized components if enabled.
         """
-        # Compute heatmap loss
-        heatmap_loss = self.heatmap_loss(pred_dict['heatmaps'], target_heatmaps)
+        # Compute raw heatmap loss
+        raw_heatmap_loss = self.heatmap_loss_fn(pred_dict['heatmaps'], target_heatmaps)
         
-        # Convert target coordinates from image space to heatmap space for loss computation
+        # Convert target coordinates from image space to heatmap space for coordinate loss computation
         target_coords_heatmap = target_coords / self.scale_factor
         
-        # Compute coordinate loss if refined coordinates are available
+        # Compute raw coordinate loss
         if 'refined_coords' in pred_dict:
-            coord_loss = self.coord_loss(pred_dict['refined_coords'], target_coords_heatmap, mask)
+            raw_coord_loss = self.coord_loss_fn(pred_dict['refined_coords'], target_coords_heatmap, mask)
         else:
             # Use initial coordinates if refined are not available
-            coord_loss = self.coord_loss(pred_dict['initial_coords'], target_coords_heatmap, mask)
+            raw_coord_loss = self.coord_loss_fn(pred_dict['initial_coords'], target_coords_heatmap, mask)
+            
+        # Handle potential NaN in losses (can happen early in training)
+        raw_heatmap_loss = torch.nan_to_num(raw_heatmap_loss, nan=1.0) # Replace NaN with a high value (e.g., 1.0)
+        raw_coord_loss = torch.nan_to_num(raw_coord_loss, nan=1.0)
+
+        # If using normalization
+        if self.use_loss_normalization and self.training: # Only update averages during training
+            # Update running averages using detached losses
+            heatmap_loss_detached = raw_heatmap_loss.detach()
+            coord_loss_detached = raw_coord_loss.detach()
+            
+            # Exponential moving average
+            self.running_avg_heatmap = self.norm_decay * self.running_avg_heatmap + (1 - self.norm_decay) * heatmap_loss_detached
+            self.running_avg_coord = self.norm_decay * self.running_avg_coord + (1 - self.norm_decay) * coord_loss_detached
+            self.norm_updates += 1
+
+            # Correct bias during initial phase (helps stabilize early training)
+            # Use 1 - decay^updates for bias correction factor
+            bias_correction_heatmap = 1.0 - self.norm_decay ** self.norm_updates
+            bias_correction_coord = 1.0 - self.norm_decay ** self.norm_updates
+            
+            avg_heatmap_corrected = self.running_avg_heatmap / (bias_correction_heatmap + 1e-8)
+            avg_coord_corrected = self.running_avg_coord / (bias_correction_coord + 1e-8)
+
+            # Normalize current losses
+            # Ensure denominators are not zero
+            norm_heatmap_loss = raw_heatmap_loss / (avg_heatmap_corrected + self.norm_epsilon)
+            norm_coord_loss = raw_coord_loss / (avg_coord_corrected + self.norm_epsilon)
+            
+            # Compute total loss using normalized components and weights
+            total_loss = self.heatmap_weight * norm_heatmap_loss + self.coord_weight * norm_coord_loss
         
-        # Compute total loss
-        total_loss = self.heatmap_weight * heatmap_loss + self.coord_weight * coord_loss
-        
-        return total_loss, heatmap_loss, coord_loss
+        else: # Not using normalization or in evaluation mode
+             # Compute total loss using raw components and weights
+            total_loss = self.heatmap_weight * raw_heatmap_loss + self.coord_weight * raw_coord_loss
+            
+        # Return total loss for backprop, and original losses for logging
+        return total_loss, raw_heatmap_loss, raw_coord_loss
 
 
 def soft_argmax(heatmaps, beta=100):
