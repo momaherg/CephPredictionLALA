@@ -79,29 +79,44 @@ class CephalometricDataset(Dataset):
                 print(f"Error loading image {img_path}: {e}")
                 raise
                 
-        elif 'Image' in img_info and pd.notna(img_info['Image']):
+        elif 'Image' in img_info:
             img_data = img_info['Image']
+            # Check if the data is actually missing (None or NaN) before proceeding
+            # pd.isna works correctly on scalars
+            if pd.isna(img_data):
+                 # If 'Image' column exists but value is NaN/None, treat as invalid
+                 raise ValueError(f"DataFrame contains 'Image' column but value is missing at index {idx}")
+
+            # --- If we reach here, img_data is not None/NaN --- 
+            
+            # Handle string representation or direct list/array
             if isinstance(img_data, str):
                 try:
+                    # Safely evaluate the string representation into a list
                     img_data = ast.literal_eval(img_data)
                 except (ValueError, SyntaxError) as e:
                      raise ValueError(f"Could not parse 'Image' column data at index {idx}: {e}. Data: {img_data[:100]}...")
             
+            # Ensure img_data is now a list or numpy array after potential parsing
             if not isinstance(img_data, (list, np.ndarray)):
+                # This might be redundant now but adds safety
                 raise TypeError(f"Expected 'Image' column data to be a list or numpy array at index {idx}, got {type(img_data)}")
                 
+            # Validate image data size before reshaping
             expected_size = self.image_size[0] * self.image_size[1]
             if len(img_data) != expected_size:
                 raise ValueError(f"Image data length mismatch at index {idx}. " 
                                  f"Expected {expected_size} ({self.image_size[0]}x{self.image_size[1]}), " 
                                  f"but got {len(img_data)}.")
                                  
+            # Reshape the flattened data into HxW format
             try:
                 image = np.array(img_data, dtype=np.uint8).reshape(self.image_size[0], self.image_size[1])
             except Exception as e:
                 raise ValueError(f"Error reshaping image data at index {idx}: {e}")
 
         else:
+            # This else now covers cases where neither 'image_path' nor 'Image' columns exist
             raise ValueError(f"DataFrame must contain either 'image_path' or 'Image' column with valid data at index {idx}")
         
         if len(image.shape) == 3 and image.shape[2] == 3:
