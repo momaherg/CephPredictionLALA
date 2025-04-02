@@ -249,8 +249,10 @@ class LandmarkTrainer:
             'val_heatmap_loss': [],
             'train_coord_loss': [],
             'val_coord_loss': [],
-            'train_med': [],  # Mean Euclidean Distance
-            'val_med': [],    # Mean Euclidean Distance
+            'train_med': [],  # Overall Mean Euclidean Distance
+            'val_med': [],    # Overall Mean Euclidean Distance
+            'train_sella_med': [], # Specific MED for Sella (index 0)
+            'val_sella_med': [],   # Specific MED for Sella (index 0)
             'heatmap_weight': [],
             'coord_weight': [],
             'learning_rate': []  # Track learning rate changes
@@ -264,7 +266,7 @@ class LandmarkTrainer:
             train_loader (DataLoader): DataLoader for training data
             
         Returns:
-            tuple: (average_loss, heatmap_loss, coord_loss, med)
+            tuple: (average_loss, heatmap_loss, coord_loss, med, sella_med)
         """
         self.model.train()
         epoch_loss = 0.0
@@ -333,7 +335,13 @@ class LandmarkTrainer:
         all_targets = torch.cat(all_targets, dim=0)
         med = mean_euclidean_distance(all_predictions, all_targets)
         
-        return epoch_loss, epoch_heatmap_loss, epoch_coord_loss, med
+        # Compute MED for Sella (index 0) if training on all landmarks or targeting Sella
+        sella_med = float('nan') # Default to NaN if not computed
+        if self.target_landmark_indices is None or 0 in self.target_landmark_indices:
+            if all_predictions.shape[1] > 0: # Check if there are landmarks
+                sella_med = mean_euclidean_distance(all_predictions[:, 0:1, :], all_targets[:, 0:1, :])
+        
+        return epoch_loss, epoch_heatmap_loss, epoch_coord_loss, med, sella_med
     
     def validate(self, val_loader):
         """
@@ -343,7 +351,7 @@ class LandmarkTrainer:
             val_loader (DataLoader): DataLoader for validation data
             
         Returns:
-            tuple: (average_loss, heatmap_loss, coord_loss, med)
+            tuple: (average_loss, heatmap_loss, coord_loss, med, sella_med)
         """
         self.model.eval()
         val_loss = 0.0
@@ -394,7 +402,12 @@ class LandmarkTrainer:
         all_targets = torch.cat(all_targets, dim=0)
         med = mean_euclidean_distance(all_predictions, all_targets)
         
-        return val_loss, val_heatmap_loss, val_coord_loss, med
+        # Compute MED for Sella (index 0)
+        sella_med = float('nan') # Default to NaN if not computed
+        if all_predictions.shape[1] > 0: # Check if there are landmarks
+            sella_med = mean_euclidean_distance(all_predictions[:, 0:1, :], all_targets[:, 0:1, :])
+        
+        return val_loss, val_heatmap_loss, val_coord_loss, med, sella_med
     
     def train(self, train_loader, val_loader, num_epochs=50, save_freq=5):
         """
@@ -434,7 +447,7 @@ class LandmarkTrainer:
         
         # Write header to log file
         with open(log_file, 'w') as f:
-            f.write("epoch,train_loss,train_heatmap_loss,train_coord_loss,train_med,val_loss,val_heatmap_loss,val_coord_loss,val_med,learning_rate\n")
+            f.write("epoch,train_loss,train_heatmap_loss,train_coord_loss,train_med,train_sella_med,val_loss,val_heatmap_loss,val_coord_loss,val_med,val_sella_med,learning_rate\n")
         
         for epoch in range(num_epochs):
             # Update loss weights if using weight schedule
@@ -456,10 +469,10 @@ class LandmarkTrainer:
                 print(f"Epoch {epoch+1}/{num_epochs}: Updated weights - heatmap={self.current_heatmap_weight:.2f}, coord={self.current_coord_weight:.2f}")
             
             # Train one epoch
-            train_loss, train_heatmap_loss, train_coord_loss, train_med = self.train_epoch(train_loader)
+            train_loss, train_heatmap_loss, train_coord_loss, train_med, train_sella_med = self.train_epoch(train_loader)
             
             # Validate
-            val_loss, val_heatmap_loss, val_coord_loss, val_med = self.validate(val_loader)
+            val_loss, val_heatmap_loss, val_coord_loss, val_med, val_sella_med = self.validate(val_loader)
             
             # Get current learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -473,6 +486,8 @@ class LandmarkTrainer:
             self.history['val_coord_loss'].append(val_coord_loss)
             self.history['train_med'].append(train_med)
             self.history['val_med'].append(val_med)
+            self.history['train_sella_med'].append(train_sella_med)
+            self.history['val_sella_med'].append(val_sella_med)
             self.history['heatmap_weight'].append(self.current_heatmap_weight)
             self.history['coord_weight'].append(self.current_coord_weight)
             self.history['learning_rate'].append(current_lr)
@@ -487,16 +502,16 @@ class LandmarkTrainer:
             
             # Write metrics to log file
             with open(log_file, 'a') as f:
-                f.write(f"{epoch+1},{train_loss:.6f},{train_heatmap_loss:.6f},{train_coord_loss:.6f},{train_med:.6f},"
-                        f"{val_loss:.6f},{val_heatmap_loss:.6f},{val_coord_loss:.6f},{val_med:.6f},{current_lr:.8f}\n")
+                f.write(f"{epoch+1},{train_loss:.6f},{train_heatmap_loss:.6f},{train_coord_loss:.6f},{train_med:.6f},{train_sella_med:.6f},"
+                        f"{val_loss:.6f},{val_heatmap_loss:.6f},{val_coord_loss:.6f},{val_med:.6f},{val_sella_med:.6f},{current_lr:.8f}\n")
             
             # Print detailed progress with all metrics
             elapsed_time = time.time() - start_time
             
             # More detailed progress log including all metrics
             print(f"Epoch {epoch+1}/{num_epochs} [{elapsed_time:.2f}s]")
-            print(f"  Train: Loss={train_loss:.4f} (Heatmap={self.current_heatmap_weight:.1f}×{train_heatmap_loss:.4f}, Coord={self.current_coord_weight:.1f}×{train_coord_loss:.4f}), MED={train_med:.2f}px")
-            print(f"  Valid: Loss={val_loss:.4f} (Heatmap={val_heatmap_loss:.4f}, Coord={val_coord_loss:.4f}), MED={val_med:.2f}px")
+            print(f"  Train: Loss={train_loss:.4f} (Heatmap={self.current_heatmap_weight:.1f}×{train_heatmap_loss:.4f}, Coord={self.current_coord_weight:.1f}×{train_coord_loss:.4f}), MED={train_med:.2f}px (Sella={train_sella_med:.2f}px)")
+            print(f"  Valid: Loss={val_loss:.4f} (Heatmap={val_heatmap_loss:.4f}, Coord={val_coord_loss:.4f}), MED={val_med:.2f}px (Sella={val_sella_med:.2f}px)")
             print(f"  LR: {current_lr:.2e}")
             
             # Save if best validation loss
@@ -676,6 +691,29 @@ class LandmarkTrainer:
             plt.savefig(os.path.join(figures_dir, 'learning_rate_schedule.png'))
             plt.close()
             
+        # Plot Sella MED curves if available
+        if len(self.history['train_sella_med']) > 0 and len(self.history['val_sella_med']) > 0:
+            plt.figure(figsize=(10, 6))
+            # Filter out potential NaN values before plotting
+            train_sella_med_filtered = [x for x in self.history['train_sella_med'] if not np.isnan(x)]
+            val_sella_med_filtered = [x for x in self.history['val_sella_med'] if not np.isnan(x)]
+            epochs_train = [i+1 for i, x in enumerate(self.history['train_sella_med']) if not np.isnan(x)]
+            epochs_val = [i+1 for i, x in enumerate(self.history['val_sella_med']) if not np.isnan(x)]
+            
+            if epochs_train:
+                plt.plot(epochs_train, train_sella_med_filtered, label='Train Sella MED')
+            if epochs_val:
+                plt.plot(epochs_val, val_sella_med_filtered, label='Validation Sella MED')
+            
+            plt.xlabel('Epoch')
+            plt.ylabel('Mean Euclidean Distance (pixels)')
+            plt.title('Sella Landmark Mean Euclidean Distance (MED)')
+            if epochs_train or epochs_val: # Add legend only if there is data to plot
+                plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(figures_dir, 'sella_med_curves.png'))
+            plt.close()
+        
         # Create a combined loss components plot
         epochs = range(1, len(self.history['train_loss']) + 1)
         plt.figure(figsize=(12, 8))
