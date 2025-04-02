@@ -46,6 +46,20 @@ def parse_args():
     parser.add_argument('--heatmap_weight', type=float, default=1.0, help='Weight for heatmap loss')
     parser.add_argument('--coord_weight', type=float, default=0.1, help='Weight for coordinate loss')
     
+    # Weight scheduling arguments
+    parser.add_argument('--use_weight_schedule', action='store_true', 
+                        help='Enable dynamic loss weight scheduling between heatmap and coordinate loss')
+    parser.add_argument('--initial_heatmap_weight', type=float, default=1.0, 
+                        help='Initial weight for heatmap loss in schedule')
+    parser.add_argument('--initial_coord_weight', type=float, default=0.1, 
+                        help='Initial weight for coordinate loss in schedule')
+    parser.add_argument('--final_heatmap_weight', type=float, default=0.5, 
+                        help='Final weight for heatmap loss in schedule')
+    parser.add_argument('--final_coord_weight', type=float, default=1.0, 
+                        help='Final weight for coordinate loss in schedule')
+    parser.add_argument('--weight_schedule_epochs', type=int, default=30, 
+                        help='Number of epochs to transition weights over')
+    
     # Data balancing arguments
     parser.add_argument('--balance_classes', action='store_true', 
                        help='Balance training data based on skeletal classification (preserves validation and test distributions)')
@@ -89,6 +103,10 @@ def parse_args():
     parser.add_argument('--loss_norm_epsilon', type=float, default=1e-6,
                         help='Epsilon for loss normalization stability')
     
+    # Landmark Subset arguments
+    parser.add_argument('--target_landmark_indices', type=int, nargs='+', default=None,
+                        help='List of 0-based landmark indices to train/evaluate (e.g., 0 1 5). Trains all if not specified.')
+    
     return parser.parse_args()
 
 def set_seed(seed):
@@ -101,8 +119,8 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16, 
-                                        train_ratio=0.8, val_ratio=0.1, 
+def create_dataloader_with_augmentations(df, all_landmark_cols, target_indices, 
+                                        batch_size=16, train_ratio=0.8, val_ratio=0.1, 
                                         apply_clahe=True, root_dir=None, 
                                         num_workers=4, balance_classes=False):
     """
@@ -110,7 +128,8 @@ def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16,
     
     Args:
         df (pandas.DataFrame): DataFrame containing the dataset
-        landmark_cols (list): List of column names containing landmark coordinates
+        all_landmark_cols (list): List of ALL column names containing landmark coordinates
+        target_indices (list): List of 0-based indices of the landmarks to actually use.
         batch_size (int): Batch size for dataloaders
         train_ratio (float): Ratio of data to use for training
         val_ratio (float): Ratio of data to use for validation
@@ -159,13 +178,13 @@ def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16,
         if 'skeletal_class' not in train_df.columns:
             print("Computing skeletal classifications for the training set...")
             from data.patient_classifier import PatientClassifier
-            classifier = PatientClassifier(landmark_cols)
+            classifier = PatientClassifier(all_landmark_cols)
             train_df = classifier.classify_patients(train_df)
         
         # Now balance the training data
         print("Balancing training data using skeletal classification...")
         from data.patient_classifier import PatientClassifier
-        classifier = PatientClassifier(landmark_cols)
+        classifier = PatientClassifier(all_landmark_cols)
         train_df = classifier.balance_classes(train_df, class_column='skeletal_class', balance_method='upsample')
         print(f"Balanced training data: {len(train_df)} samples")
         
@@ -192,17 +211,20 @@ def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16,
     # Create datasets
     train_dataset = CephalometricDataset(
         train_df, root_dir=root_dir, transform=train_transform, 
-        landmark_cols=landmark_cols, train=True, apply_clahe=apply_clahe
+        all_landmark_cols=all_landmark_cols, target_indices=target_indices, 
+        train=True, apply_clahe=apply_clahe
     )
     
     val_dataset = CephalometricDataset(
         val_df, root_dir=root_dir, transform=base_transforms, 
-        landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe
+        all_landmark_cols=all_landmark_cols, target_indices=target_indices, 
+        train=False, apply_clahe=apply_clahe
     )
     
     test_dataset = CephalometricDataset(
         test_df, root_dir=root_dir, transform=base_transforms, 
-        landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe
+        all_landmark_cols=all_landmark_cols, target_indices=target_indices, 
+        train=False, apply_clahe=apply_clahe
     )
     
     # Create dataloaders
@@ -234,7 +256,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Define landmark columns - fix Gonion column names
-    landmark_cols = ['sella_x', 'sella_y', 'nasion_x', 'nasion_y', 'A point_x', 'A point_y',
+    all_landmark_cols = ['sella_x', 'sella_y', 'nasion_x', 'nasion_y', 'A point_x', 'A point_y',
        'B point_x', 'B point_y', 'upper 1 tip_x', 'upper 1 tip_y',
        'upper 1 apex_x', 'upper 1 apex_y', 'lower 1 tip_x', 'lower 1 tip_y',
        'lower 1 apex_x', 'lower 1 apex_y', 'ANS_x', 'ANS_y', 'PNS_x', 'PNS_y',
@@ -244,17 +266,33 @@ def main():
        'Lower lip_y', 'ST Pogonion_x', 'ST Pogonion_y', 'gnathion_x',
        'gnathion_y']
     
-    # Extract landmark names for evaluation
-    landmark_names = []
-    for i in range(0, len(landmark_cols), 2):
-        # Extract name from column (removing _x or _y suffix)
-        name = landmark_cols[i].replace('_x', '')
-        landmark_names.append(name)
+    # Determine target landmarks
+    target_indices = args.target_landmark_indices
+    if target_indices is not None:
+        print(f"Training for a subset of landmarks: Indices {target_indices}")
+        # Select the corresponding columns (both x and y)
+        landmark_cols = []
+        for idx in target_indices:
+            if 2*idx + 1 < len(all_landmark_cols):
+                landmark_cols.extend(all_landmark_cols[2*idx : 2*idx+2])
+            else:
+                raise IndexError(f"Landmark index {idx} is out of bounds for the available {len(all_landmark_cols)//2} landmarks.")
+        num_landmarks = len(target_indices)
+    else:
+        print("Training for all landmarks.")
+        landmark_cols = all_landmark_cols
+        num_landmarks = len(landmark_cols) // 2
+        target_indices = list(range(num_landmarks)) # Keep track of indices even if all are used
     
-    # Initialize data processor
+    # Extract landmark names for evaluation
+    all_landmark_names = [all_landmark_cols[i].replace('_x', '') for i in range(0, len(all_landmark_cols), 2)]
+    landmark_names = [all_landmark_names[i] for i in target_indices]
+    print(f"Target landmark names: {landmark_names}")
+    
+    # Initialize data processor (still uses all columns for potential features like classification)
     data_processor = DataProcessor(
         data_path=args.data_path,
-        landmark_cols=landmark_cols,
+        landmark_cols=all_landmark_cols, # Pass all columns here
         image_size=(224, 224),
         apply_clahe=args.apply_clahe
     )
@@ -301,7 +339,8 @@ def main():
     print("Creating dataloaders with augmentation for training set...")
     train_loader, val_loader, test_loader = create_dataloader_with_augmentations(
         df=df,
-        landmark_cols=landmark_cols,
+        all_landmark_cols=all_landmark_cols, # Pass all columns to dataset loader
+        target_indices=target_indices, # Pass the target indices
         batch_size=args.batch_size,
         train_ratio=0.8,
         val_ratio=0.1,
@@ -325,6 +364,7 @@ def main():
     # Log training configuration
     print("\nTraining Configuration:")
     print(f"  Model: HRNet-W32 with{'' if args.use_refinement else 'out'} refinement MLP")
+    print(f"  Target Landmarks ({num_landmarks}): {landmark_names}") # Log target landmarks
     
     # Log optimizer info
     print(f"  Optimizer: {args.optimizer.upper()}")
@@ -346,7 +386,7 @@ def main():
     
     # Create trainer
     trainer = LandmarkTrainer(
-        num_landmarks=args.num_landmarks,
+        num_landmarks=num_landmarks, # Use the calculated number of landmarks
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         device=device,  # Auto-select or forced CPU
@@ -380,7 +420,8 @@ def main():
         # Loss normalization parameters
         use_loss_normalization=not args.no_loss_norm,
         norm_decay=args.loss_norm_decay,
-        norm_epsilon=args.loss_norm_epsilon
+        norm_epsilon=args.loss_norm_epsilon,
+        target_landmark_indices=target_indices # Pass indices to trainer
     )
     
     # Train model
@@ -397,8 +438,8 @@ def main():
     results = trainer.evaluate(
         test_loader, 
         save_visualizations=True,
-        landmark_names=landmark_names,
-        landmark_cols=landmark_cols  # Pass landmark columns for skeletal classification
+        landmark_names=landmark_names, # Pass filtered names
+        landmark_cols=all_landmark_cols  # Pass all columns for skeletal classification if needed
     )
     
     # Print evaluation results

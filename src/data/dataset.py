@@ -8,109 +8,97 @@ from PIL import Image
 from torchvision import transforms
 
 class CephalometricDataset(Dataset):
-    def __init__(self, data_frame, root_dir=None, transform=None, 
-                 landmark_cols=None, train=True, apply_clahe=True,
-                 clahe_clip_limit=2.0, clahe_grid_size=(8,8)):
+    """Cephalometric landmark dataset."""
+
+    def __init__(self, dataframe, root_dir=None, transform=None, 
+                 all_landmark_cols=None, target_indices=None,
+                 train=False, apply_clahe=True, clahe_clip_limit=2.0, 
+                 clahe_grid_size=(8, 8)):
         """
         Args:
-            data_frame (pandas.DataFrame): DataFrame containing image paths and landmarks
-            root_dir (string): Directory with all the images
-            transform (callable, optional): Optional transform to be applied on a sample
-            landmark_cols (list): Columns containing landmark coordinates
-            train (bool): Whether this is training set or not
-            apply_clahe (bool): Whether to apply CLAHE for histogram equalization
-            clahe_clip_limit (float): Clip limit for CLAHE
-            clahe_grid_size (tuple): Grid size for CLAHE
+            dataframe (pd.DataFrame): DataFrame with image info and landmarks.
+            root_dir (string, optional): Directory with all the images (if paths are relative).
+            transform (callable, optional): Optional transform to be applied on a sample.
+            all_landmark_cols (list): List of ALL column names for landmark coordinates (x, y).
+            target_indices (list, optional): List of 0-based indices of landmarks to use. 
+                                            If None, all landmarks are used.
+            train (bool): Indicates if this is the training dataset (for augmentation control).
+            apply_clahe (bool): Apply CLAHE preprocessing.
+            clahe_clip_limit (float): Clip limit for CLAHE.
+            clahe_grid_size (tuple): Grid size for CLAHE.
         """
-        self.data_frame = data_frame
+        self.dataframe = dataframe
         self.root_dir = root_dir
         self.transform = transform
-        self.landmark_cols = landmark_cols
         self.train = train
         self.apply_clahe = apply_clahe
-        
-        # Store CLAHE parameters instead of the object itself
         self.clahe_clip_limit = clahe_clip_limit
         self.clahe_grid_size = clahe_grid_size
-    
+        
+        self.all_landmark_cols = all_landmark_cols
+        self.target_indices = target_indices
+        
+        # Determine the final landmark columns to be extracted
+        if self.target_indices is not None:
+            self.landmark_cols = []
+            for idx in self.target_indices:
+                 if 2*idx + 1 < len(self.all_landmark_cols):
+                     self.landmark_cols.extend(self.all_landmark_cols[2*idx : 2*idx+2])
+                 else:
+                     # This should ideally be caught earlier, but double-check
+                     raise IndexError(f"Landmark index {idx} is out of bounds.")
+            self.num_landmarks = len(self.target_indices)
+        else:
+            self.landmark_cols = self.all_landmark_cols
+            self.num_landmarks = len(self.landmark_cols) // 2
+
     def __len__(self):
-        return len(self.data_frame)
-    
+        return len(self.dataframe)
+
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
-        
+
         # Get image data
-        if 'Image' in self.data_frame.columns:
-            # Assuming 'Image' column contains pixel array data
-            img_data = self.data_frame.iloc[idx]['Image']
-            # Convert from list of RGB tuples to numpy array if needed
-            if isinstance(img_data, list):
-                img_array = np.array(img_data).reshape(224, 224, 3)
-            else:
-                img_array = img_data
-        else:
-            # For synthetic data when no actual images are available, create a blank image
-            if self.root_dir is None or 'image_path' in self.data_frame.columns:
-                # Create a synthetic image for demonstration
-                img_array = np.zeros((224, 224, 3), dtype=np.uint8)
-                # Add some random noise to make it more realistic
-                img_array = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
-            else:
-                # If images are stored as files
-                img_name = os.path.join(self.root_dir, self.data_frame.iloc[idx]['patient'] + '.jpg')
-                img_array = np.array(Image.open(img_name))
-        
-        # Ensure image is in the right format (uint8) for OpenCV operations
-        if img_array.dtype != np.uint8:
-            # If float in range [0,1], convert to [0,255]
-            if img_array.dtype == np.float32 or img_array.dtype == np.float64:
-                if img_array.max() <= 1.0:
-                    img_array = (img_array * 255).astype(np.uint8)
-                else:
-                    img_array = img_array.astype(np.uint8)
-            else:
-                # For other types, simply convert to uint8
-                img_array = img_array.astype(np.uint8)
-        
-        # Apply CLAHE for histogram equalization
-        if self.apply_clahe and len(img_array.shape) == 3:
+        if 'image_path' in self.dataframe.columns:
+            img_name = self.dataframe.iloc[idx, self.dataframe.columns.get_loc('image_path')]
+            if self.root_dir:
+                img_name = os.path.join(self.root_dir, img_name)
             try:
-                # Create CLAHE object on-demand (no longer stored as instance attribute)
-                clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit, tileGridSize=self.clahe_grid_size)
-                
-                # Convert to LAB color space
-                lab = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
-                l, a, b = cv2.split(lab)
-                
-                # Apply CLAHE to L channel
-                cl = clahe.apply(l)
-                
-                # Merge the CLAHE enhanced L channel with the a and b channels
-                limg = cv2.merge((cl, a, b))
-                
-                # Convert back to RGB color space
-                img_array = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
-            except cv2.error as e:
-                # If color conversion fails, use original image
-                print(f"Warning: CLAHE could not be applied, using original image. Error: {e}")
-                # You might want to log this instead of printing
-        
-        # Get landmarks if available
-        if self.landmark_cols and all(col in self.data_frame.columns for col in self.landmark_cols):
-            landmarks = self.data_frame.iloc[idx][self.landmark_cols].values.astype('float32')
-            # Reshape to (num_landmarks, 2) for easier processing
-            landmarks = landmarks.reshape(-1, 2)
+                image = cv2.imread(img_name, cv2.IMREAD_GRAYSCALE)
+                if image is None:
+                    raise FileNotFoundError(f"Image not found or could not be read: {img_name}")
+            except Exception as e:
+                print(f"Error loading image {img_name}: {e}")
+                # Return a dummy sample or raise an error
+                return None # Or raise an exception if preferred
+        elif 'Image' in self.dataframe.columns:
+            # Assumes image data is stored directly in the DataFrame (e.g., flattened list)
+            img_data = self.dataframe.iloc[idx]['Image']
+            # Infer image size (assuming square for now)
+            side_len = int(np.sqrt(len(img_data)))
+            image = np.array(img_data, dtype=np.uint8).reshape(side_len, side_len)
         else:
-            landmarks = np.array([])
+            raise ValueError("DataFrame must contain either 'image_path' or 'Image' column")
+
+        # Apply CLAHE if requested
+        if self.apply_clahe:
+            clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit, tileGridSize=self.clahe_grid_size)
+            image = clahe.apply(image)
         
-        # Create sample
-        sample = {'image': img_array, 'landmarks': landmarks}
-        
-        # Apply transformations
+        # Ensure image is 2D (grayscale)
+        if len(image.shape) > 2:
+             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) # Convert if accidentally loaded as BGR
+
+        # Get landmark coordinates (only the ones specified by self.landmark_cols)
+        landmarks = self.dataframe.iloc[idx][self.landmark_cols].values.astype('float')
+        landmarks = landmarks.reshape(-1, 2) # Reshape to (num_landmarks, 2)
+
+        sample = {'image': image, 'landmarks': landmarks}
+
         if self.transform:
             sample = self.transform(sample)
-        
+
         return sample
 
 
@@ -200,17 +188,20 @@ def create_dataloaders(df, landmark_cols, batch_size=32, train_ratio=0.8, val_ra
     # Create datasets
     train_dataset = CephalometricDataset(
         train_df, root_dir=root_dir, transform=train_transform, 
-        landmark_cols=landmark_cols, train=True, apply_clahe=apply_clahe
+        all_landmark_cols=landmark_cols, target_indices=None,
+        train=True, apply_clahe=apply_clahe
     )
     
     val_dataset = CephalometricDataset(
         val_df, root_dir=root_dir, transform=val_transform, 
-        landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe
+        all_landmark_cols=landmark_cols, target_indices=None,
+        train=False, apply_clahe=apply_clahe
     )
     
     test_dataset = CephalometricDataset(
         test_df, root_dir=root_dir, transform=val_transform, 
-        landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe
+        all_landmark_cols=landmark_cols, target_indices=None,
+        train=False, apply_clahe=apply_clahe
     )
     
     # Create dataloaders

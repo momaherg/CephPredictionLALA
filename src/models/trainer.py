@@ -56,6 +56,7 @@ class LandmarkTrainer:
                  use_loss_normalization=True,
                  norm_decay=0.99,
                  norm_epsilon=1e-6,
+                 target_landmark_indices=None,
                  total_steps=None): # Added total_steps for OneCycleLR pre-initialization
         """
         Initialize trainer
@@ -92,6 +93,7 @@ class LandmarkTrainer:
             use_loss_normalization (bool): Normalize loss components before weighting.
             norm_decay (float): Decay factor for loss normalization running average.
             norm_epsilon (float): Epsilon for loss normalization stability.
+            target_landmark_indices (list, optional): List of 0-based indices to target.
             total_steps (int, optional): Total number of training steps, required for OneCycleLR if initialized directly.
         """
         # Set device
@@ -223,6 +225,7 @@ class LandmarkTrainer:
         
         # Set number of landmarks
         self.num_landmarks = num_landmarks
+        self.target_landmark_indices = target_landmark_indices
         
         # Set output directory
         self.output_dir = output_dir
@@ -704,8 +707,9 @@ class LandmarkTrainer:
         Args:
             test_loader (DataLoader): DataLoader for test data
             save_visualizations (bool): Whether to save visualization images
-            landmark_names (list, optional): Names of landmarks for better reporting
-            landmark_cols (list, optional): List of landmark column names for skeletal classification
+            landmark_names (list, optional): Names of the TARGET landmarks being evaluated.
+            landmark_cols (list, optional): List of ALL original landmark column names 
+                                            for skeletal classification (if used).
             
         Returns:
             dict: Evaluation results
@@ -724,16 +728,16 @@ class LandmarkTrainer:
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(test_loader):
-                # Get images and landmarks
+                # Get images and landmarks (landmarks are already filtered by dataset)
                 images = batch['image'].to(self.device)
-                landmarks = batch['landmarks'].to(self.device)
+                landmarks = batch['landmarks'].to(self.device) # These are the target landmarks
                 
                 # Forward pass
-                predicted_landmarks = self.model.predict_landmarks(images)
+                predicted_landmarks = self.model.predict_landmarks(images) # Predicts based on model output size
                 
                 # Save predictions and targets
                 all_predictions.append(predicted_landmarks.cpu())
-                all_targets.append(landmarks.cpu())
+                all_targets.append(landmarks.cpu()) # landmarks are already filtered
                 
                 # Save visualizations for the first few batches
                 if save_visualizations and batch_idx < 5:
@@ -744,7 +748,7 @@ class LandmarkTrainer:
         all_predictions = torch.cat(all_predictions, dim=0)
         all_targets = torch.cat(all_targets, dim=0)
         
-        # Compute standard metrics
+        # Compute standard metrics (will use the number of landmarks model was trained on)
         med = mean_euclidean_distance(all_predictions, all_targets)
         success_rate_2mm = landmark_success_rate(all_predictions, all_targets, threshold=2.0)
         success_rate_4mm = landmark_success_rate(all_predictions, all_targets, threshold=4.0)
@@ -754,10 +758,11 @@ class LandmarkTrainer:
         detailed_report = generate_landmark_evaluation_report(
             predictions=all_predictions,
             targets=all_targets,
-            landmark_names=landmark_names,
+            landmark_names=landmark_names, # Pass the filtered names
             output_dir=report_dir,
             thresholds=[2.0, 4.0, 6.0],
-            landmark_cols=landmark_cols  # Pass landmark_cols for skeletal classification
+            landmark_cols=landmark_cols,  # Pass all columns for skeletal classification
+            target_indices=self.target_landmark_indices # Pass target indices for context
         )
         
         # Create results dictionary
@@ -774,22 +779,32 @@ class LandmarkTrainer:
         print(f"Success Rate (2mm): {success_rate_2mm * 100:.2f}%")
         print(f"Success Rate (4mm): {success_rate_4mm * 100:.2f}%")
         
-        # Print worst performing landmarks
-        print("\nTop 3 Worst Performing Landmarks:")
-        worst_landmarks = detailed_report['worst_landmarks']
-        worst_med = detailed_report['worst_landmarks_med']
-        for i, (idx, med_val) in enumerate(zip(worst_landmarks, worst_med)):
-            name = landmark_names[idx] if landmark_names else f"Landmark {idx+1}"
+        # Print worst performing landmarks (indices are relative to the subset)
+        print("\nTop 3 Worst Performing Landmarks (within the evaluated subset):")
+        worst_landmarks_indices_relative = detailed_report.get('worst_landmarks_indices_relative', [])
+        worst_med = detailed_report.get('worst_landmarks_med', [])
+        if landmark_names is None:
+            landmark_names = [f"Landmark {i}" for i in range(self.num_landmarks)]
+            
+        for i, (idx_rel, med_val) in enumerate(zip(worst_landmarks_indices_relative, worst_med)):
+            name = landmark_names[idx_rel] # Use relative index for name lookup
             print(f"  {i+1}. {name}: {med_val:.2f} pixels")
         
-        # Print skeletal classification results if available
-        if 'classification' in detailed_report:
-            class_results = detailed_report['classification']
-            print("\nSkeletal Classification Results:")
-            print(f"  Classification Accuracy: {class_results['accuracy']*100:.2f}%")
-            print(f"  Mean ANB Angle Error: {class_results['ANB_error_mean']:.2f}°")
-            print(f"  Mean SNA Angle Error: {class_results['SNA_error_mean']:.2f}°")
-            print(f"  Mean SNB Angle Error: {class_results['SNB_error_mean']:.2f}°")
+        # Print skeletal classification results if available and relevant
+        # (Skeletal classification uses specific landmarks, may not be valid if those weren't predicted)
+        if 'classification' in detailed_report and landmark_cols is not None:
+             # Check if necessary landmarks for classification were included in the target subset
+             # This check depends on how PatientClassifier determines necessity. Assuming it needs Sella, Nasion, A, B.
+             required_indices_for_class = [0, 1, 2, 3] # Example: Indices for Sella, Nasion, A, B
+             if self.target_landmark_indices is None or all(idx in self.target_landmark_indices for idx in required_indices_for_class):
+                 class_results = detailed_report['classification']
+                 print("\nSkeletal Classification Results:")
+                 print(f"  Classification Accuracy: {class_results['accuracy']*100:.2f}% (Note: Based on predicted target landmarks)")
+                 print(f"  Mean ANB Angle Error: {class_results['ANB_error_mean']:.2f}°")
+                 print(f"  Mean SNA Angle Error: {class_results['SNA_error_mean']:.2f}°")
+                 print(f"  Mean SNB Angle Error: {class_results['SNB_error_mean']:.2f}°")
+             else:
+                 print("\nSkeletal Classification Results: Not calculated (required landmarks were not targeted)")
         
         print(f"\nDetailed report saved to: {report_dir}")
         
