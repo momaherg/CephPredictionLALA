@@ -212,19 +212,22 @@ def create_dataloader_with_augmentations(df, all_landmark_cols, target_indices,
     train_dataset = CephalometricDataset(
         train_df, root_dir=root_dir, transform=train_transform, 
         all_landmark_cols=all_landmark_cols, target_indices=target_indices, 
-        train=True, apply_clahe=apply_clahe
+        train=True, apply_clahe=apply_clahe,
+        image_size=(224, 224)
     )
     
     val_dataset = CephalometricDataset(
         val_df, root_dir=root_dir, transform=base_transforms, 
         all_landmark_cols=all_landmark_cols, target_indices=target_indices, 
-        train=False, apply_clahe=apply_clahe
+        train=False, apply_clahe=apply_clahe,
+        image_size=(224, 224)
     )
     
     test_dataset = CephalometricDataset(
         test_df, root_dir=root_dir, transform=base_transforms, 
         all_landmark_cols=all_landmark_cols, target_indices=target_indices, 
-        train=False, apply_clahe=apply_clahe
+        train=False, apply_clahe=apply_clahe,
+        image_size=(224, 224)
     )
     
     # Create dataloaders

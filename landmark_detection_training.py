@@ -298,21 +298,24 @@ train_dataset = CephalometricDataset(
     train_df, root_dir=None, transform=train_transform, 
     all_landmark_cols=landmark_cols, # Pass all
     target_indices=TARGET_LANDMARK_INDICES, # Pass target indices
-    train=True, apply_clahe=APPLY_CLAHE
+    train=True, apply_clahe=APPLY_CLAHE,
+    image_size=(224, 224) # Explicitly pass image size
 )
 
 val_dataset = CephalometricDataset(
     val_df, root_dir=None, transform=base_transforms, 
     all_landmark_cols=landmark_cols, # Pass all
     target_indices=TARGET_LANDMARK_INDICES, # Pass target indices
-    train=False, apply_clahe=APPLY_CLAHE
+    train=False, apply_clahe=APPLY_CLAHE,
+    image_size=(224, 224)
 )
 
 test_dataset = CephalometricDataset(
     test_df, root_dir=None, transform=base_transforms, 
     all_landmark_cols=landmark_cols, # Pass all
     target_indices=TARGET_LANDMARK_INDICES, # Pass target indices
-    train=False, apply_clahe=APPLY_CLAHE
+    train=False, apply_clahe=APPLY_CLAHE,
+    image_size=(224, 224)
 )
 
 # Create dataloaders
