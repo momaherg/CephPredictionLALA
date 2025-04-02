@@ -123,9 +123,10 @@ USE_LOSS_NORMALIZATION = True  # Normalize losses before weighting
 NORM_DECAY = 0.99  # Decay factor for running average
 NORM_EPSILON = 1e-6  # Epsilon for numerical stability
 
-# Landmark Subset parameters
-TARGET_LANDMARK_INDICES = None # e.g., [0, 1, 2] to train only Sella, Nasion, A point
-                               # Set to None to train all landmarks
+# Target Landmarks (optional)
+# Define a list of 0-based indices for landmarks to focus on, or None to train on all.
+# Example: TARGET_LANDMARK_INDICES = [0, 1, 5] # Focus on Sella, Nasion, A point
+TARGET_LANDMARK_INDICES = None 
 
 # LR Range Test parameters
 RUN_LR_FINDER = True  # Set to True to run the LR range test before training
@@ -165,27 +166,6 @@ landmark_cols = ['sella_x', 'sella_y', 'nasion_x', 'nasion_y', 'A point_x', 'A p
                 'Subnasal_y', 'Upper lip_x', 'Upper lip_y', 'Lower lip_x',
                 'Lower lip_y', 'ST Pogonion_x', 'ST Pogonion_y', 'gnathion_x',
                 'gnathion_y']
-
-# Determine target landmarks based on TARGET_LANDMARK_INDICES
-if TARGET_LANDMARK_INDICES is not None:
-    print(f"Training for a subset of landmarks: Indices {TARGET_LANDMARK_INDICES}")
-    selected_landmark_cols = []
-    for idx in TARGET_LANDMARK_INDICES:
-        if 2*idx + 1 < len(landmark_cols):
-            selected_landmark_cols.extend(landmark_cols[2*idx : 2*idx+2])
-        else:
-            raise IndexError(f"Landmark index {idx} is out of bounds.")
-    num_landmarks_to_train = len(TARGET_LANDMARK_INDICES)
-else:
-    print("Training for all landmarks.")
-    selected_landmark_cols = landmark_cols
-    num_landmarks_to_train = len(landmark_cols) // 2
-    TARGET_LANDMARK_INDICES = list(range(num_landmarks_to_train))
-
-# Extract names of the target landmarks
-all_landmark_names = [landmark_cols[i].replace('_x', '') for i in range(0, len(landmark_cols), 2)]
-selected_landmark_names = [all_landmark_names[i] for i in TARGET_LANDMARK_INDICES]
-print(f"Target landmark names: {selected_landmark_names}")
 
 # Initialize data processor
 try:
@@ -296,26 +276,17 @@ if BALANCE_CLASSES and 'skeletal_class' in train_df.columns:
 # Create datasets
 train_dataset = CephalometricDataset(
     train_df, root_dir=None, transform=train_transform, 
-    all_landmark_cols=landmark_cols, # Pass all
-    target_indices=TARGET_LANDMARK_INDICES, # Pass target indices
-    train=True, apply_clahe=APPLY_CLAHE,
-    image_size=(224, 224) # Explicitly pass image size
+    landmark_cols=landmark_cols, train=True, apply_clahe=APPLY_CLAHE
 )
 
 val_dataset = CephalometricDataset(
     val_df, root_dir=None, transform=base_transforms, 
-    all_landmark_cols=landmark_cols, # Pass all
-    target_indices=TARGET_LANDMARK_INDICES, # Pass target indices
-    train=False, apply_clahe=APPLY_CLAHE,
-    image_size=(224, 224)
+    landmark_cols=landmark_cols, train=False, apply_clahe=APPLY_CLAHE
 )
 
 test_dataset = CephalometricDataset(
     test_df, root_dir=None, transform=base_transforms, 
-    all_landmark_cols=landmark_cols, # Pass all
-    target_indices=TARGET_LANDMARK_INDICES, # Pass target indices
-    train=False, apply_clahe=APPLY_CLAHE,
-    image_size=(224, 224)
+    landmark_cols=landmark_cols, train=False, apply_clahe=APPLY_CLAHE
 )
 
 # Create dataloaders
@@ -345,7 +316,7 @@ print(f"  Test samples: {len(test_dataset)}")
 # %%
 # Create trainer
 trainer = LandmarkTrainer(
-    num_landmarks=num_landmarks_to_train, # Use calculated number
+    num_landmarks=NUM_LANDMARKS,
     learning_rate=LEARNING_RATE,
     weight_decay=WEIGHT_DECAY,
     device=device,
@@ -381,7 +352,8 @@ trainer = LandmarkTrainer(
     use_loss_normalization=USE_LOSS_NORMALIZATION,
     norm_decay=NORM_DECAY,
     norm_epsilon=NORM_EPSILON,
-    target_landmark_indices=TARGET_LANDMARK_INDICES # Pass indices
+    # Target landmarks
+    target_landmark_indices=TARGET_LANDMARK_INDICES
 )
 
 # Custom max_delta setting for the refinement MLP if needed
@@ -433,7 +405,7 @@ if RUN_LR_FINDER:
     # Create a temporary trainer instance JUST for the LR finder
     # Use a base learning rate, it will be overridden by the finder
     temp_trainer_for_finder = LandmarkTrainer(
-        num_landmarks=num_landmarks_to_train,
+        num_landmarks=NUM_LANDMARKS,
         learning_rate=LR_FINDER_START_LR, # Start LR for the finder
         weight_decay=WEIGHT_DECAY,
         device=device,
@@ -502,12 +474,7 @@ history = trainer.train(
 # %%
 # Evaluate the model on the test set
 print("Evaluating model on test set...")
-results = trainer.evaluate(
-    test_loader, 
-    save_visualizations=True,
-    landmark_names=selected_landmark_names, # Pass filtered names
-    landmark_cols=landmark_cols # Pass all columns for skeletal classification
-    )
+results = trainer.evaluate(test_loader, save_visualizations=True)
 
 # Print evaluation results
 print("\nEvaluation Results:")
@@ -652,7 +619,7 @@ def save_model_config(output_dir, config):
 
 # Create and save model configuration
 model_config = {
-    'num_landmarks': num_landmarks_to_train,
+    'num_landmarks': NUM_LANDMARKS,
     'use_refinement': USE_REFINEMENT,
     'max_delta': MAX_DELTA,
     'hrnet_type': HRNET_TYPE,

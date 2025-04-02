@@ -4,8 +4,13 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import pandas as pd
 import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
+import sys
 import os
-import warnings
+
+# Add the project root to the path to import patient_classifier
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from src.data.patient_classifier import PatientClassifier
 
 def mean_euclidean_distance_per_landmark(predictions, targets):
     """
@@ -171,206 +176,259 @@ def plot_landmark_metrics(med_per_landmark, success_rate_per_landmark=None, land
         plt.savefig(output_path / 'med_heatmap.png')
     plt.close()
 
-def generate_landmark_evaluation_report(predictions, targets, landmark_names=None, 
-                                          output_dir='./evaluation_reports', 
-                                          thresholds=[2.0, 4.0, 6.0],
-                                          landmark_cols=None,
-                                          target_indices=None):
+def evaluate_skeletal_classification(predictions, targets, landmark_cols, output_dir=None):
     """
-    Generates a detailed evaluation report for landmark predictions.
-
-    Args:
-        predictions (torch.Tensor): Predicted landmarks (N, num_landmarks, 2).
-        targets (torch.Tensor): Ground truth landmarks (N, num_landmarks, 2).
-        landmark_names (list, optional): Names of the landmarks being evaluated.
-        output_dir (str): Directory to save the report and plots.
-        thresholds (list): List of thresholds (in pixels) for success rate calculation.
-        landmark_cols (list, optional): List of ALL original landmark column names for skeletal classification.
-        target_indices (list, optional): List of 0-based indices of the landmarks that were targeted.
-
-    Returns:
-        dict: Dictionary containing overall and per-landmark metrics.
-    """
-    os.makedirs(output_dir, exist_ok=True)
+    Evaluate the accuracy of skeletal classification based on predicted vs. true landmarks
     
-    # Ensure tensors are numpy arrays on CPU
+    Args:
+        predictions (torch.Tensor or np.ndarray): Predicted landmark coordinates of shape (batch_size, num_landmarks, 2)
+        targets (torch.Tensor or np.ndarray): Ground truth landmark coordinates of shape (batch_size, num_landmarks, 2)
+        landmark_cols (list): List of landmark column names
+        output_dir (str, optional): Directory to save the evaluation plots
+        
+    Returns:
+        dict: Dictionary containing classification metrics
+    """
+    # Convert to numpy if needed
     if isinstance(predictions, torch.Tensor):
         predictions = predictions.detach().cpu().numpy()
     if isinstance(targets, torch.Tensor):
         targets = targets.detach().cpu().numpy()
-        
-    num_samples, num_landmarks, _ = predictions.shape
     
-    if landmark_names is None:
-        landmark_names = [f'Landmark_{i+1}' for i in range(num_landmarks)]
-    elif len(landmark_names) != num_landmarks:
-        warnings.warn(f"Number of landmark names ({len(landmark_names)}) does not match number of predicted landmarks ({num_landmarks}). Using generic names.")
-        landmark_names = [f'Landmark_{i+1}' for i in range(num_landmarks)]
-
-    # 1. Calculate Euclidean Distances
-    distances = np.sqrt(np.sum((predictions - targets)**2, axis=2))
+    # Create patient classifier instance
+    classifier = PatientClassifier(landmark_cols)
     
-    # 2. Overall Metrics
-    overall_med = np.mean(distances)
-    overall_std = np.std(distances)
-    overall_success_rates = {f'{t}mm': np.mean(distances < t) for t in thresholds}
+    # Calculate cephalometric angles and classification from ground truth
+    SNA_true = classifier.calculate_SNA_angle(targets)
+    SNB_true = classifier.calculate_SNB_angle(targets)
+    ANB_true = classifier.calculate_ANB_angle(SNA_true, SNB_true)
+    class_true = classifier.classify_ANB(ANB_true)
     
-    # 3. Per-Landmark Metrics
-    per_landmark_stats = []
-    for i in range(num_landmarks):
-        landmark_distances = distances[:, i]
-        stats = {
-            'name': landmark_names[i],
-            'index_relative': i, # Index within the evaluated subset
-            'index_original': target_indices[i] if target_indices is not None else i, # Original index if provided
-            'med': np.mean(landmark_distances),
-            'std': np.std(landmark_distances),
-            'min': np.min(landmark_distances),
-            'max': np.max(landmark_distances)
-        }
-        for t in thresholds:
-            stats[f'success_rate_{t}mm'] = np.mean(landmark_distances < t)
-        per_landmark_stats.append(stats)
-        
-    # Sort landmarks by MED (worst first)
-    per_landmark_stats.sort(key=lambda x: x['med'], reverse=True)
+    # Calculate cephalometric angles and classification from predictions
+    SNA_pred = classifier.calculate_SNA_angle(predictions)
+    SNB_pred = classifier.calculate_SNB_angle(predictions)
+    ANB_pred = classifier.calculate_ANB_angle(SNA_pred, SNB_pred)
+    class_pred = classifier.classify_ANB(ANB_pred)
     
-    # Identify worst performing landmarks (relative indices)
-    worst_landmarks_indices_relative = [stats['index_relative'] for stats in per_landmark_stats[:5]]
-    worst_landmarks_med = [stats['med'] for stats in per_landmark_stats[:5]]
+    # Calculate classification accuracy
+    accuracy = accuracy_score(class_true, class_pred)
+    conf_matrix = confusion_matrix(class_true, class_pred)
+    class_report = classification_report(class_true, class_pred, output_dict=True)
     
-    # 4. Skeletal Classification (Optional)
-    classification_report = None
-    if landmark_cols is not None:
-        try:
-            from ..data.patient_classifier import PatientClassifier # Relative import
-            classifier = PatientClassifier(landmark_cols) # Use all columns here
-            
-            # We need to map the predicted subset back to the full landmark array structure
-            # required by the classifier. Assume classifier needs all landmarks.
-            
-            # Create placeholder arrays for full predictions and targets
-            num_all_landmarks = len(landmark_cols) // 2
-            full_predictions = np.full((num_samples, num_all_landmarks, 2), np.nan)
-            full_targets = np.full((num_samples, num_all_landmarks, 2), np.nan)
-            
-            # Fill in the values for the landmarks that were predicted
-            if target_indices is not None:
-                for i, original_idx in enumerate(target_indices):
-                    full_predictions[:, original_idx, :] = predictions[:, i, :]
-                    full_targets[:, original_idx, :] = targets[:, i, :]
-            else: # If target_indices is None, assume all were predicted
-                full_predictions = predictions
-                full_targets = targets
-            
-            # Create temporary dataframes for classification
-            pred_data = {landmark_cols[j]: full_predictions[:, j // 2, j % 2] for j in range(len(landmark_cols))}
-            target_data = {landmark_cols[j]: full_targets[:, j // 2, j % 2] for j in range(len(landmark_cols))}
-            pred_df = pd.DataFrame(pred_data)
-            target_df = pd.DataFrame(target_data)
-            
-            # Classify based on predictions and ground truth
-            # Need to handle potential NaNs if required landmarks were not predicted
-            pred_class_df = classifier.classify_patients(pred_df.dropna(subset=classifier.required_cols))
-            target_class_df = classifier.classify_patients(target_df.dropna(subset=classifier.required_cols))
-            
-            # Calculate classification metrics if classification was possible
-            if 'skeletal_class' in pred_class_df.columns and 'skeletal_class' in target_class_df.columns:
-                classification_report = classifier.evaluate_classification(
-                    pred_class_df, 
-                    target_class_df
-                )
-            else:
-                warnings.warn("Could not perform skeletal classification due to missing required landmarks in predictions or targets.")
-
-        except ImportError:
-            warnings.warn("PatientClassifier not found. Skipping skeletal classification evaluation.")
-        except Exception as e:
-            warnings.warn(f"Error during skeletal classification: {e}")
-
-    # 5. Generate Report File
-    report_path = os.path.join(output_dir, 'evaluation_report.txt')
-    with open(report_path, 'w') as f:
-        f.write("Cephalometric Landmark Detection Evaluation Report\n")
-        f.write("====================================================\n\n")
-        f.write(f"Total Samples Evaluated: {num_samples}\n")
-        f.write(f"Number of Landmarks Evaluated: {num_landmarks}\n")
-        if target_indices:
-            f.write(f"Target Landmark Indices (original): {target_indices}\n")
-            f.write(f"Target Landmark Names: {landmark_names}\n\n")
-        else:
-            f.write("Evaluated All Landmarks\n\n")
-            
-        f.write("Overall Metrics:\n")
-        f.write(f"  Mean Euclidean Distance (MED): {overall_med:.4f} pixels\n")
-        f.write(f"  Standard Deviation (SD): {overall_std:.4f} pixels\n")
-        for t in thresholds:
-            f.write(f"  Success Rate ({t}mm threshold): {overall_success_rates[f'{t}mm'] * 100:.2f}%\n")
-        f.write("\n")
-        
-        if classification_report:
-            f.write("Skeletal Classification Metrics:\n")
-            f.write(f"  Classification Accuracy: {classification_report['accuracy'] * 100:.2f}%\n")
-            f.write(f"  Mean ANB Angle Error: {classification_report['ANB_error_mean']:.2f}° (SD: {classification_report['ANB_error_std']:.2f}°)\n")
-            f.write(f"  Mean SNA Angle Error: {classification_report['SNA_error_mean']:.2f}° (SD: {classification_report['SNA_error_std']:.2f}°)\n")
-            f.write(f"  Mean SNB Angle Error: {classification_report['SNB_error_mean']:.2f}° (SD: {classification_report['SNB_error_std']:.2f}°)\n")
-            # Include confusion matrix if desired
-            # f.write("\nConfusion Matrix:\n")
-            # f.write(str(classification_report['confusion_matrix']))
-            f.write("\n")
-            
-        f.write("Per-Landmark Metrics (Sorted by MED, worst first):\n")
-        header = "{:<5} {:<20} {:<10} {:<10} {:<10} {:<10}".format(
-            "Idx", "Name", "MED", "StdDev", f"SR@{thresholds[0]}mm", f"SR@{thresholds[1]}mm"
-        )
-        f.write(header + "\n")
-        f.write("-" * len(header) + "\n")
-        for stats in per_landmark_stats:
-            line = "{:<5} {:<20} {:<10.4f} {:<10.4f} {:<10.2f} {:<10.2f}".format(
-                stats['index_original'], 
-                stats['name'], 
-                stats['med'], 
-                stats['std'], 
-                stats[f'success_rate_{thresholds[0]}mm'] * 100, 
-                stats[f'success_rate_{thresholds[1]}mm'] * 100
-            )
-            f.write(line + "\n")
-            
-    print(f"Evaluation report saved to {report_path}")
+    # Calculate angle errors
+    SNA_error = np.abs(SNA_true - SNA_pred)
+    SNB_error = np.abs(SNB_true - SNB_pred)
+    ANB_error = np.abs(ANB_true - ANB_pred)
     
-    # 6. Generate Plots
-    # Plot MED distribution
-    plt.figure(figsize=(10, 6))
-    plt.hist(distances.flatten(), bins=50, density=True)
-    plt.title('Distribution of Euclidean Distances')
-    plt.xlabel('Distance (pixels)')
-    plt.ylabel('Density')
-    plt.grid(True)
-    plt.savefig(os.path.join(output_dir, 'distance_distribution.png'))
-    plt.close()
-    
-    # Plot per-landmark MED
-    landmark_indices_orig = [stats['index_original'] for stats in per_landmark_stats]
-    med_values = [stats['med'] for stats in per_landmark_stats]
-    plt.figure(figsize=(max(10, num_landmarks * 0.5), 6))
-    plt.bar(range(num_landmarks), med_values)
-    plt.xticks(range(num_landmarks), [landmark_names[stats['index_relative']] for stats in per_landmark_stats], rotation=90)
-    plt.ylabel('MED (pixels)')
-    plt.title('Mean Euclidean Distance per Landmark (Sorted)')
-    plt.grid(axis='y')
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'per_landmark_med.png'))
-    plt.close()
-
-    # 7. Return results dictionary
-    report_dict = {
-        'overall_med': overall_med,
-        'overall_std': overall_std,
-        'overall_success_rates': overall_success_rates,
-        'per_landmark_stats': per_landmark_stats,
-        'worst_landmarks_indices_relative': worst_landmarks_indices_relative,
-        'worst_landmarks_med': worst_landmarks_med,
-        'classification': classification_report
+    # Create result dictionary
+    results = {
+        'accuracy': accuracy,
+        'confusion_matrix': conf_matrix,
+        'classification_report': class_report,
+        'SNA_error_mean': np.mean(SNA_error),
+        'SNB_error_mean': np.mean(SNB_error),
+        'ANB_error_mean': np.mean(ANB_error),
+        'class_true': class_true,
+        'class_pred': class_pred,
+        'ANB_true': ANB_true,
+        'ANB_pred': ANB_pred
     }
     
-    return report_dict 
+    # Create plots if output_dir is provided
+    if output_dir:
+        output_path = Path(output_dir)
+        output_path.mkdir(exist_ok=True, parents=True)
+        
+        # Plot confusion matrix
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues',
+                   xticklabels=['Class I', 'Class II', 'Class III'],
+                   yticklabels=['Class I', 'Class II', 'Class III'])
+        plt.xlabel('Predicted Class')
+        plt.ylabel('True Class')
+        plt.title('Skeletal Classification Confusion Matrix')
+        plt.tight_layout()
+        plt.savefig(output_path / 'class_confusion_matrix.png')
+        plt.close()
+        
+        # Plot angle error distribution
+        plt.figure(figsize=(12, 6))
+        
+        plt.subplot(1, 3, 1)
+        sns.histplot(SNA_error, kde=True)
+        plt.title(f'SNA Angle Error (Mean: {np.mean(SNA_error):.2f}°)')
+        plt.xlabel('Error (degrees)')
+        
+        plt.subplot(1, 3, 2)
+        sns.histplot(SNB_error, kde=True)
+        plt.title(f'SNB Angle Error (Mean: {np.mean(SNB_error):.2f}°)')
+        plt.xlabel('Error (degrees)')
+        
+        plt.subplot(1, 3, 3)
+        sns.histplot(ANB_error, kde=True)
+        plt.title(f'ANB Angle Error (Mean: {np.mean(ANB_error):.2f}°)')
+        plt.xlabel('Error (degrees)')
+        
+        plt.tight_layout()
+        plt.savefig(output_path / 'angle_error_distribution.png')
+        plt.close()
+        
+        # Plot true vs predicted ANB angles
+        plt.figure(figsize=(10, 6))
+        plt.scatter(ANB_true, ANB_pred, alpha=0.6)
+        
+        # Add diagonal perfect prediction line
+        min_val = min(ANB_true.min(), ANB_pred.min()) - 1
+        max_val = max(ANB_true.max(), ANB_pred.max()) + 1
+        plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.7)
+        
+        # Add class boundary lines
+        plt.axhline(y=0, color='g', linestyle='--', alpha=0.5)
+        plt.axhline(y=4, color='g', linestyle='--', alpha=0.5)
+        plt.axvline(x=0, color='g', linestyle='--', alpha=0.5)
+        plt.axvline(x=4, color='g', linestyle='--', alpha=0.5)
+        
+        # Add annotations for class regions
+        plt.text(min_val, (0+min_val)/2, 'Class III', fontsize=10, ha='left', va='center')
+        plt.text(min_val, 2, 'Class I', fontsize=10, ha='left', va='center')
+        plt.text(min_val, (4+max_val)/2, 'Class II', fontsize=10, ha='left', va='center')
+        
+        plt.xlabel('True ANB Angle (degrees)')
+        plt.ylabel('Predicted ANB Angle (degrees)')
+        plt.title('True vs. Predicted ANB Angle')
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(output_path / 'anb_angle_comparison.png')
+        plt.close()
+        
+        # Save numerical results to CSV
+        results_df = pd.DataFrame({
+            'SNA_true': SNA_true,
+            'SNA_pred': SNA_pred,
+            'SNA_error': SNA_error,
+            'SNB_true': SNB_true,
+            'SNB_pred': SNB_pred,
+            'SNB_error': SNB_error,
+            'ANB_true': ANB_true,
+            'ANB_pred': ANB_pred,
+            'ANB_error': ANB_error,
+            'true_class': class_true,
+            'predicted_class': class_pred,
+            'correct_classification': class_true == class_pred
+        })
+        
+        results_df.to_csv(output_path / 'skeletal_classification_results.csv', index=False)
+    
+    return results
+
+def generate_landmark_evaluation_report(predictions, targets, landmark_names=None, output_dir=None, thresholds=None, landmark_cols=None):
+    """
+    Generate a comprehensive evaluation report for landmark detection
+    
+    Args:
+        predictions (torch.Tensor or np.ndarray): Predicted landmark coordinates of shape (batch_size, num_landmarks, 2)
+        targets (torch.Tensor or np.ndarray): Ground truth landmark coordinates of shape (batch_size, num_landmarks, 2)
+        landmark_names (list, optional): Names of the landmarks
+        output_dir (str, optional): Directory to save the report and plots
+        thresholds (list, optional): List of thresholds for success rate calculation
+        landmark_cols (list, optional): List of landmark column names (needed for skeletal classification)
+        
+    Returns:
+        dict: Dictionary containing all evaluation metrics
+    """
+    if thresholds is None:
+        thresholds = [2.0, 4.0, 6.0]  # Default thresholds in pixels
+    
+    # Calculate MED for each landmark
+    med_per_landmark = mean_euclidean_distance_per_landmark(predictions, targets)
+    
+    # Calculate success rate for each landmark at different thresholds
+    success_rates = {}
+    for threshold in thresholds:
+        success_rates[threshold] = success_rate_per_landmark(predictions, targets, threshold=threshold)
+    
+    # Calculate overall metrics
+    overall_med = med_per_landmark.mean()
+    overall_success_rates = {t: rate.mean() for t, rate in success_rates.items()}
+    
+    # Identify problematic landmarks (highest MED)
+    sort_indices = np.argsort(med_per_landmark)[::-1]  # Sort in descending order
+    worst_landmarks = sort_indices[:3]  # Top 3 worst landmarks
+    
+    # Create evaluation report
+    report = {
+        'overall_med': overall_med,
+        'overall_success_rates': overall_success_rates,
+        'med_per_landmark': med_per_landmark,
+        'success_rates_per_landmark': success_rates,
+        'worst_landmarks': worst_landmarks,
+        'worst_landmarks_med': med_per_landmark[worst_landmarks]
+    }
+    
+    # Add skeletal classification evaluation if landmark_cols is provided
+    if landmark_cols is not None:
+        try:
+            classification_dir = None
+            if output_dir:
+                classification_dir = os.path.join(output_dir, 'classification')
+            
+            classification_results = evaluate_skeletal_classification(
+                predictions, 
+                targets, 
+                landmark_cols, 
+                output_dir=classification_dir
+            )
+            
+            report['classification'] = classification_results
+        except Exception as e:
+            print(f"Warning: Could not evaluate skeletal classification: {e}")
+    
+    # Generate plots
+    if output_dir:
+        plot_landmark_metrics(
+            med_per_landmark=med_per_landmark,
+            success_rate_per_landmark=success_rates,
+            landmark_names=landmark_names,
+            output_dir=output_dir,
+            thresholds=thresholds
+        )
+        
+        # Save report as CSV
+        output_path = Path(output_dir)
+        output_path.mkdir(exist_ok=True, parents=True)
+        
+        # Create a DataFrame with all metrics
+        if landmark_names is None:
+            landmark_names = [f"Landmark {i+1}" for i in range(len(med_per_landmark))]
+        
+        report_df = pd.DataFrame({
+            'Landmark': landmark_names,
+            'MED (pixels)': med_per_landmark
+        })
+        
+        # Add success rates for each threshold
+        for t in thresholds:
+            report_df[f'Success Rate ({t}mm)'] = success_rates[t] * 100
+        
+        # Save to CSV
+        report_df.to_csv(output_path / 'landmark_evaluation_report.csv', index=False)
+        
+        # Save summary as text
+        with open(output_path / 'summary.txt', 'w') as f:
+            f.write(f"Overall Mean Euclidean Distance (MED): {overall_med:.2f} pixels\n\n")
+            f.write("Success Rates:\n")
+            for t, rate in overall_success_rates.items():
+                f.write(f"  {t}mm threshold: {rate*100:.2f}%\n")
+            
+            f.write("\nWorst Performing Landmarks:\n")
+            for i, idx in enumerate(worst_landmarks):
+                name = landmark_names[idx] if landmark_names else f"Landmark {idx+1}"
+                f.write(f"  {i+1}. {name}: {med_per_landmark[idx]:.2f} pixels\n")
+            
+            # Add classification results if available
+            if 'classification' in report:
+                f.write("\nSkeletal Classification Results:\n")
+                f.write(f"  Accuracy: {report['classification']['accuracy']*100:.2f}%\n")
+                f.write(f"  Mean ANB Angle Error: {report['classification']['ANB_error_mean']:.2f}°\n")
+    
+    return report 

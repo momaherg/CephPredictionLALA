@@ -15,7 +15,7 @@ class AdaptiveWingLoss(nn.Module):
     Wang et al. "Adaptive Wing Loss for Robust Face Alignment via Heatmap 
     Regression", ICCV 2019
     """
-    def __init__(self, alpha=2.1, omega=14, epsilon=1, theta=0.5):
+    def __init__(self, alpha=2.1, omega=14, epsilon=1, theta=0.5, target_landmark_indices=None):
         """
         Initialize Adaptive Wing Loss
         
@@ -24,12 +24,15 @@ class AdaptiveWingLoss(nn.Module):
             omega (float): Weight parameter to adjust influence of non-linear part
             epsilon (float): Small constant to avoid numerical issues
             theta (float): Threshold to switch between linear and non-linear part
+            target_landmark_indices (list, optional): List of landmark indices (channels) to compute loss for.
+                                                      If None, computes loss for all landmarks.
         """
         super(AdaptiveWingLoss, self).__init__()
         self.alpha = alpha
         self.omega = omega
         self.epsilon = epsilon
         self.theta = theta
+        self.target_landmark_indices = target_landmark_indices
         
     def forward(self, pred, target):
         """
@@ -42,10 +45,23 @@ class AdaptiveWingLoss(nn.Module):
         Returns:
             torch.Tensor: Computed loss value
         """
+        # If target_landmark_indices is specified, select only those channels
+        if self.target_landmark_indices is not None:
+            # Ensure indices are valid
+            num_channels = pred.shape[1]
+            valid_indices = [idx for idx in self.target_landmark_indices if 0 <= idx < num_channels]
+            if len(valid_indices) == 0:
+                # Return zero loss if no valid indices or list is empty
+                return torch.tensor(0.0, device=pred.device, requires_grad=True)
+            
+            pred = pred[:, valid_indices]
+            target = target[:, valid_indices]
+            
         # Calculate the difference
         delta = torch.abs(target - pred)
         
         # Calculate A and C constants according to the paper
+        # Ensure target used for A, C calculation has the same filtered shape
         A = self.omega * (1 / (1 + torch.pow(self.theta / self.epsilon, self.alpha - target))) * \
             (self.alpha - target) * torch.pow(self.theta / self.epsilon, self.alpha - target - 1) * (1 / self.epsilon)
         C = (self.theta * A - self.omega * torch.log(1 + torch.pow(self.theta / self.epsilon, self.alpha - target)))
@@ -56,6 +72,9 @@ class AdaptiveWingLoss(nn.Module):
             self.omega * torch.log(1 + torch.pow(delta / self.epsilon, self.alpha - target)),
             A * delta - C
         )
+        
+        # Handle potential NaNs resulting from calculations
+        losses = torch.nan_to_num(losses, nan=0.0) # Replace NaNs with zero
         
         return torch.mean(losses)
 
@@ -192,10 +211,12 @@ class CombinedLoss(nn.Module):
     
     Combines Adaptive Wing Loss for heatmaps with Wing Loss for coordinates.
     Optionally normalizes loss components based on running averages before applying weights.
+    Allows specifying target landmarks to focus the loss calculation.
     """
     def __init__(self, heatmap_weight=1.0, coord_weight=1.0, 
                  output_size=(64, 64), image_size=(224, 224),
-                 use_loss_normalization=True, norm_decay=0.99, norm_epsilon=1e-6):
+                 use_loss_normalization=True, norm_decay=0.99, norm_epsilon=1e-6,
+                 target_landmark_indices=None):
         """
         Initialize combined loss
         
@@ -207,6 +228,8 @@ class CombinedLoss(nn.Module):
             use_loss_normalization (bool): Whether to normalize losses before weighting.
             norm_decay (float): Decay factor for running average normalization.
             norm_epsilon (float): Epsilon for numerical stability in normalization.
+            target_landmark_indices (list, optional): List of landmark indices to compute loss for.
+                                                      If None, computes loss for all landmarks.
         """
         super(CombinedLoss, self).__init__()
         self.heatmap_weight = heatmap_weight
@@ -218,11 +241,14 @@ class CombinedLoss(nn.Module):
         self.norm_decay = norm_decay
         self.norm_epsilon = norm_epsilon
         
+        self.target_landmark_indices = target_landmark_indices
+        
         # Calculate scale factor
         self.scale_factor = image_size[0] / output_size[0]  # Assuming square aspect ratio
         
-        self.heatmap_loss_fn = AdaptiveWingLoss()
-        self.coord_loss_fn = WingLoss()
+        # Pass target_landmark_indices to heatmap loss
+        self.heatmap_loss_fn = AdaptiveWingLoss(target_landmark_indices=self.target_landmark_indices)
+        self.coord_loss_fn = WingLoss() # WingLoss doesn't need indices directly, we filter inputs
         
         # Buffers for running average normalization
         if self.use_loss_normalization:
@@ -246,23 +272,40 @@ class CombinedLoss(nn.Module):
                    Note: The returned component losses are the original, unnormalized values.
                    The total_loss is calculated using normalized components if enabled.
         """
-        # Compute raw heatmap loss
+        # Compute raw heatmap loss (already handles target indices)
         raw_heatmap_loss = self.heatmap_loss_fn(pred_dict['heatmaps'], target_heatmaps)
         
         # Convert target coordinates from image space to heatmap space for coordinate loss computation
         target_coords_heatmap = target_coords / self.scale_factor
         
-        # Compute raw coordinate loss
-        if 'refined_coords' in pred_dict:
-            raw_coord_loss = self.coord_loss_fn(pred_dict['refined_coords'], target_coords_heatmap, mask)
+        # Select coordinates based on target_landmark_indices if specified
+        if self.target_landmark_indices is not None:
+            # Ensure indices are valid
+            num_landmarks = target_coords_heatmap.shape[1]
+            valid_indices = [idx for idx in self.target_landmark_indices if 0 <= idx < num_landmarks]
+            
+            if len(valid_indices) == 0:
+                 # If no valid target landmarks, coordinate loss is zero
+                 raw_coord_loss = torch.tensor(0.0, device=target_coords_heatmap.device, requires_grad=True)
+            else:
+                # Filter predicted and target coordinates
+                pred_coords_filtered = pred_dict['refined_coords'][:, valid_indices] if 'refined_coords' in pred_dict else pred_dict['initial_coords'][:, valid_indices]
+                target_coords_filtered = target_coords_heatmap[:, valid_indices]
+                
+                # Compute coordinate loss on filtered coordinates
+                raw_coord_loss = self.coord_loss_fn(pred_coords_filtered, target_coords_filtered, mask)
         else:
-            # Use initial coordinates if refined are not available
-            raw_coord_loss = self.coord_loss_fn(pred_dict['initial_coords'], target_coords_heatmap, mask)
+            # Compute coordinate loss on all coordinates
+            if 'refined_coords' in pred_dict:
+                raw_coord_loss = self.coord_loss_fn(pred_dict['refined_coords'], target_coords_heatmap, mask)
+            else:
+                raw_coord_loss = self.coord_loss_fn(pred_dict['initial_coords'], target_coords_heatmap, mask)
             
         # Handle potential NaN in losses (can happen early in training)
         raw_heatmap_loss = torch.nan_to_num(raw_heatmap_loss, nan=1.0) # Replace NaN with a high value (e.g., 1.0)
         raw_coord_loss = torch.nan_to_num(raw_coord_loss, nan=1.0)
 
+        # --- Loss Normalization and Weighting --- 
         # If using normalization
         if self.use_loss_normalization and self.training: # Only update averages during training
             # Update running averages using detached losses
@@ -274,8 +317,7 @@ class CombinedLoss(nn.Module):
             self.running_avg_coord = self.norm_decay * self.running_avg_coord + (1 - self.norm_decay) * coord_loss_detached
             self.norm_updates += 1
 
-            # Correct bias during initial phase (helps stabilize early training)
-            # Use 1 - decay^updates for bias correction factor
+            # Correct bias during initial phase
             bias_correction_heatmap = 1.0 - self.norm_decay ** self.norm_updates
             bias_correction_coord = 1.0 - self.norm_decay ** self.norm_updates
             
@@ -283,27 +325,12 @@ class CombinedLoss(nn.Module):
             avg_coord_corrected = self.running_avg_coord / (bias_correction_coord + 1e-8)
 
             # Normalize current losses
-            # Ensure denominators are not zero
             norm_heatmap_loss = raw_heatmap_loss / (avg_heatmap_corrected + self.norm_epsilon)
-            norm_coord_loss = raw_coord_loss / (avg_coord_corrected + self.norm_epsilon)
+            # Avoid division by zero if coord loss is genuinely zero (e.g., no target landmarks)
+            norm_coord_loss = raw_coord_loss / (avg_coord_corrected + self.norm_epsilon) if avg_coord_corrected > self.norm_epsilon else raw_coord_loss
             
             # Compute total loss using normalized components and weights
             total_loss = self.heatmap_weight * norm_heatmap_loss + self.coord_weight * norm_coord_loss
-            
-            # --- Debug Logging --- 
-            if int(self.norm_updates.item()) % 100 == 0: # Log every 100 steps
-                print("\n--- Loss Debug (Step: {}) ---".format(int(self.norm_updates.item())))
-                print(f"  Raw Heatmap Loss:  {raw_heatmap_loss.item():.6f}")
-                print(f"  Raw Coord Loss:    {raw_coord_loss.item():.6f}")
-                print(f"  Avg Heatmap Loss:  {avg_heatmap_corrected.item():.6f}")
-                print(f"  Avg Coord Loss:    {avg_coord_corrected.item():.6f}")
-                print(f"  Norm Heatmap Loss: {norm_heatmap_loss.item():.6f}")
-                print(f"  Norm Coord Loss:   {norm_coord_loss.item():.6f}")
-                print(f"  Weighted Norm Heatmap: {self.heatmap_weight * norm_heatmap_loss.item():.6f} (Weight: {self.heatmap_weight:.2f})")
-                print(f"  Weighted Norm Coord:   {self.coord_weight * norm_coord_loss.item():.6f} (Weight: {self.coord_weight:.2f})")
-                print(f"  Final Total Loss:  {total_loss.item():.6f}")
-                print("---------------------------")
-            # --- End Debug Logging ---
         
         else: # Not using normalization or in evaluation mode
              # Compute total loss using raw components and weights
