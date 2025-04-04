@@ -286,7 +286,7 @@ class LandmarkTrainer:
             train_loader (DataLoader): DataLoader for training data
             
         Returns:
-            tuple: (average_loss, heatmap_loss, coord_loss, med)
+            tuple: (average_loss, heatmap_loss, coord_loss, med, sella_med)
         """
         self.model.train()
         epoch_loss = 0.0
@@ -355,7 +355,13 @@ class LandmarkTrainer:
         all_targets = torch.cat(all_targets, dim=0)
         med = mean_euclidean_distance(all_predictions, all_targets)
         
-        return epoch_loss, epoch_heatmap_loss, epoch_coord_loss, med
+        # Compute MED for Sella (index 0) if training on all landmarks or targeting Sella
+        sella_med = float('nan')  # Default to NaN if not computed
+        if all_predictions.shape[1] > 0:  # Check if there are landmarks
+            if self.target_landmark_indices is None or 0 in self.target_landmark_indices:
+                sella_med = mean_euclidean_distance(all_predictions[:, 0:1, :], all_targets[:, 0:1, :])
+        
+        return epoch_loss, epoch_heatmap_loss, epoch_coord_loss, med, sella_med
     
     def validate(self, val_loader):
         """
@@ -365,7 +371,7 @@ class LandmarkTrainer:
             val_loader (DataLoader): DataLoader for validation data
             
         Returns:
-            tuple: (average_loss, heatmap_loss, coord_loss, med)
+            tuple: (average_loss, heatmap_loss, coord_loss, med, sella_med)
         """
         self.model.eval()
         val_loss = 0.0
@@ -416,7 +422,13 @@ class LandmarkTrainer:
         all_targets = torch.cat(all_targets, dim=0)
         med = mean_euclidean_distance(all_predictions, all_targets)
         
-        return val_loss, val_heatmap_loss, val_coord_loss, med
+        # Compute MED for Sella (index 0) if validating on all landmarks or targeting Sella
+        sella_med = float('nan')  # Default to NaN if not computed
+        if all_predictions.shape[1] > 0:  # Check if there are landmarks
+            if self.target_landmark_indices is None or 0 in self.target_landmark_indices:
+                sella_med = mean_euclidean_distance(all_predictions[:, 0:1, :], all_targets[:, 0:1, :])
+        
+        return val_loss, val_heatmap_loss, val_coord_loss, med, sella_med
     
     def train(self, train_loader, val_loader, num_epochs=50, save_freq=5):
         """
@@ -489,10 +501,10 @@ class LandmarkTrainer:
                 print(f"Epoch {epoch+1}/{num_epochs}: Updated weights - heatmap={self.current_heatmap_weight:.2f}, coord={self.current_coord_weight:.2f}")
             
             # Train one epoch
-            train_loss, train_heatmap_loss, train_coord_loss, train_med = self.train_epoch(train_loader)
+            train_loss, train_heatmap_loss, train_coord_loss, train_med, train_sella_med = self.train_epoch(train_loader)
             
             # Validate
-            val_loss, val_heatmap_loss, val_coord_loss, val_med = self.validate(val_loader)
+            val_loss, val_heatmap_loss, val_coord_loss, val_med, val_sella_med = self.validate(val_loader)
             
             # Get current learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -506,6 +518,8 @@ class LandmarkTrainer:
             self.history['val_coord_loss'].append(val_coord_loss)
             self.history['train_med'].append(train_med)
             self.history['val_med'].append(val_med)
+            self.history['train_sella_med'].append(train_sella_med)
+            self.history['val_sella_med'].append(val_sella_med)
             self.history['heatmap_weight'].append(self.current_heatmap_weight)
             self.history['coord_weight'].append(self.current_coord_weight)
             self.history['learning_rate'].append(current_lr)
@@ -542,8 +556,8 @@ class LandmarkTrainer:
             
             # More detailed progress log including all metrics
             print(f"Epoch {epoch+1}/{num_epochs} [{elapsed_time:.2f}s]")
-            print(f"  Train: Loss={train_loss:.4f} (Heatmap={self.current_heatmap_weight:.1f}×{train_heatmap_loss:.4f}, Coord={self.current_coord_weight:.1f}×{train_coord_loss:.4f}), MED={train_med:.2f}px")
-            print(f"  Valid: Loss={val_loss:.4f} (Heatmap={val_heatmap_loss:.4f}, Coord={val_coord_loss:.4f}), MED={val_med:.2f}px")
+            print(f"  Train: Loss={train_loss:.4f} (Heatmap={self.current_heatmap_weight:.1f}×{train_heatmap_loss:.4f}, Coord={self.current_coord_weight:.1f}×{train_coord_loss:.4f}), MED={train_med:.2f}px (Sella={train_sella_med:.2f}px)")
+            print(f"  Valid: Loss={val_loss:.4f} (Heatmap={val_heatmap_loss:.4f}, Coord={val_coord_loss:.4f}), MED={val_med:.2f}px (Sella={val_sella_med:.2f}px)")
             print(f"  LR: {current_lr:.2e}")
             
             # Save if best validation loss
@@ -715,6 +729,30 @@ class LandmarkTrainer:
         plt.tight_layout()
         plt.savefig(os.path.join(figures_dir, 'loss_components.png'))
         plt.close()
+        
+        # Plot Sella MED curves if available
+        if len(self.history['train_sella_med']) > 0 and len(self.history['val_sella_med']) > 0:
+            plt.figure(figsize=(10, 6))
+            
+            # First, filter out NaN values
+            train_epochs = [i for i, v in enumerate(self.history['train_sella_med']) if not np.isnan(v)]
+            train_values = [v for v in self.history['train_sella_med'] if not np.isnan(v)]
+            val_epochs = [i for i, v in enumerate(self.history['val_sella_med']) if not np.isnan(v)]
+            val_values = [v for v in self.history['val_sella_med'] if not np.isnan(v)]
+            
+            # Plot only if we have non-NaN values
+            if len(train_values) > 0:
+                plt.plot(train_epochs, train_values, label='Train Sella MED')
+            if len(val_values) > 0:
+                plt.plot(val_epochs, val_values, label='Validation Sella MED')
+                
+            plt.xlabel('Epoch')
+            plt.ylabel('Mean Euclidean Distance (pixels)')
+            plt.title('Sella Landmark Mean Euclidean Distance (MED)')
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(figures_dir, 'sella_med_curves.png'))
+            plt.close()
     
     def evaluate(self, test_loader, save_visualizations=True, landmark_names=None, landmark_cols=None):
         """
