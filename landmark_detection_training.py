@@ -128,6 +128,12 @@ NORM_EPSILON = 1e-6  # Epsilon for numerical stability
 # Example: TARGET_LANDMARK_INDICES = [0, 1, 5] # Focus on Sella, Nasion, A point
 TARGET_LANDMARK_INDICES = None 
 
+# Per-Landmark Loss Weights (optional)
+# Define a list of weights, one for each landmark. Must have NUM_LANDMARKS elements.
+# Weights multiply the loss for each specific landmark. Default is 1.0 for all.
+# Example: LANDMARK_WEIGHTS = [2.0] + [1.0] * (NUM_LANDMARKS - 1) # Make first landmark twice as important
+LANDMARK_WEIGHTS = None # Defaults to equal weight (1.0) for all landmarks
+
 # LR Range Test parameters
 RUN_LR_FINDER = True  # Set to True to run the LR range test before training
 LR_FINDER_START_LR = 1e-7
@@ -353,7 +359,9 @@ trainer = LandmarkTrainer(
     norm_decay=NORM_DECAY,
     norm_epsilon=NORM_EPSILON,
     # Target landmarks
-    target_landmark_indices=TARGET_LANDMARK_INDICES
+    target_landmark_indices=TARGET_LANDMARK_INDICES,
+    # Per-Landmark Loss Weights
+    landmark_weights=LANDMARK_WEIGHTS
 )
 
 # Custom max_delta setting for the refinement MLP if needed
@@ -666,7 +674,8 @@ model_config = {
     'use_loss_normalization': USE_LOSS_NORMALIZATION,
     'norm_decay': NORM_DECAY,
     'norm_epsilon': NORM_EPSILON,
-    'target_landmark_indices': TARGET_LANDMARK_INDICES
+    'target_landmark_indices': TARGET_LANDMARK_INDICES,
+    'landmark_weights': LANDMARK_WEIGHTS
 }
 
 save_model_config(OUTPUT_DIR, model_config)

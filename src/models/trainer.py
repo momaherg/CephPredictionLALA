@@ -42,7 +42,24 @@ class LandmarkTrainer:
                  lr_patience=5,
                  lr_factor=0.5,
                  lr_min=1e-6,
-                 lr_t_max=10):
+                 lr_t_max=10,
+                 # OneCycleLR parameters (add defaults)
+                 max_lr=1e-3, 
+                 pct_start=0.3, 
+                 div_factor=25.0, 
+                 final_div_factor=1e4,
+                 # Optimizer parameters (add defaults)
+                 optimizer_type='adam',
+                 momentum=0.9,
+                 nesterov=True,
+                 # Loss Normalization parameters (add defaults)
+                 use_loss_normalization=False,
+                 norm_decay=0.99,
+                 norm_epsilon=1e-6,
+                 # Target landmarks
+                 target_landmark_indices=None,
+                 # Per-landmark weights
+                 landmark_weights=None):
         """
         Initialize trainer
         
@@ -68,6 +85,18 @@ class LandmarkTrainer:
             lr_factor (float): Factor by which to reduce learning rate for ReduceLROnPlateau
             lr_min (float): Minimum learning rate for schedulers
             lr_t_max (int): T_max parameter for CosineAnnealingLR (usually set to num_epochs/2)
+            max_lr (float): Maximum learning rate for OneCycleLR
+            pct_start (float): Percentage of total steps to reach max_lr
+            div_factor (float): Factor by which to divide learning rate
+            final_div_factor (float): Factor by which to divide learning rate at the end of OneCycleLR
+            optimizer_type (str): Type of optimizer to use ('adam', 'adamw', or 'sgd')
+            momentum (float): Momentum for SGD optimizer
+            nesterov (bool): Whether to use Nesterov momentum for SGD
+            use_loss_normalization (bool): Whether to use loss normalization
+            norm_decay (float): Decay rate for loss normalization
+            norm_epsilon (float): Epsilon for loss normalization
+            target_landmark_indices (list[int], optional): Indices of landmarks to focus loss on. Defaults to None (all landmarks).
+            landmark_weights (list[float], optional): Weights for each landmark's loss contribution. Must match num_landmarks. Defaults to None (all 1.0).
         """
         # Set device
         if device is not None:
@@ -84,6 +113,29 @@ class LandmarkTrainer:
                 self.device = torch.device('cpu')
                 print("Using CPU device")
         
+        self.num_landmarks = num_landmarks
+        self.output_dir = output_dir
+        self.use_refinement = use_refinement
+        self.target_landmark_indices = target_landmark_indices
+        self.use_loss_normalization = use_loss_normalization
+
+        # Validate and store landmark_weights
+        if landmark_weights is not None:
+            if not isinstance(landmark_weights, list) or len(landmark_weights) != num_landmarks:
+                raise ValueError(f"landmark_weights must be a list of length {num_landmarks}, but got {landmark_weights}")
+            self.landmark_weights = torch.tensor(landmark_weights, dtype=torch.float32, device=self.device)
+            print(f"Using custom landmark weights: {landmark_weights}")
+        else:
+            # Default to equal weights (tensor of ones)
+            self.landmark_weights = torch.ones(num_landmarks, dtype=torch.float32, device=self.device)
+            print("Using default landmark weights (all 1.0)")
+            
+        # Print target landmarks info
+        if target_landmark_indices is not None:
+            print(f"Targeting specific landmarks with indices: {target_landmark_indices}")
+            # Ensure weights tensor only considers target landmarks if specified implicitly by loss function
+            # Note: The actual filtering happens within the loss function
+        
         # Create model
         self.model = create_hrnet_model(
             num_landmarks=num_landmarks, 
@@ -93,24 +145,29 @@ class LandmarkTrainer:
         )
         self.model = self.model.to(self.device)
         
-        # Create optimizer
-        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-        
+        # Optimizer parameters
+        self.optimizer_type = optimizer_type
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.momentum = momentum
+        self.nesterov = nesterov
+        self.create_optimizer() # Call helper method to create optimizer
+
         # Learning rate scheduler parameters
         self.scheduler_type = scheduler_type
-        self.scheduler = None
-        if scheduler_type == 'cosine':
-            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=lr_t_max, eta_min=lr_min
-            )
-            print(f"Using CosineAnnealingLR scheduler with T_max={lr_t_max}, min_lr={lr_min}")
-        elif scheduler_type == 'plateau':
-            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode='min', factor=lr_factor, 
-                patience=lr_patience, verbose=True, min_lr=lr_min
-            )
-            print(f"Using ReduceLROnPlateau scheduler with patience={lr_patience}, factor={lr_factor}, min_lr={lr_min}")
-        
+        self.lr_patience = lr_patience
+        self.lr_factor = lr_factor
+        self.lr_min = lr_min
+        self.lr_t_max = lr_t_max
+        # Store OneCycleLR parameters separately for later initialization
+        self.onecycle_params = {
+            'max_lr': max_lr,
+            'pct_start': pct_start,
+            'div_factor': div_factor,
+            'final_div_factor': final_div_factor
+        }
+        self.scheduler = None # Initialize scheduler as None
+
         # Weight scheduling parameters
         self.use_weight_schedule = use_weight_schedule
         self.initial_heatmap_weight = initial_heatmap_weight
@@ -129,38 +186,64 @@ class LandmarkTrainer:
                 heatmap_weight=self.current_heatmap_weight, 
                 coord_weight=self.current_coord_weight,
                 output_size=(64, 64),   # Heatmap size
-                image_size=(224, 224)   # Original image size
+                image_size=(224, 224),   # Original image size
+                use_loss_normalization=use_loss_normalization,
+                norm_decay=norm_decay,
+                norm_epsilon=norm_epsilon,
+                target_landmark_indices=target_landmark_indices,
+                landmark_weights=self.landmark_weights # Pass the weights tensor
             )
         else:
-            self.criterion = AdaptiveWingLoss()
+            # AdaptiveWingLoss also needs weights and target indices if used standalone
+            self.criterion = AdaptiveWingLoss(
+                use_loss_normalization=use_loss_normalization,
+                norm_decay=norm_decay,
+                norm_epsilon=norm_epsilon,
+                target_landmark_indices=target_landmark_indices,
+                landmark_weights=self.landmark_weights # Pass the weights tensor
+            )
         
         # Create heatmap generator
         self.heatmap_generator = GaussianHeatmapGenerator(output_size=(64, 64), sigma=2.5)
         
-        # Set number of landmarks
-        self.num_landmarks = num_landmarks
-        
-        # Set output directory
-        self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Set whether to use refinement MLP
-        self.use_refinement = use_refinement
-        
-        # Initialize training history
+        # Initialize training history (add sella_med tracking)
         self.history = {
-            'train_loss': [],
-            'val_loss': [],
-            'train_heatmap_loss': [],
-            'val_heatmap_loss': [],
-            'train_coord_loss': [],
-            'val_coord_loss': [],
-            'train_med': [],  # Mean Euclidean Distance
-            'val_med': [],    # Mean Euclidean Distance
-            'heatmap_weight': [],
-            'coord_weight': [],
-            'learning_rate': []  # Track learning rate changes
+            'train_loss': [], 'val_loss': [],
+            'train_heatmap_loss': [], 'val_heatmap_loss': [],
+            'train_coord_loss': [], 'val_coord_loss': [],
+            'train_med': [], 'val_med': [],
+            'train_sella_med': [], 'val_sella_med': [], # Specific MED for Sella (index 0)
+            'heatmap_weight': [], 'coord_weight': [],
+            'learning_rate': []
         }
+    
+    def create_optimizer(self):
+        """Creates the optimizer based on the specified type."""
+        if self.optimizer_type.lower() == 'adam':
+            self.optimizer = optim.Adam(
+                self.model.parameters(), 
+                lr=self.learning_rate, 
+                weight_decay=self.weight_decay
+            )
+            print(f"Using Adam optimizer with LR={self.learning_rate}, WeightDecay={self.weight_decay}")
+        elif self.optimizer_type.lower() == 'adamw':
+            self.optimizer = optim.AdamW(
+                self.model.parameters(), 
+                lr=self.learning_rate, 
+                weight_decay=self.weight_decay
+            )
+            print(f"Using AdamW optimizer with LR={self.learning_rate}, WeightDecay={self.weight_decay}")
+        elif self.optimizer_type.lower() == 'sgd':
+            self.optimizer = optim.SGD(
+                self.model.parameters(), 
+                lr=self.learning_rate, 
+                momentum=self.momentum, 
+                weight_decay=self.weight_decay,
+                nesterov=self.nesterov
+            )
+            print(f"Using SGD optimizer with LR={self.learning_rate}, Momentum={self.momentum}, Nesterov={self.nesterov}, WeightDecay={self.weight_decay}")
+        else:
+            raise ValueError(f"Unsupported optimizer type: {self.optimizer_type}")
     
     def train_epoch(self, train_loader):
         """
