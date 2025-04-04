@@ -15,7 +15,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')
 
 from .hrnet import create_hrnet_model
 from .losses import AdaptiveWingLoss, GaussianHeatmapGenerator, soft_argmax, CombinedLoss
-from src.utils.metrics import mean_euclidean_distance, landmark_success_rate, per_landmark_metrics
+from src.utils.metrics import mean_euclidean_distance, landmark_success_rate, per_landmark_metrics, per_landmark_euclidean_distance
 from src.utils.landmark_evaluation import generate_landmark_evaluation_report
 
 class LandmarkTrainer:
@@ -272,9 +272,9 @@ class LandmarkTrainer:
             'heatmap_weight': [],
             'coord_weight': [],
             'learning_rate': [],  # Track learning rate changes
-            # History for specific landmarks MED
-            'train_med_specific': [],
-            'val_med_specific': []
+            # History for specific landmarks MED - now stores dict {idx: [med1, med2, ...]}
+            'train_med_specific': {},
+            'val_med_specific': {}
         }
     
     def train_epoch(self, train_loader):
@@ -363,10 +363,12 @@ class LandmarkTrainer:
                 num_landmarks = all_predictions.shape[1]
                 valid_indices = [idx for idx in self.log_specific_landmark_indices if 0 <= idx < num_landmarks]
                 if valid_indices:
-                    med_specific = mean_euclidean_distance(
-                        all_predictions[:, valid_indices, :],
-                        all_targets[:, valid_indices, :]
+                    # Calculate per-landmark MED for all landmarks first
+                    per_lm_meds = per_landmark_euclidean_distance(
+                        all_predictions, all_targets
                     )
+                    # Create a dictionary mapping the requested index to its MED
+                    med_specific = {idx: per_lm_meds[idx].item() for idx in valid_indices}
                 else:
                      print("Warning: No valid indices provided for specific MED logging.")
             except Exception as e:
@@ -442,10 +444,12 @@ class LandmarkTrainer:
                 num_landmarks = all_predictions.shape[1]
                 valid_indices = [idx for idx in self.log_specific_landmark_indices if 0 <= idx < num_landmarks]
                 if valid_indices:
-                    med_specific = mean_euclidean_distance(
-                        all_predictions[:, valid_indices, :],
-                        all_targets[:, valid_indices, :]
+                    # Calculate per-landmark MED for all landmarks first
+                    per_lm_meds = per_landmark_euclidean_distance(
+                        all_predictions, all_targets
                     )
+                    # Create a dictionary mapping the requested index to its MED
+                    med_specific = {idx: per_lm_meds[idx].item() for idx in valid_indices}
                 else:
                      print("Warning: No valid indices provided for specific MED logging.")
             except Exception as e:
@@ -530,10 +534,22 @@ class LandmarkTrainer:
             self.history['val_coord_loss'].append(val_coord_loss)
             self.history['train_med'].append(train_med)
             self.history['val_med'].append(val_med)
-            if train_med_specific is not None:
-                self.history['train_med_specific'].append(train_med_specific)
-            if val_med_specific is not None:
-                self.history['val_med_specific'].append(val_med_specific)
+            
+            # Update specific MED history
+            if self.log_specific_landmark_indices:
+                # Train specific MED
+                if train_med_specific is not None:
+                    for idx, med_val in train_med_specific.items():
+                        if idx not in self.history['train_med_specific']:
+                            self.history['train_med_specific'][idx] = []
+                        self.history['train_med_specific'][idx].append(med_val)
+                # Validation specific MED
+                if val_med_specific is not None:
+                    for idx, med_val in val_med_specific.items():
+                        if idx not in self.history['val_med_specific']:
+                            self.history['val_med_specific'][idx] = []
+                        self.history['val_med_specific'][idx].append(med_val)
+            
             self.history['heatmap_weight'].append(self.current_heatmap_weight)
             self.history['coord_weight'].append(self.current_coord_weight)
             self.history['learning_rate'].append(current_lr)
@@ -548,12 +564,41 @@ class LandmarkTrainer:
             
             # Write metrics to log file
             with open(log_file, 'a') as f:
-                # Append specific MEDs if they exist, otherwise empty strings
-                train_med_specific_str = f"{train_med_specific:.6f}" if train_med_specific is not None else ""
-                val_med_specific_str = f"{val_med_specific:.6f}" if val_med_specific is not None else ""
-                f.write(f"{epoch+1},{train_loss:.6f},{train_heatmap_loss:.6f},{train_coord_loss:.6f},{train_med:.6f},{train_med_specific_str},"
-                        f"{val_loss:.6f},{val_heatmap_loss:.6f},{val_coord_loss:.6f},{val_med:.6f},{val_med_specific_str},{current_lr:.8f}\n")
-            
+                # Prepare specific MED strings (handle missing data)
+                train_med_specific_str_parts = []
+                val_med_specific_str_parts = []
+                if self.log_specific_landmark_indices:
+                    for idx in self.log_specific_landmark_indices:
+                        train_med_val = self.history['train_med_specific'].get(idx, [])[-1] if self.history['train_med_specific'].get(idx) else np.nan
+                        val_med_val = self.history['val_med_specific'].get(idx, [])[-1] if self.history['val_med_specific'].get(idx) else np.nan
+                        train_med_specific_str_parts.append(f"{train_med_val:.6f}")
+                        val_med_specific_str_parts.append(f"{val_med_val:.6f}")
+                
+                # Join parts or use empty string if no specific logging
+                train_med_specific_str = ",".join(train_med_specific_str_parts) if train_med_specific_str_parts else ""
+                val_med_specific_str = ",".join(val_med_specific_str_parts) if val_med_specific_str_parts else ""
+                
+                # Update header if first epoch and specific logging is enabled
+                if epoch == 0 and self.log_specific_landmark_indices:
+                    specific_headers = ",".join([f"train_med_{i}" for i in self.log_specific_landmark_indices]) + "," + \
+                                       ",".join([f"val_med_{i}" for i in self.log_specific_landmark_indices])
+                    # Re-read header, remove newline, append new headers, write back
+                    with open(log_file, 'r+') as log_f_rw:
+                        header = log_f_rw.readline().strip()
+                        new_header = f"{header.replace(',learning_rate', '')},{specific_headers},learning_rate\n"
+                        log_f_rw.seek(0)
+                        log_f_rw.write(new_header)
+                        # Need to rewrite the first line of data since we overwrote it
+                        log_f_rw.write(f"{epoch+1},{train_loss:.6f},{train_heatmap_loss:.6f},{train_coord_loss:.6f},{train_med:.6f},,"
+                                       f"{val_loss:.6f},{val_heatmap_loss:.6f},{val_coord_loss:.6f},{val_med:.6f},,{current_lr:.8f}\n")
+                        # Now write the actual first line data with specific MEDs
+                        f.write(f"{epoch+1},{train_loss:.6f},{train_heatmap_loss:.6f},{train_coord_loss:.6f},{train_med:.6f},{train_med_specific_str},"
+                                f"{val_loss:.6f},{val_heatmap_loss:.6f},{val_coord_loss:.6f},{val_med:.6f},{val_med_specific_str},{current_lr:.8f}\n")
+                else:
+                     # Write data for subsequent epochs
+                    f.write(f"{epoch+1},{train_loss:.6f},{train_heatmap_loss:.6f},{train_coord_loss:.6f},{train_med:.6f},{train_med_specific_str},"
+                            f"{val_loss:.6f},{val_heatmap_loss:.6f},{val_coord_loss:.6f},{val_med:.6f},{val_med_specific_str},{current_lr:.8f}\n")
+
             # Print detailed progress with all metrics
             elapsed_time = time.time() - start_time
             
@@ -562,11 +607,13 @@ class LandmarkTrainer:
             print(f"  Train: Loss={train_loss:.4f} (Heatmap={self.current_heatmap_weight:.1f}×{train_heatmap_loss:.4f}, Coord={self.current_coord_weight:.1f}×{train_coord_loss:.4f}), MED={train_med:.2f}px")
             # Print specific train MED if available
             if train_med_specific is not None:
-                print(f"         Specific Train MED ({self.log_specific_landmark_indices}): {train_med_specific:.2f}px")
+                med_str = ", ".join([f"L{idx}: {med:.2f}" for idx, med in train_med_specific.items()])
+                print(f"         Specific Train MEDs: [{med_str}] px")
             print(f"  Valid: Loss={val_loss:.4f} (Heatmap={val_heatmap_loss:.4f}, Coord={val_coord_loss:.4f}), MED={val_med:.2f}px")
             # Print specific validation MED if available
             if val_med_specific is not None:
-                print(f"         Specific Valid MED ({self.log_specific_landmark_indices}): {val_med_specific:.2f}px")
+                med_str = ", ".join([f"L{idx}: {med:.2f}" for idx, med in val_med_specific.items()])
+                print(f"         Specific Valid MEDs: [{med_str}] px")
             print(f"  LR: {current_lr:.2e}")
             
             # Save if best validation loss
@@ -748,16 +795,35 @@ class LandmarkTrainer:
             
         # Plot specific MED if available
         if self.log_specific_landmark_indices and len(self.history['train_med_specific']) > 0:
-            plt.figure(figsize=(10, 6))
-            plt.plot(self.history['train_med_specific'], label=f'Train MED (Indices: {self.log_specific_landmark_indices})')
-            plt.plot(self.history['val_med_specific'], label=f'Validation MED (Indices: {self.log_specific_landmark_indices})')
-            plt.xlabel('Epoch')
-            plt.ylabel('Mean Euclidean Distance (pixels)')
-            plt.title('Specific Landmark MED')
-            plt.legend()
-            plt.grid(True)
+            plt.figure(figsize=(12, 7))
+            num_plots = len(self.log_specific_landmark_indices)
+            # Create subplots dynamically - consider layout if many landmarks
+            cols = min(3, num_plots) # Max 3 columns
+            rows = (num_plots + cols - 1) // cols
+            fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
+            axes = axes.flatten()
+            
+            plot_idx = 0
+            for idx in self.log_specific_landmark_indices:
+                if idx in self.history['train_med_specific'] and idx in self.history['val_med_specific']:
+                    ax = axes[plot_idx]
+                    ax.plot(self.history['train_med_specific'][idx], label=f'Train MED')
+                    ax.plot(self.history['val_med_specific'][idx], label=f'Valid MED')
+                    ax.set_title(f'Landmark {idx} MED')
+                    ax.set_xlabel('Epoch')
+                    ax.set_ylabel('MED (pixels)')
+                    ax.legend()
+                    ax.grid(True)
+                    plot_idx += 1
+            
+            # Hide unused subplots
+            for i in range(plot_idx, len(axes)):
+                fig.delaxes(axes[i])
+                
+            fig.suptitle('Mean Euclidean Distance for Specific Landmarks', fontsize=16)
+            fig.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent title overlap
             plt.savefig(os.path.join(figures_dir, 'med_specific_curves.png'))
-            plt.close()
+            plt.close(fig)
             
         # Create a combined loss components plot
         epochs = range(1, len(self.history['train_loss']) + 1)

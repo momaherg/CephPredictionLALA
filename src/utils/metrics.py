@@ -122,3 +122,29 @@ def per_landmark_metrics(pred, target, mask=None):
         }
     
     return metrics 
+
+
+def per_landmark_euclidean_distance(predictions, targets):
+    """
+    Calculate the Mean Euclidean Distance for each landmark individually.
+
+    Args:
+        predictions (torch.Tensor): Predicted coordinates (B, N, 2).
+        targets (torch.Tensor): Ground truth coordinates (B, N, 2).
+
+    Returns:
+        torch.Tensor: A tensor of shape (N,) containing the MED for each landmark.
+    """
+    if predictions.shape != targets.shape:
+        raise ValueError(f"Predictions shape {predictions.shape} must match targets shape {targets.shape}")
+    if predictions.dim() != 3 or predictions.shape[-1] != 2:
+        raise ValueError("Inputs must have shape (B, N, 2)")
+
+    # Calculate squared differences: (B, N, 2)
+    diff_sq = (predictions - targets) ** 2
+    # Sum squared differences for x and y, then take sqrt: (B, N)
+    distances = torch.sqrt(diff_sq.sum(dim=-1))
+    # Average distance across the batch for each landmark: (N,)
+    per_landmark_med = distances.mean(dim=0)
+    
+    return per_landmark_med 
