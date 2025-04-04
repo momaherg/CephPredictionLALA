@@ -29,7 +29,7 @@ class LandmarkTrainer:
                  output_dir='./outputs',
                  use_refinement=True,
                  heatmap_weight=1.0,
-                 coord_weight=1.0,
+                 coord_weight=0.1,
                  use_mps=False,
                  hrnet_type='w32',
                  use_weight_schedule=False,
@@ -119,6 +119,9 @@ class LandmarkTrainer:
         self.target_landmark_indices = target_landmark_indices
         self.use_loss_normalization = use_loss_normalization
 
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+
         # Validate and store landmark_weights
         if landmark_weights is not None:
             if not isinstance(landmark_weights, list) or len(landmark_weights) != num_landmarks:
@@ -166,7 +169,9 @@ class LandmarkTrainer:
             'div_factor': div_factor,
             'final_div_factor': final_div_factor
         }
-        self.scheduler = None # Initialize scheduler as None
+        
+        # Create scheduler (except for OneCycleLR which needs dataloader length)
+        self.create_scheduler()
 
         # Weight scheduling parameters
         self.use_weight_schedule = use_weight_schedule
@@ -244,6 +249,34 @@ class LandmarkTrainer:
             print(f"Using SGD optimizer with LR={self.learning_rate}, Momentum={self.momentum}, Nesterov={self.nesterov}, WeightDecay={self.weight_decay}")
         else:
             raise ValueError(f"Unsupported optimizer type: {self.optimizer_type}")
+    
+    def create_scheduler(self):
+        """Creates the learning rate scheduler based on the specified type."""
+        if self.scheduler_type is None or self.scheduler_type.lower() == 'none':
+            self.scheduler = None
+            print("No learning rate scheduler will be used")
+            return
+            
+        if self.scheduler_type == 'cosine':
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=self.lr_t_max, eta_min=self.lr_min
+            )
+            print(f"Using CosineAnnealingLR scheduler with T_max={self.lr_t_max}, min_lr={self.lr_min}")
+        elif self.scheduler_type == 'plateau':
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='min', factor=self.lr_factor, 
+                patience=self.lr_patience, verbose=True, min_lr=self.lr_min
+            )
+            print(f"Using ReduceLROnPlateau scheduler with patience={self.lr_patience}, factor={self.lr_factor}, min_lr={self.lr_min}")
+        elif self.scheduler_type == 'onecycle':
+            # For OneCycleLR, we need to know the number of steps in an epoch
+            # This will be called during train when we know the size of the dataloader
+            print(f"OneCycleLR scheduler parameters ready (will be initialized at training start)")
+            # OneCycleLR will be initialized in train() when we have train_loader
+            self.scheduler = None
+        else:
+            print(f"Warning: Unknown scheduler type {self.scheduler_type}, no scheduler will be used")
+            self.scheduler = None
     
     def train_epoch(self, train_loader):
         """
@@ -393,37 +426,48 @@ class LandmarkTrainer:
             train_loader (DataLoader): DataLoader for training data
             val_loader (DataLoader): DataLoader for validation data
             num_epochs (int): Number of epochs to train
-            save_freq (int): Frequency of saving model checkpoints
+            save_freq (int): How often to save model checkpoints (in epochs)
+            
+        Returns:
+            dict: Training history
         """
+        print(f"Starting training for {num_epochs} epochs...")
+        
         best_val_loss = float('inf')
-        best_val_med = float('inf')  # Also track best validation MED
+        best_val_med = float('inf')
         start_time = time.time()
         
-        # Initialize OneCycleLR scheduler if needed (requires knowing steps_per_epoch)
-        if self.scheduler_type == 'onecycle' and self.scheduler is None:
-            steps_per_epoch = len(train_loader)
-            total_steps = steps_per_epoch * num_epochs
+        # Initialize OneCycleLR if selected (needs dataloader length)
+        if self.scheduler_type == 'onecycle':
+            # Get max_lr from parameters (or default to 10x base lr)
+            max_lr = self.onecycle_params['max_lr']
+            if max_lr is None:
+                max_lr = 10 * self.learning_rate
+                
             self.scheduler = optim.lr_scheduler.OneCycleLR(
-                self.optimizer, 
-                max_lr=self.onecycle_params['max_lr'],
-                total_steps=total_steps,
+                self.optimizer,
+                max_lr=max_lr,
+                steps_per_epoch=len(train_loader),
+                epochs=num_epochs,
                 pct_start=self.onecycle_params['pct_start'],
                 div_factor=self.onecycle_params['div_factor'],
                 final_div_factor=self.onecycle_params['final_div_factor']
             )
-            print(f"OneCycleLR scheduler initialized with total_steps={total_steps}")
+            print(f"Initialized OneCycleLR scheduler with max_lr={max_lr}, steps_per_epoch={len(train_loader)}")
         
-        print(f"Starting training for {num_epochs} epochs...")
-        print(f"Initial weights: heatmap={self.current_heatmap_weight:.2f}, coord={self.current_coord_weight:.2f}")
+        # Create figures directory for plots
+        figures_dir = os.path.join(self.output_dir, 'figures')
+        os.makedirs(figures_dir, exist_ok=True)
         
-        # Create a log file for detailed metrics
-        log_dir = os.path.join(self.output_dir, 'logs')
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, 'training_log.csv')
+        # Display initial weights if using weight scheduling
+        if self.use_weight_schedule:
+            print(f"Initial weights: heatmap={self.current_heatmap_weight:.2f}, coord={self.current_coord_weight:.2f}")
         
-        # Write header to log file
-        with open(log_file, 'w') as f:
-            f.write("epoch,train_loss,train_heatmap_loss,train_coord_loss,train_med,val_loss,val_heatmap_loss,val_coord_loss,val_med,learning_rate\n")
+        # Create log file for metrics
+        log_file_path = os.path.join(self.output_dir, 'training_log.csv')
+        with open(log_file_path, 'w') as f:
+            # Write header
+            f.write("epoch,train_loss,train_heatmap_loss,train_coord_loss,train_med,train_sella_med,val_loss,val_heatmap_loss,val_coord_loss,val_med,val_sella_med,learning_rate\n")
         
         for epoch in range(num_epochs):
             # Update loss weights if using weight schedule
@@ -466,18 +510,32 @@ class LandmarkTrainer:
             self.history['coord_weight'].append(self.current_coord_weight)
             self.history['learning_rate'].append(current_lr)
             
-            # Update learning rate scheduler (except OneCycleLR which is updated per batch)
+            # Update learning rate if scheduler is used
             if self.scheduler_type == 'cosine':
-                self.scheduler.step()
-                print(f"Learning rate updated to {self.optimizer.param_groups[0]['lr']:.2e}")
+                # Cosine scheduler steps every epoch
+                if self.scheduler is not None:
+                    self.scheduler.step()
+                    current_lr = self.scheduler.get_last_lr()[0]
             elif self.scheduler_type == 'plateau':
                 # For ReduceLROnPlateau, we use validation MED as the metric to monitor
-                self.scheduler.step(val_med)
+                if self.scheduler is not None:
+                    self.scheduler.step(val_med)
+                    current_lr = self.optimizer.param_groups[0]['lr']
+            elif self.scheduler_type == 'onecycle':
+                # OneCycleLR already steps every batch in train_epoch
+                if self.scheduler is not None:
+                    current_lr = self.scheduler.get_last_lr()[0]
+            else:
+                # If no scheduler is used, learning rate doesn't change
+                current_lr = self.optimizer.param_groups[0]['lr']
+                
+            # Track learning rate
+            self.history['learning_rate'].append(current_lr)
             
             # Write metrics to log file
-            with open(log_file, 'a') as f:
-                f.write(f"{epoch+1},{train_loss:.6f},{train_heatmap_loss:.6f},{train_coord_loss:.6f},{train_med:.6f},"
-                        f"{val_loss:.6f},{val_heatmap_loss:.6f},{val_coord_loss:.6f},{val_med:.6f},{current_lr:.8f}\n")
+            with open(log_file_path, 'a') as f:
+                f.write(f"{epoch+1},{train_loss:.6f},{train_heatmap_loss:.6f},{train_coord_loss:.6f},{train_med:.6f},{train_sella_med:.6f},"
+                        f"{val_loss:.6f},{val_heatmap_loss:.6f},{val_coord_loss:.6f},{val_med:.6f},{val_sella_med:.6f},{current_lr:.8f}\n")
             
             # Print detailed progress with all metrics
             elapsed_time = time.time() - start_time
