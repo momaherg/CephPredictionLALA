@@ -93,6 +93,10 @@ def parse_args():
     parser.add_argument('--target_landmarks', type=str, default=None,
                         help='Comma-separated list of landmark indices (0-based) to focus training on. E.g., "0,1,5". If None, trains on all.')
     
+    # Per-Landmark Weights argument
+    parser.add_argument('--landmark_weights', type=str, default=None,
+                        help='Comma-separated list of weights for each landmark. Must have NUM_LANDMARKS values. E.g., "2.0,1.0,1.0,..." to make Sella (0) twice as important.')
+    
     return parser.parse_args()
 
 def set_seed(seed):
@@ -240,6 +244,26 @@ def main():
         except ValueError:
             print(f"Warning: Could not parse --target_landmarks '{args.target_landmarks}'. Training on all landmarks.")
             target_landmark_indices = None
+    
+    # Parse landmark weights if provided
+    landmark_weights = None
+    if args.landmark_weights:
+        try:
+            landmark_weights = [float(w.strip()) for w in args.landmark_weights.split(',')]
+            if len(landmark_weights) != args.num_landmarks:
+                print(f"Warning: landmark_weights has {len(landmark_weights)} values, but num_landmarks is {args.num_landmarks}.")
+                if len(landmark_weights) < args.num_landmarks:
+                    # Pad with ones
+                    print(f"Padding landmark_weights with 1.0 to match num_landmarks.")
+                    landmark_weights.extend([1.0] * (args.num_landmarks - len(landmark_weights)))
+                else:
+                    # Truncate
+                    print(f"Truncating landmark_weights to {args.num_landmarks} values.")
+                    landmark_weights = landmark_weights[:args.num_landmarks]
+            print(f"Using custom landmark weights: {landmark_weights}")
+        except ValueError:
+            print(f"Warning: Could not parse --landmark_weights '{args.landmark_weights}'. Using equal weights (1.0) for all landmarks.")
+            landmark_weights = None
     
     # Set random seed
     set_seed(args.seed)
@@ -396,7 +420,8 @@ def main():
         norm_decay=args.loss_norm_decay,
         norm_epsilon=args.loss_norm_epsilon,
         # Target landmarks
-        target_landmark_indices=target_landmark_indices
+        target_landmark_indices=target_landmark_indices,
+        landmark_weights=landmark_weights
     )
     
     # Train model
