@@ -89,13 +89,11 @@ def parse_args():
     parser.add_argument('--loss_norm_epsilon', type=float, default=1e-6,
                         help='Epsilon for loss normalization stability')
     
-    # Target Landmarks argument
-    parser.add_argument('--target_landmarks', type=str, default=None,
-                        help='Comma-separated list of landmark indices (0-based) to focus training on. E.g., "0,1,5". If None, trains on all.')
-    
-    # Per-Landmark Weights argument
-    parser.add_argument('--landmark_weights', type=str, default=None,
-                        help='Comma-separated list of weights for each landmark. Must have NUM_LANDMARKS values. E.g., "2.0,1.0,1.0,..." to make Sella (0) twice as important.')
+    # Per-Landmark Weighting/Focusing
+    parser.add_argument('--target_indices', type=int, nargs='*', default=None,
+                        help='List of landmark indices (0-based) to focus loss calculation on. If None, uses all landmarks.')
+    parser.add_argument('--landmark_weights', type=float, nargs='*', default=None,
+                        help='List of weights (one per landmark) to apply to the loss calculation. Must match num_landmarks.')
     
     return parser.parse_args()
 
@@ -234,36 +232,6 @@ def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16,
 def main():
     # Parse arguments
     args = parse_args()
-    
-    # Parse target landmark indices if provided
-    target_landmark_indices = None
-    if args.target_landmarks:
-        try:
-            target_landmark_indices = [int(idx.strip()) for idx in args.target_landmarks.split(',')]
-            print(f"Targeting specific landmarks for training: {target_landmark_indices}")
-        except ValueError:
-            print(f"Warning: Could not parse --target_landmarks '{args.target_landmarks}'. Training on all landmarks.")
-            target_landmark_indices = None
-    
-    # Parse landmark weights if provided
-    landmark_weights = None
-    if args.landmark_weights:
-        try:
-            landmark_weights = [float(w.strip()) for w in args.landmark_weights.split(',')]
-            if len(landmark_weights) != args.num_landmarks:
-                print(f"Warning: landmark_weights has {len(landmark_weights)} values, but num_landmarks is {args.num_landmarks}.")
-                if len(landmark_weights) < args.num_landmarks:
-                    # Pad with ones
-                    print(f"Padding landmark_weights with 1.0 to match num_landmarks.")
-                    landmark_weights.extend([1.0] * (args.num_landmarks - len(landmark_weights)))
-                else:
-                    # Truncate
-                    print(f"Truncating landmark_weights to {args.num_landmarks} values.")
-                    landmark_weights = landmark_weights[:args.num_landmarks]
-            print(f"Using custom landmark weights: {landmark_weights}")
-        except ValueError:
-            print(f"Warning: Could not parse --landmark_weights '{args.landmark_weights}'. Using equal weights (1.0) for all landmarks.")
-            landmark_weights = None
     
     # Set random seed
     set_seed(args.seed)
@@ -419,9 +387,9 @@ def main():
         use_loss_normalization=not args.no_loss_norm,
         norm_decay=args.loss_norm_decay,
         norm_epsilon=args.loss_norm_epsilon,
-        # Target landmarks
-        target_landmark_indices=target_landmark_indices,
-        landmark_weights=landmark_weights
+        # Per-Landmark Weighting/Focusing
+        target_landmark_indices=args.target_indices,
+        landmark_weights=args.landmark_weights
     )
     
     # Train model

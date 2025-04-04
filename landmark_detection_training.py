@@ -123,16 +123,10 @@ USE_LOSS_NORMALIZATION = True  # Normalize losses before weighting
 NORM_DECAY = 0.99  # Decay factor for running average
 NORM_EPSILON = 1e-6  # Epsilon for numerical stability
 
-# Target Landmarks (optional)
-# Define a list of 0-based indices for landmarks to focus on, or None to train on all.
-# Example: TARGET_LANDMARK_INDICES = [0, 1, 5] # Focus on Sella, Nasion, A point
-TARGET_LANDMARK_INDICES = None 
-
-# Per-Landmark Loss Weights (optional)
-# Define a list of weights, one for each landmark. Must have NUM_LANDMARKS elements.
-# Weights multiply the loss for each specific landmark. Default is 1.0 for all.
-# Example: LANDMARK_WEIGHTS = [2.0] + [1.0] * (NUM_LANDMARKS - 1) # Make first landmark twice as important
-LANDMARK_WEIGHTS = None # Defaults to equal weight (1.0) for all landmarks
+# Per-Landmark Weighting/Focusing Parameters
+TARGET_LANDMARK_INDICES = None  # e.g., [0, 1, 10] to focus on Sella, Nasion, Gonion
+LANDMARK_WEIGHTS = None # e.g., [2.0, 1.0, ..., 1.0] (list/array of length NUM_LANDMARKS)
+                       # If None, all landmarks have weight 1.0
 
 # LR Range Test parameters
 RUN_LR_FINDER = True  # Set to True to run the LR range test before training
@@ -358,9 +352,8 @@ trainer = LandmarkTrainer(
     use_loss_normalization=USE_LOSS_NORMALIZATION,
     norm_decay=NORM_DECAY,
     norm_epsilon=NORM_EPSILON,
-    # Target landmarks
+    # Per-Landmark Weighting/Focusing
     target_landmark_indices=TARGET_LANDMARK_INDICES,
-    # Per-Landmark Loss Weights
     landmark_weights=LANDMARK_WEIGHTS
 )
 
