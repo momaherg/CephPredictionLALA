@@ -128,6 +128,9 @@ TARGET_LANDMARK_INDICES = None  # e.g., [0, 1, 10] to focus on Sella, Nasion, Go
 LANDMARK_WEIGHTS = None # e.g., [2.0, 1.0, ..., 1.0] (list/array of length NUM_LANDMARKS)
                        # If None, all landmarks have weight 1.0
 
+# Specific MED Logging
+LOG_SPECIFIC_LANDMARK_INDICES = None # e.g., [0, 1, 10] to log MED for Sella, Nasion, Gonion
+
 # LR Range Test parameters
 RUN_LR_FINDER = True  # Set to True to run the LR range test before training
 LR_FINDER_START_LR = 1e-7
@@ -354,7 +357,9 @@ trainer = LandmarkTrainer(
     norm_epsilon=NORM_EPSILON,
     # Per-Landmark Weighting/Focusing
     target_landmark_indices=TARGET_LANDMARK_INDICES,
-    landmark_weights=LANDMARK_WEIGHTS
+    landmark_weights=LANDMARK_WEIGHTS,
+    # Specific MED Logging
+    log_specific_landmark_indices=LOG_SPECIFIC_LANDMARK_INDICES
 )
 
 # Custom max_delta setting for the refinement MLP if needed
@@ -668,7 +673,8 @@ model_config = {
     'norm_decay': NORM_DECAY,
     'norm_epsilon': NORM_EPSILON,
     'target_landmark_indices': TARGET_LANDMARK_INDICES,
-    'landmark_weights': LANDMARK_WEIGHTS
+    'landmark_weights': LANDMARK_WEIGHTS,
+    'log_specific_landmark_indices': LOG_SPECIFIC_LANDMARK_INDICES
 }
 
 save_model_config(OUTPUT_DIR, model_config)

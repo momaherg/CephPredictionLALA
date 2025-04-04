@@ -95,6 +95,10 @@ def parse_args():
     parser.add_argument('--landmark_weights', type=float, nargs='*', default=None,
                         help='List of weights (one per landmark) to apply to the loss calculation. Must match num_landmarks.')
     
+    # Specific MED Logging
+    parser.add_argument('--log_specific_med', type=int, nargs='*', default=None,
+                        help='List of landmark indices (0-based) to log MED for separately during training.')
+    
     return parser.parse_args()
 
 def set_seed(seed):
@@ -389,7 +393,9 @@ def main():
         norm_epsilon=args.loss_norm_epsilon,
         # Per-Landmark Weighting/Focusing
         target_landmark_indices=args.target_indices,
-        landmark_weights=args.landmark_weights
+        landmark_weights=args.landmark_weights,
+        # Specific MED Logging
+        log_specific_landmark_indices=args.log_specific_med
     )
     
     # Train model
