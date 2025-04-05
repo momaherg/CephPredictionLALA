@@ -87,10 +87,20 @@ class CephalometricDataset(Dataset):
             img_data = self.landmarks_frame.iloc[idx, self.landmarks_frame.columns.get_loc('Image')]
             if isinstance(img_data, (np.ndarray, list)):
                 try:
-                    image = np.array(img_data).reshape(self.image_size).astype(np.uint8)
+                    # --- FIX: Assume 3 channels (H, W, C) if reshaping from flat array ---
+                    expected_elements = self.image_size[0] * self.image_size[1] * 3
+                    if np.array(img_data).size == expected_elements:
+                        image = np.array(img_data).reshape(self.image_size[0], self.image_size[1], 3).astype(np.uint8)
+                    # --- Fallback for grayscale (if needed, though unlikely given the error) ---
+                    elif np.array(img_data).size == self.image_size[0] * self.image_size[1]:
+                         image = np.array(img_data).reshape(self.image_size).astype(np.uint8)
+                         print(f"Debug idx {idx}: Reshaped image from DataFrame as grayscale {image.shape}") # Debug print
+                    else:
+                         raise ValueError(f"Unexpected number of elements {np.array(img_data).size} for image size {self.image_size}")
+                    # --- End Fix ---
                 except ValueError as e:
                      print(f"Warning: Error reshaping image data at index {idx}: {e}")
-                     return None
+                     return None # Return None or handle error appropriately
             else:
                 print(f"Warning: Invalid image data format at index {idx}")
                 return None
@@ -114,6 +124,7 @@ class CephalometricDataset(Dataset):
         # Ensure image is HWC format and uint8
         image = image.astype(np.uint8)
         original_h, original_w = image.shape[:2]
+        print(f"Debug idx {idx}: Loaded image shape {image.shape}, type {image.dtype}") # Debug print
 
         # Apply CLAHE if requested
         if self.apply_clahe:
@@ -125,11 +136,14 @@ class CephalometricDataset(Dataset):
             cl = clahe.apply(l)
             limg = cv2.merge((cl, a, b))
             image = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
+            print(f"Debug idx {idx}: Image shape after CLAHE {image.shape}") # Debug print
 
         # Resize image
+        print(f"Debug idx {idx}: Resizing image from {image.shape[:2]} to {self.image_size}") # Debug print
         image = transform.resize(image, self.image_size, anti_aliasing=True)
         # Convert image back to uint8 after resize (skimage converts to float)
         image = (image * 255).astype(np.uint8)
+        print(f"Debug idx {idx}: Image shape after resize {image.shape}") # Debug print
 
         # Load landmarks
         landmarks = self.landmarks_frame.iloc[idx][self.landmark_cols].values
@@ -157,6 +171,7 @@ class CephalometricDataset(Dataset):
                     outputs, target_sizes=[self.image_size]
                 )
                 depth_map_tensor = post_processed[0]["predicted_depth"]
+                print(f"Debug idx {idx}: Raw depth map shape {depth_map_tensor.shape}, device {depth_map_tensor.device}") # Debug print
                 
                 # Normalize depth map (e.g., min-max to 0-1)
                 min_d = torch.min(depth_map_tensor)
@@ -168,6 +183,7 @@ class CephalometricDataset(Dataset):
                 
                 # Add channel dimension and move to CPU if needed for concatenation
                 depth_map = depth_map.unsqueeze(0).cpu() # Shape: (1, H, W)
+                print(f"Debug idx {idx}: Processed depth map shape {depth_map.shape}") # Debug print
 
             except Exception as e:
                 print(f"Warning: Error predicting depth for index {idx}: {e}. Skipping depth feature.")
@@ -189,19 +205,35 @@ class CephalometricDataset(Dataset):
             final_image = torch.from_numpy(final_image.transpose((2, 0, 1))).float() / 255.0
         elif not isinstance(final_image, torch.Tensor):
             raise TypeError(f"Unsupported image type after transform: {type(final_image)}")
+        print(f"Debug idx {idx}: Image tensor shape before depth concat {final_image.shape}") # Debug print
             
         # If depth map exists, concatenate it
         if depth_map is not None and isinstance(final_image, torch.Tensor) and final_image.dim() == 3:
             if depth_map.shape[1:] == final_image.shape[1:]:
                 # Concatenate along channel dimension (C, H, W)
                 final_image = torch.cat((final_image, depth_map), dim=0) # Now has 4 channels
+                print(f"Debug idx {idx}: Final image tensor shape after depth concat {final_image.shape}") # Debug print
             else:
                 print(f"Warning: Depth map size {depth_map.shape[1:]} mismatch with image size {final_image.shape[1:]} at index {idx}. Skipping depth.")
+        elif depth_map is not None:
+             print(f"Debug idx {idx}: Depth map existed but was not concatenated (Image type: {type(final_image)}, Image dims: {final_image.dim()})") # Debug print
 
         sample['image'] = final_image
         # Note: Landmarks are kept as numpy array until ToTensor or similar in DataLoader transform
         # --- End Concatenate --- 
         
+        # --- Save first sample for debugging ---
+        if idx == 0:
+            try:
+                save_path = 'debug_sample.pt'
+                torch.save({'image': sample['image'].clone(), # Clone to avoid issues if tensor is modified later
+                           'landmarks': sample['landmarks'].copy()}, # Copy numpy array
+                           save_path)
+                print(f"Debug: Saved first processed sample (image tensor & landmarks) to {save_path}")
+            except Exception as e:
+                print(f"Debug: Failed to save debug sample: {e}")
+        # --- End Save Sample ---
+
         return sample
 
 
