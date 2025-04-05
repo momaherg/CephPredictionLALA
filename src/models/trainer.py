@@ -59,7 +59,8 @@ class LandmarkTrainer:
                  total_steps=None,
                  target_landmark_indices=None,
                  landmark_weights=None,
-                 log_specific_landmark_indices=None): # Indices for specific MED logging
+                 log_specific_landmark_indices=None,
+                 use_depth_features=False): # Indices for specific MED logging
         """
         Initialize trainer
         
@@ -100,6 +101,7 @@ class LandmarkTrainer:
             landmark_weights (list or numpy array, optional): Weights to apply to each landmark's loss.
                                                               Must have length equal to num_landmarks.
             log_specific_landmark_indices (list, optional): Indices of landmarks to log MED for separately.
+            use_depth_features (bool): Whether to use depth features in the model
         """
         # Set device
         if device is not None:
@@ -117,11 +119,13 @@ class LandmarkTrainer:
                 print("Using CPU device")
         
         # Create model
+        input_channels = 4 if use_depth_features else 3 # Determine input channels
         self.model = create_hrnet_model(
             num_landmarks=num_landmarks, 
             pretrained=True, 
             use_refinement=use_refinement,
-            hrnet_type=hrnet_type
+            hrnet_type=hrnet_type,
+            input_channels=input_channels # Pass correct number of channels
         )
         self.model = self.model.to(self.device)
         

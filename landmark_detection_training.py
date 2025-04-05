@@ -30,7 +30,7 @@ sys.path.append('./src')
 # Import model and training components
 from src.models.hrnet import create_hrnet_model
 from src.models.trainer import LandmarkTrainer
-from src.data.dataset import CephalometricDataset, ToTensor, Normalize
+from src.data.dataset import CephalometricDataset, ToTensor, Normalize, ToTensor4CH, Normalize4CH
 from src.data.data_augmentation import get_train_transforms
 from src.data.data_processor import DataProcessor
 from src.utils.lr_finder import LRFinder
@@ -72,6 +72,7 @@ PRETRAINED = True
 USE_REFINEMENT = True  # Whether to use refinement MLP
 MAX_DELTA = 2.0  # Maximum allowed delta for refinement
 HRNET_TYPE = 'w32'  # HRNet variant: 'w32' (default) or 'w48' (larger model)
+USE_DEPTH_FEATURES = False # Set to True to enable depth feature usage
 
 # Loss parameters
 HEATMAP_WEIGHT = 1.0  # Weight for heatmap loss (used when not using weight scheduling)
@@ -229,16 +230,22 @@ class TrainTransform:
         # Then apply base transforms (ToTensor, Normalize)
         return self.base_transforms(augmented)
 
-# Define data transformations
-base_transforms = transforms.Compose([
-    ToTensor(),
-    Normalize()
-])
+# Define data transformations based on whether depth features are used
+if USE_DEPTH_FEATURES:
+    base_transforms = transforms.Compose([
+        ToTensor4CH(),
+        Normalize4CH() # Assumes RGB normalization, depth handled separately if needed
+    ])
+else:
+    base_transforms = transforms.Compose([
+        ToTensor(),
+        Normalize()
+    ])
 
 # Get training transformations with augmentations
 train_augmentations = get_train_transforms(include_horizontal_flip=False)
 
-# Create custom transform for training
+# Create custom transform for training (applies augmentation BEFORE base ToTensor/Normalize)
 train_transform = TrainTransform(train_augmentations, base_transforms)
 
 # Split data into train, val, test
@@ -279,17 +286,23 @@ if BALANCE_CLASSES and 'skeletal_class' in train_df.columns:
 # Create datasets
 train_dataset = CephalometricDataset(
     train_df, root_dir=None, transform=train_transform, 
-    landmark_cols=landmark_cols, train=True, apply_clahe=APPLY_CLAHE
+    landmark_cols=landmark_cols, train=True, apply_clahe=APPLY_CLAHE,
+    use_depth_features=USE_DEPTH_FEATURES, # Pass flag
+    image_size=(224, 224)
 )
 
 val_dataset = CephalometricDataset(
     val_df, root_dir=None, transform=base_transforms, 
-    landmark_cols=landmark_cols, train=False, apply_clahe=APPLY_CLAHE
+    landmark_cols=landmark_cols, train=False, apply_clahe=APPLY_CLAHE,
+    use_depth_features=USE_DEPTH_FEATURES, # Pass flag
+    image_size=(224, 224)
 )
 
 test_dataset = CephalometricDataset(
     test_df, root_dir=None, transform=base_transforms, 
-    landmark_cols=landmark_cols, train=False, apply_clahe=APPLY_CLAHE
+    landmark_cols=landmark_cols, train=False, apply_clahe=APPLY_CLAHE,
+    use_depth_features=USE_DEPTH_FEATURES, # Pass flag
+    image_size=(224, 224)
 )
 
 # Create dataloaders
@@ -359,7 +372,9 @@ trainer = LandmarkTrainer(
     target_landmark_indices=TARGET_LANDMARK_INDICES,
     landmark_weights=LANDMARK_WEIGHTS,
     # Specific MED Logging
-    log_specific_landmark_indices=LOG_SPECIFIC_LANDMARK_INDICES
+    log_specific_landmark_indices=LOG_SPECIFIC_LANDMARK_INDICES,
+    # Feature Engineering
+    use_depth_features=USE_DEPTH_FEATURES
 )
 
 # Custom max_delta setting for the refinement MLP if needed
@@ -674,7 +689,8 @@ model_config = {
     'norm_epsilon': NORM_EPSILON,
     'target_landmark_indices': TARGET_LANDMARK_INDICES,
     'landmark_weights': LANDMARK_WEIGHTS,
-    'log_specific_landmark_indices': LOG_SPECIFIC_LANDMARK_INDICES
+    'log_specific_landmark_indices': LOG_SPECIFIC_LANDMARK_INDICES,
+    'use_depth_features': USE_DEPTH_FEATURES
 }
 
 save_model_config(OUTPUT_DIR, model_config)

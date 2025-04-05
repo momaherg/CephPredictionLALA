@@ -8,7 +8,7 @@ from torchvision import transforms
 import platform
 
 from data.data_processor import DataProcessor
-from data.dataset import CephalometricDataset, ToTensor, Normalize
+from data.dataset import CephalometricDataset, ToTensor, Normalize, ToTensor4CH, Normalize4CH
 from data.data_augmentation import get_train_transforms
 from models.trainer import LandmarkTrainer
 
@@ -81,6 +81,10 @@ def parse_args():
     parser.add_argument('--nesterov', action='store_true',
                         help='Enable Nesterov momentum for SGD optimizer')
     
+    # Feature Engineering
+    parser.add_argument('--use_depth_features', action='store_true',
+                        help='Predict depth map and use it as an additional input channel')
+    
     # Loss Normalization arguments
     parser.add_argument('--no_loss_norm', action='store_true',
                         help='Disable running average loss normalization in CombinedLoss')
@@ -114,7 +118,7 @@ def set_seed(seed):
 def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16, 
                                         train_ratio=0.8, val_ratio=0.1, 
                                         apply_clahe=True, root_dir=None, 
-                                        num_workers=4, balance_classes=False):
+                                        num_workers=4, balance_classes=False, use_depth_features=False):
     """
     Create train, validation, and test DataLoaders with proper augmentations
     
@@ -128,6 +132,7 @@ def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16,
         root_dir (str): Directory containing images (if images are stored as files)
         num_workers (int): Number of worker threads for dataloader
         balance_classes (bool): Whether to balance training data using skeletal classification
+        use_depth_features (bool): Whether to use depth features as an additional input channel
         
     Returns:
         tuple: (train_loader, val_loader, test_loader)
@@ -188,31 +193,42 @@ def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16,
                 print(f"  {class_name}: {count} samples ({count/len(train_df)*100:.1f}%)")
     
     # Define data transformations (non-augmentation)
-    base_transforms = transforms.Compose([
-        ToTensor(),
-        Normalize()
-    ])
+    # Use custom versions if handling depth features
+    if use_depth_features:
+        base_transforms = transforms.Compose([
+            ToTensor4CH(),
+            Normalize4CH() # Normalizes RGB, passes depth through (or normalizes separately)
+        ])
+        # Create custom transform that applies augmentations before tensor conversion and normalization
+        train_transform = TrainTransform(train_augmentations, base_transforms)
+    else:
+        base_transforms = transforms.Compose([
+            ToTensor(),
+            Normalize()
+        ])
+        # Create custom transform that applies augmentations before tensor conversion
+        train_transform = TrainTransform(train_augmentations, base_transforms)
     
     # Training transformations with augmentations
     train_augmentations = get_train_transforms(include_horizontal_flip=False)
     
-    # Create custom transform that applies augmentations before tensor conversion
-    train_transform = TrainTransform(train_augmentations, base_transforms)
-    
     # Create datasets
     train_dataset = CephalometricDataset(
         train_df, root_dir=root_dir, transform=train_transform, 
-        landmark_cols=landmark_cols, train=True, apply_clahe=apply_clahe
+        landmark_cols=landmark_cols, train=True, apply_clahe=apply_clahe,
+        use_depth_features=use_depth_features, image_size=(224, 224)
     )
     
     val_dataset = CephalometricDataset(
         val_df, root_dir=root_dir, transform=base_transforms, 
-        landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe
+        landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe,
+        use_depth_features=use_depth_features, image_size=(224, 224)
     )
     
     test_dataset = CephalometricDataset(
         test_df, root_dir=root_dir, transform=base_transforms, 
-        landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe
+        landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe,
+        use_depth_features=use_depth_features, image_size=(224, 224)
     )
     
     # Create dataloaders
@@ -318,7 +334,8 @@ def main():
         apply_clahe=args.apply_clahe,
         root_dir=None,
         num_workers=args.num_workers,
-        balance_classes=args.balance_classes  # Only the training set will be balanced
+        balance_classes=args.balance_classes,  # Only the training set will be balanced
+        use_depth_features=args.use_depth_features # Pass flag to dataloader creation
     )
     
     print(f"Created data loaders:")
@@ -395,7 +412,9 @@ def main():
         target_landmark_indices=args.target_indices,
         landmark_weights=args.landmark_weights,
         # Specific MED Logging
-        log_specific_landmark_indices=args.log_specific_med
+        log_specific_landmark_indices=args.log_specific_med,
+        # Feature Engineering
+        use_depth_features=args.use_depth_features
     )
     
     # Train model

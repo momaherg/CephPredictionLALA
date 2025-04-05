@@ -6,144 +6,248 @@ from torch.utils.data import Dataset, DataLoader
 import cv2
 from PIL import Image
 from torchvision import transforms
+from skimage import io, transform
+import platform
+
+# Conditional import for Depth Model
+try:
+    from transformers import DepthProImageProcessorFast, DepthProForDepthEstimation
+    from requests.exceptions import RequestException
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
 
 class CephalometricDataset(Dataset):
-    def __init__(self, data_frame, root_dir=None, transform=None, 
-                 landmark_cols=None, train=True, apply_clahe=True,
-                 clahe_clip_limit=2.0, clahe_grid_size=(8,8)):
+    """Cephalometric landmark dataset."""
+
+    def __init__(self, dataframe, root_dir=None, transform=None, 
+                 landmark_cols=None, train=True, apply_clahe=False,
+                 use_depth_features=False, image_size=(224, 224)):
         """
         Args:
-            data_frame (pandas.DataFrame): DataFrame containing image paths and landmarks
-            root_dir (string): Directory with all the images
-            transform (callable, optional): Optional transform to be applied on a sample
-            landmark_cols (list): Columns containing landmark coordinates
-            train (bool): Whether this is training set or not
-            apply_clahe (bool): Whether to apply CLAHE for histogram equalization
-            clahe_clip_limit (float): Clip limit for CLAHE
-            clahe_grid_size (tuple): Grid size for CLAHE
+            dataframe (pd.DataFrame): DataFrame with image paths and landmarks.
+            root_dir (string, optional): Directory with all the images. If None, assumes images are in dataframe.
+            transform (callable, optional): Optional transform to be applied on a sample.
+            landmark_cols (list): List of landmark column names.
+            train (bool): Indicates if the dataset is for training (used for CLAHE).
+            apply_clahe (bool): Whether to apply CLAHE.
+            use_depth_features (bool): Whether to predict and add depth as a feature.
+            image_size (tuple): Target size for images and depth maps.
         """
-        self.data_frame = data_frame
+        self.landmarks_frame = dataframe
         self.root_dir = root_dir
         self.transform = transform
         self.landmark_cols = landmark_cols
         self.train = train
         self.apply_clahe = apply_clahe
+        self.use_depth_features = use_depth_features
+        self.image_size = image_size
         
-        # Store CLAHE parameters instead of the object itself
-        self.clahe_clip_limit = clahe_clip_limit
-        self.clahe_grid_size = clahe_grid_size
-    
+        # Initialize CLAHE object here if needed, but create on demand in getitem
+        self.clahe_clip_limit = 2.0
+        self.clahe_grid_size = (8, 8)
+        
+        # Initialize Depth model if requested and available
+        self.depth_model = None
+        self.depth_processor = None
+        if self.use_depth_features:
+            if TRANSFORMERS_AVAILABLE:
+                try:
+                    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if platform.system() == 'Darwin' and torch.backends.mps.is_available() else "cpu")
+                    self.depth_processor = DepthProImageProcessorFast.from_pretrained("apple/DepthPro-hf")
+                    self.depth_model = DepthProForDepthEstimation.from_pretrained("apple/DepthPro-hf").to(device)
+                    self.depth_model.eval() # Set to evaluation mode
+                    print(f"Depth model apple/DepthPro-hf loaded successfully on device: {device}")
+                except (OSError, RequestException, ImportError) as e:
+                    print(f"Warning: Failed to load depth model apple/DepthPro-hf: {e}. Depth features will not be used.")
+                    self.use_depth_features = False # Disable if loading fails
+            else:
+                print("Warning: 'transformers' package not found. Cannot use depth features. Install with 'pip install transformers'")
+                self.use_depth_features = False
+
     def __len__(self):
-        return len(self.data_frame)
-    
+        return len(self.landmarks_frame)
+
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
-        
-        # Get image data
-        if 'Image' in self.data_frame.columns:
-            # Assuming 'Image' column contains pixel array data
-            img_data = self.data_frame.iloc[idx]['Image']
-            # Convert from list of RGB tuples to numpy array if needed
-            if isinstance(img_data, list):
-                img_array = np.array(img_data).reshape(224, 224, 3)
-            else:
-                img_array = img_data
-        else:
-            # For synthetic data when no actual images are available, create a blank image
-            if self.root_dir is None or 'image_path' in self.data_frame.columns:
-                # Create a synthetic image for demonstration
-                img_array = np.zeros((224, 224, 3), dtype=np.uint8)
-                # Add some random noise to make it more realistic
-                img_array = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
-            else:
-                # If images are stored as files
-                img_name = os.path.join(self.root_dir, self.data_frame.iloc[idx]['patient'] + '.jpg')
-                img_array = np.array(Image.open(img_name))
-        
-        # Ensure image is in the right format (uint8) for OpenCV operations
-        if img_array.dtype != np.uint8:
-            # If float in range [0,1], convert to [0,255]
-            if img_array.dtype == np.float32 or img_array.dtype == np.float64:
-                if img_array.max() <= 1.0:
-                    img_array = (img_array * 255).astype(np.uint8)
-                else:
-                    img_array = img_array.astype(np.uint8)
-            else:
-                # For other types, simply convert to uint8
-                img_array = img_array.astype(np.uint8)
-        
-        # Apply CLAHE for histogram equalization
-        if self.apply_clahe and len(img_array.shape) == 3:
+
+        # Load image
+        image = None
+        if 'image_path' in self.landmarks_frame.columns and self.root_dir:
+            img_name = os.path.join(self.root_dir, self.landmarks_frame.iloc[idx, self.landmarks_frame.columns.get_loc('image_path')])
             try:
-                # Create CLAHE object on-demand (no longer stored as instance attribute)
-                clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit, tileGridSize=self.clahe_grid_size)
-                
-                # Convert to LAB color space
-                lab = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
-                l, a, b = cv2.split(lab)
-                
-                # Apply CLAHE to L channel
-                cl = clahe.apply(l)
-                
-                # Merge the CLAHE enhanced L channel with the a and b channels
-                limg = cv2.merge((cl, a, b))
-                
-                # Convert back to RGB color space
-                img_array = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
-            except cv2.error as e:
-                # If color conversion fails, use original image
-                print(f"Warning: CLAHE could not be applied, using original image. Error: {e}")
-                # You might want to log this instead of printing
-        
-        # Get landmarks if available
-        if self.landmark_cols and all(col in self.data_frame.columns for col in self.landmark_cols):
-            landmarks = self.data_frame.iloc[idx][self.landmark_cols].values.astype('float32')
-            # Reshape to (num_landmarks, 2) for easier processing
-            landmarks = landmarks.reshape(-1, 2)
+                image = io.imread(img_name)
+            except FileNotFoundError:
+                print(f"Warning: Image file not found: {img_name}")
+                # Return a placeholder or handle error appropriately
+                return None 
+        elif 'Image' in self.landmarks_frame.columns:
+             # Assuming image data is stored directly in the dataframe as numpy array or list
+            img_data = self.landmarks_frame.iloc[idx, self.landmarks_frame.columns.get_loc('Image')]
+            if isinstance(img_data, (np.ndarray, list)):
+                try:
+                    image = np.array(img_data).reshape(self.image_size).astype(np.uint8)
+                except ValueError as e:
+                     print(f"Warning: Error reshaping image data at index {idx}: {e}")
+                     return None
+            else:
+                print(f"Warning: Invalid image data format at index {idx}")
+                return None
         else:
-            landmarks = np.array([])
-        
-        # Create sample
-        sample = {'image': img_array, 'landmarks': landmarks}
-        
-        # Apply transformations
+            raise KeyError("Dataset needs either 'image_path' and 'root_dir' or an 'Image' column.")
+            
+        # Handle grayscale images - convert to 3 channels for consistency
+        if image.ndim == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.ndim == 3 and image.shape[2] == 1:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.ndim == 3 and image.shape[2] == 4:
+            # Handle RGBA images (convert to RGB)
+            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+        elif image.ndim != 3 or image.shape[2] != 3:
+             print(f"Warning: Unexpected image shape {image.shape} at index {idx}. Attempting to process.")
+             # Try to force into 3 channels if possible, otherwise error might occur later
+             if image.ndim == 2: image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+             # Add more specific handling if needed
+
+        # Ensure image is HWC format and uint8
+        image = image.astype(np.uint8)
+        original_h, original_w = image.shape[:2]
+
+        # Apply CLAHE if requested
+        if self.apply_clahe:
+            # Create CLAHE object on demand
+            clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit, tileGridSize=self.clahe_grid_size)
+            # Convert to LAB color space, apply CLAHE to L channel, convert back to RGB
+            lab_image = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+            l, a, b = cv2.split(lab_image)
+            cl = clahe.apply(l)
+            limg = cv2.merge((cl, a, b))
+            image = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
+
+        # Resize image
+        image = transform.resize(image, self.image_size, anti_aliasing=True)
+        # Convert image back to uint8 after resize (skimage converts to float)
+        image = (image * 255).astype(np.uint8)
+
+        # Load landmarks
+        landmarks = self.landmarks_frame.iloc[idx][self.landmark_cols].values
+        landmarks = landmarks.astype('float').reshape(-1, 2)
+
+        # Adjust landmarks for resize
+        scale_y = self.image_size[0] / original_h
+        scale_x = self.image_size[1] / original_w
+        landmarks = landmarks * [scale_x, scale_y]
+
+        # --- Predict and Add Depth Feature --- 
+        depth_map = None
+        if self.use_depth_features and self.depth_model is not None:
+            try:
+                # Prepare image for depth model (needs PIL format)
+                pil_image = Image.fromarray(image) # Image is already resized uint8 RGB
+                
+                # Process image and predict depth
+                with torch.no_grad():
+                    inputs = self.depth_processor(images=pil_image, return_tensors="pt").to(self.depth_model.device)
+                    outputs = self.depth_model(**inputs)
+                
+                # Post-process depth map
+                post_processed = self.depth_processor.post_process_depth_estimation(
+                    outputs, target_sizes=[self.image_size]
+                )
+                depth_map_tensor = post_processed[0]["predicted_depth"]
+                
+                # Normalize depth map (e.g., min-max to 0-1)
+                min_d = torch.min(depth_map_tensor)
+                max_d = torch.max(depth_map_tensor)
+                if max_d > min_d:
+                    depth_map = (depth_map_tensor - min_d) / (max_d - min_d)
+                else:
+                    depth_map = torch.zeros_like(depth_map_tensor) # Handle case of flat depth
+                
+                # Add channel dimension and move to CPU if needed for concatenation
+                depth_map = depth_map.unsqueeze(0).cpu() # Shape: (1, H, W)
+
+            except Exception as e:
+                print(f"Warning: Error predicting depth for index {idx}: {e}. Skipping depth feature.")
+                depth_map = None # Ensure depth_map is None if error occurs
+        # --- End Depth Feature --- 
+
+        sample = {'image': image, 'landmarks': landmarks}
+
+        # Apply standard data augmentations if transform is provided
         if self.transform:
             sample = self.transform(sample)
+            # After augmentation, sample['image'] might be tensor or numpy array
+        
+        # --- Convert image to tensor and concatenate depth --- 
+        # Ensure image is a tensor (some transforms might return numpy)
+        final_image = sample['image']
+        if isinstance(final_image, np.ndarray):
+            # Convert HWC numpy array to CHW tensor
+            final_image = torch.from_numpy(final_image.transpose((2, 0, 1))).float() / 255.0
+        elif not isinstance(final_image, torch.Tensor):
+            raise TypeError(f"Unsupported image type after transform: {type(final_image)}")
+            
+        # If depth map exists, concatenate it
+        if depth_map is not None and isinstance(final_image, torch.Tensor) and final_image.dim() == 3:
+            if depth_map.shape[1:] == final_image.shape[1:]:
+                # Concatenate along channel dimension (C, H, W)
+                final_image = torch.cat((final_image, depth_map), dim=0) # Now has 4 channels
+            else:
+                print(f"Warning: Depth map size {depth_map.shape[1:]} mismatch with image size {final_image.shape[1:]} at index {idx}. Skipping depth.")
+
+        sample['image'] = final_image
+        # Note: Landmarks are kept as numpy array until ToTensor or similar in DataLoader transform
+        # --- End Concatenate --- 
         
         return sample
 
 
-class ToTensor(object):
-    """Convert ndarrays in sample to Tensors."""
-    
+# --- Custom Transforms for handling 4 channels --- 
+class ToTensor4CH:
+    """Convert ndarrays in sample to Tensors, handle 3 or 4 channel image."""
+    def __call__(self, sample):
+        image, landmarks = sample['image'], sample['landmarks']
+
+        # numpy image: H x W x C
+        # torch image: C X H X W
+        if isinstance(image, np.ndarray):
+            image = image.transpose((2, 0, 1))
+            image = torch.from_numpy(image).float() / 255.0 # Normalize uint8
+        elif not isinstance(image, torch.Tensor):
+             raise TypeError(f"ToTensor4CH expects numpy array or torch Tensor, got {type(image)}")
+             
+        # Convert landmarks to tensor
+        landmarks = torch.from_numpy(landmarks).float()
+
+        return {'image': image, 'landmarks': landmarks}
+
+class Normalize4CH:
+    """Normalize a tensor image with mean and standard deviation, handling 4 channels.
+       Normalizes first 3 channels (RGB) with given stats, leaves 4th channel (depth) as is (or applies specific norm)."""
+    def __init__(self, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225), normalize_depth=False, depth_mean=0.5, depth_std=0.5):
+        self.mean = torch.tensor(mean).view(3, 1, 1)
+        self.std = torch.tensor(std).view(3, 1, 1)
+        self.normalize_depth = normalize_depth
+        self.depth_mean = depth_mean
+        self.depth_std = depth_std
+
     def __call__(self, sample):
         image, landmarks = sample['image'], sample['landmarks']
         
-        # Convert image to tensor
-        # Transpose image dimensions: (H x W x C) -> (C X H X W)
-        image = image.transpose((2, 0, 1))
-        
-        return {
-            'image': torch.from_numpy(image).float() / 255.0,
-            'landmarks': torch.from_numpy(landmarks).float(),
-        }
+        if not isinstance(image, torch.Tensor):
+             raise TypeError("Normalize4CH expects a torch Tensor image.")
 
-
-class Normalize(object):
-    """Normalize the image tensors."""
-    
-    def __init__(self, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
-        self.mean = mean
-        self.std = std
-    
-    def __call__(self, sample):
-        image, landmarks = sample['image'], sample['landmarks']
+        # Normalize RGB channels
+        image[:3, :, :] = (image[:3, :, :] - self.mean) / self.std
         
-        # Normalize image
-        for t, m, s in zip(image, self.mean, self.std):
-            t.sub_(m).div_(s)
-            
+        # Normalize depth channel if requested and present
+        if self.normalize_depth and image.shape[0] == 4:
+             image[3, :, :] = (image[3, :, :] - self.depth_mean) / self.depth_std
+        # If normalize_depth is False, the 4th channel (already scaled 0-1) is passed through.
+        
         return {'image': image, 'landmarks': landmarks}
 
 
@@ -188,13 +292,13 @@ def create_dataloaders(df, landmark_cols, batch_size=32, train_ratio=0.8, val_ra
     
     # Define transformations
     train_transform = transforms.Compose([
-        ToTensor(),
-        Normalize()
+        ToTensor4CH(),
+        Normalize4CH()
     ])
     
     val_transform = transforms.Compose([
-        ToTensor(),
-        Normalize()
+        ToTensor4CH(),
+        Normalize4CH()
     ])
     
     # Create datasets

@@ -113,8 +113,9 @@ class HRNet(nn.Module):
     
     Supports different HRNet variants (W32, W48, etc.)
     """
-    def __init__(self, pretrained=True, hrnet_type='w32'):
+    def __init__(self, pretrained=True, hrnet_type='w32', input_channels=3):
         super(HRNet, self).__init__()
+        self.input_channels = input_channels
         
         # Load pretrained HRNet model
         if pretrained:
@@ -126,21 +127,66 @@ class HRNet(nn.Module):
                 model_name = f'hrnet_{hrnet_type}'
                 self.backbone = timm.create_model(model_name, pretrained=True, features_only=True)
                 print(f"Successfully loaded pretrained {model_name} using timm.")
+
+                # Modify the first layer if input_channels is not 3
+                if input_channels != 3:
+                    print(f"Modifying first conv layer to accept {input_channels} channels.")
+                    first_conv_layer_name = 'conv1' # Common name, might need adjustment based on timm model structure
+                    original_conv = getattr(self.backbone.feature_info.module_name(first_conv_layer_name), first_conv_layer_name)
+                    
+                    # Get original weights and parameters
+                    original_weights = original_conv.weight.data
+                    out_channels = original_conv.out_channels
+                    kernel_size = original_conv.kernel_size
+                    stride = original_conv.stride
+                    padding = original_conv.padding
+                    dilation = original_conv.dilation
+                    groups = original_conv.groups
+                    bias_term = original_conv.bias is not None
+
+                    # Create new layer
+                    new_conv = nn.Conv2d(input_channels, out_channels, kernel_size=kernel_size,
+                                       stride=stride, padding=padding, dilation=dilation,
+                                       groups=groups, bias=bias_term)
+
+                    # Copy RGB weights and initialize others
+                    new_weights = new_conv.weight.data
+                    new_weights[:, :3, :, :] = original_weights[:, :3, :, :] # Copy RGB
+                    if input_channels > 3:
+                        # Initialize remaining channels (e.g., depth) by averaging RGB weights
+                        rgb_avg = original_weights[:, :3, :, :].mean(dim=1, keepdim=True)
+                        for i in range(3, input_channels):
+                             new_weights[:, i:i+1, :, :] = rgb_avg
+
+                    # Assign new weights and bias (if exists)
+                    new_conv.weight.data = new_weights
+                    if bias_term:
+                        new_conv.bias.data = original_conv.bias.data
+                        
+                    # Replace the layer in the backbone
+                    # This part might need adjustment depending on how timm structures the model
+                    # Trying a common pattern: find the module containing the conv layer
+                    module_path = self.backbone.feature_info.module_name(first_conv_layer_name)
+                    module = self.backbone
+                    for part in module_path.split('.'):
+                         if part: # Avoid empty splits
+                            module = getattr(module, part)
+                    setattr(module, first_conv_layer_name, new_conv)
+                    print(f"Replaced {first_conv_layer_name} in {module_path}")
+
             except Exception as e:
                 # Fallback to a simplified backbone if pretrained model is not available
-                logging.warning(f"Error loading pretrained HRNet-{hrnet_type.upper()}: {str(e)}")
-                print(f"Warning: Pretrained HRNet-{hrnet_type.upper()} not available. Using simplified backbone.")
-                print("To fix this issue, install timm: pip install timm")
-                self.backbone = self._create_simplified_backbone()
+                logging.warning(f"Error loading or modifying pretrained HRNet-{hrnet_type.upper()}: {str(e)}")
+                print(f"Warning: Using simplified backbone with {input_channels} input channels.")
+                self.backbone = self._create_simplified_backbone(input_channels)
         else:
             # Use simplified backbone if pretrained is not required
-            self.backbone = self._create_simplified_backbone()
+            self.backbone = self._create_simplified_backbone(input_channels)
     
-    def _create_simplified_backbone(self):
+    def _create_simplified_backbone(self, input_channels):
         # Simplified backbone as a placeholder
-        # In practice, this would be a full implementation of HRNet
         backbone = nn.Sequential(
-            nn.Conv2d(3, 64, 3, 2, 1),
+            nn.Conv2d(input_channels, 64, 3, 2, 1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, 3, 2, 1),
@@ -218,12 +264,12 @@ class RefinementMLP(nn.Module):
         # Forward through the network with normalized input
         h1 = self.relu(self.bn1(self.fc1(x_norm)))
         h2 = self.relu(self.bn2(self.fc2(h1)))
-        deltas = self.fc3(h2)
+        # deltas = self.fc3(h2)
         
         
         # # Output deltas with tanh activation and scaling
         # # tanh outputs values between -1 and 1, we scale by max_delta
-        # deltas = self.tanh(self.fc3(h2)) * self.max_delta
+        deltas = self.tanh(self.fc3(h2)) * self.max_delta
 
         return deltas
 
@@ -238,7 +284,7 @@ class LandmarkHeatmapNet(nn.Module):
     3. Coordinate extraction from heatmaps
     4. Refinement MLP to improve coordinate predictions
     """
-    def __init__(self, num_landmarks=19, output_size=(64, 64), pretrained=True, use_refinement=True, hrnet_type='w32'):
+    def __init__(self, num_landmarks=19, output_size=(64, 64), pretrained=True, use_refinement=True, hrnet_type='w32', input_channels=3):
         super(LandmarkHeatmapNet, self).__init__()
         
         self.num_landmarks = num_landmarks
@@ -246,8 +292,8 @@ class LandmarkHeatmapNet(nn.Module):
         self.use_refinement = use_refinement
         self.hrnet_type = hrnet_type
         
-        # HRNet backbone
-        self.hrnet = HRNet(pretrained=pretrained, hrnet_type=hrnet_type)
+        # HRNet backbone with specified input channels
+        self.hrnet = HRNet(pretrained=pretrained, hrnet_type=hrnet_type, input_channels=input_channels)
         
         # We'll create the heatmap layer after we know the channel size
         self.heatmap_layer = None
@@ -376,7 +422,7 @@ class LandmarkHeatmapNet(nn.Module):
         return coords
 
 
-def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, hrnet_type='w32'):
+def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, hrnet_type='w32', input_channels=3):
     """
     Create a HRNet-based landmark detection model
     
@@ -385,6 +431,7 @@ def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, h
         pretrained (bool): Whether to use pretrained weights for the backbone
         use_refinement (bool): Whether to use refinement MLP
         hrnet_type (str): HRNet variant to use ('w32' or 'w48')
+        input_channels (int): Number of input channels (3 for RGB, 4 for RGB+Depth)
         
     Returns:
         LandmarkHeatmapNet: The created model
@@ -394,6 +441,7 @@ def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, h
         output_size=(64, 64),
         pretrained=pretrained,
         use_refinement=use_refinement,
-        hrnet_type=hrnet_type
+        hrnet_type=hrnet_type,
+        input_channels=input_channels
     )
     return model 
