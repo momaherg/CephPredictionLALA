@@ -205,6 +205,53 @@ class CephalometricDataset(Dataset):
         return sample
 
 
+# --- Standard Transforms (needed when depth is not used) ---
+class ToTensor(object):
+    """Convert ndarrays in sample to Tensors."""
+    def __call__(self, sample):
+        image, landmarks = sample['image'], sample['landmarks']
+
+        # Convert image to tensor if it's a numpy array
+        # Transpose image dimensions: (H x W x C) -> (C X H X W)
+        if isinstance(image, np.ndarray):
+            # Assuming image is HWC uint8
+            image = image.transpose((2, 0, 1))
+            image = torch.from_numpy(image).float() / 255.0
+        elif isinstance(image, torch.Tensor):
+            # If already a tensor, ensure correct shape and type (e.g., CHW, float)
+            if image.dim() == 3 and image.shape[0] != 3: # Check if channel is first dim
+                 if image.shape[2] == 3: # If HWC, permute
+                     image = image.permute(2, 0, 1)
+            if image.dtype != torch.float32:
+                image = image.float() / 255.0 if image.max() > 1.0 else image.float()
+        else:
+            raise TypeError(f"ToTensor received unexpected type: {type(image)}")
+
+        # Convert landmarks to tensor
+        landmarks = torch.from_numpy(landmarks).float()
+
+        return {'image': image, 'landmarks': landmarks}
+
+class Normalize(object):
+    """Normalize a tensor image with mean and standard deviation."""
+    def __init__(self, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
+        # Ensure mean and std are tensors for broadcasting
+        self.mean = torch.tensor(mean).view(3, 1, 1)
+        self.std = torch.tensor(std).view(3, 1, 1)
+
+    def __call__(self, sample):
+        image, landmarks = sample['image'], sample['landmarks']
+        
+        if not isinstance(image, torch.Tensor):
+            raise TypeError("Normalize expects a torch Tensor image.")
+        if image.shape[0] != 3:
+            raise ValueError(f"Normalize expects a 3-channel image, but got {image.shape[0]} channels.")
+            
+        # Normalize image (ensure tensors are on the same device implicitly)
+        image = (image - self.mean.to(image.device)) / self.std.to(image.device)
+        
+        return {'image': image, 'landmarks': landmarks}
+
 # --- Custom Transforms for handling 4 channels --- 
 class ToTensor4CH:
     """Convert ndarrays in sample to Tensors, handle 3 or 4 channel image."""
