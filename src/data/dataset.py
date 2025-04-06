@@ -52,13 +52,43 @@ class CephalometricDataset(Dataset):
         if 'Image' in self.dataframe.columns:
             # Image data is directly in the DataFrame (e.g., as numpy array)
             img_data = self.dataframe.iloc[idx]['Image']
+            
+            # Handle image data (list or numpy array)
             if isinstance(img_data, list):
-                # Assuming flattened list for 224x224 image
-                img = np.array(img_data).reshape((224, 224)).astype(np.float32)
+                list_len = len(img_data)
+                expected_len_gray = self.image_size[0] * self.image_size[1]
+                expected_len_rgb = expected_len_gray * 3
+                
+                if list_len == expected_len_gray:
+                    # Reshape grayscale list
+                    img = np.array(img_data).reshape(self.image_size) # Shape (H, W)
+                elif list_len == expected_len_rgb:
+                    # Reshape RGB list and convert to grayscale
+                    img_rgb = np.array(img_data).reshape((self.image_size[0], self.image_size[1], 3))
+                    # Convert HWC to grayscale (using simple mean, could use weighted avg) 
+                    img = img_rgb.mean(axis=2) # Shape (H, W)
+                else:
+                    raise ValueError(f"Row {idx}: List length {list_len} does not match expected grayscale ({expected_len_gray}) or RGB ({expected_len_rgb})")
+            
             elif isinstance(img_data, np.ndarray):
-                img = img_data.astype(np.float32)
+                img = img_data
+                # Ensure grayscale if numpy array is provided
+                if img.ndim == 3:
+                    if img.shape[0] == 3: # CHW -> HWC -> Gray
+                        img = img.transpose(1, 2, 0).mean(axis=2)
+                    elif img.shape[-1] == 3: # HWC -> Gray
+                        img = img.mean(axis=2)
+                    elif img.shape[-1] == 1: # HW1 -> HW
+                        img = img.squeeze(axis=-1)
+                # If img.ndim == 2, it's already grayscale HW
             else:
-                raise TypeError(f"Unsupported image data type in DataFrame: {type(img_data)}")
+                raise TypeError(f"Row {idx}: Unexpected image data type: {type(img_data)}")
+
+            # Ensure img is 2D after processing
+            if img.ndim != 2:
+                 raise ValueError(f"Row {idx}: Image processing failed, expected 2D array, got shape {img.shape}")
+                 
+            img = img.astype(np.float32) # Ensure float32 for transforms
         elif self.root_dir and 'image_path' in self.dataframe.columns:
             # Load image from file path
             img_name = os.path.join(self.root_dir, self.dataframe.iloc[idx, 0]) # Assuming first column is path
