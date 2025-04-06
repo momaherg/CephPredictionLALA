@@ -126,32 +126,32 @@ class DataProcessor:
             try:
                 if isinstance(image_data, list):
                     # --- Debugging Start ---
-                    print(f"\n[Debug Index {index}] Detected list input.")
+                    # print(f"\n[Debug Index {index}] Detected list input.")
                     try:
                         np_array_flat = np.array(image_data) # Convert list to numpy array first
                     except Exception as e:
-                         print(f"[Debug Index {index}] Error during np.array(list): {e}")
+                         # print(f"[Debug Index {index}] Error during np.array(list): {e}")
                          raise TypeError("Failed to convert list to np array")
                          
                     list_len = np_array_flat.size
                     dtype = np_array_flat.dtype
                     expected_len_gray = self.image_size[0] * self.image_size[1]
                     expected_len_rgb = expected_len_gray * 3
-                    print(f"[Debug Index {index}] List Length: {list_len}, Dtype: {dtype}")
-                    print(f"[Debug Index {index}] Expected Gray Length: {expected_len_gray}, Expected RGB Length: {expected_len_rgb}")
+                    # print(f"[Debug Index {index}] List Length: {list_len}, Dtype: {dtype}")
+                    # print(f"[Debug Index {index}] Expected Gray Length: {expected_len_gray}, Expected RGB Length: {expected_len_rgb}")
                     # --- Debugging End ---
                     
                     if list_len == expected_len_gray:
-                        print(f"[Debug Index {index}] Matched Gray Length. Reshaping to {self.image_size}.")
+                        # print(f"[Debug Index {index}] Matched Gray Length. Reshaping to {self.image_size}.")
                         image_array = np_array_flat.reshape(self.image_size) # Reshape grayscale
                     elif list_len == expected_len_rgb:
-                        print(f"[Debug Index {index}] Matched RGB Length. Reshaping to {(self.image_size[0], self.image_size[1], 3)}.")
+                        # print(f"[Debug Index {index}] Matched RGB Length. Reshaping to {(self.image_size[0], self.image_size[1], 3)}.")
                         image_array = np_array_flat.reshape((self.image_size[0], self.image_size[1], 3)) # Reshape RGB
                     else:
                         raise ValueError(f"List length {list_len} does not match expected grayscale ({expected_len_gray}) or RGB ({expected_len_rgb})")
                 
                 elif isinstance(image_data, np.ndarray):
-                    print(f"\n[Debug Index {index}] Detected numpy array input. Shape: {image_data.shape}, Dtype: {image_data.dtype}")
+                    # print(f"\n[Debug Index {index}] Detected numpy array input. Shape: {image_data.shape}, Dtype: {image_data.dtype}")
                     image_array = image_data # Already a numpy array
                 
                 else:
