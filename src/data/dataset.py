@@ -48,124 +48,78 @@ class CephalometricDataset(Dataset):
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
-        # Load image
-        if 'Image' in self.dataframe.columns:
-            # Image data is directly in the DataFrame (e.g., as numpy array)
-            img_data = self.dataframe.iloc[idx]['Image']
-            if isinstance(img_data, list):
-                # Handle both grayscale and RGB flattened lists
-                list_len = len(img_data)
-                expected_gray_len = 224 * 224
-                expected_rgb_len = expected_gray_len * 3
-                
-                # Direct way: check list dimensions
-                if list_len == 150528:  # Exact match for 224*224*3
-                    # This is an RGB flat image - reshape to 3D and convert to grayscale
-                    img = np.array(img_data).reshape((224, 224, 3)).astype(np.float32)
-                    img = cv2.cvtColor(img.astype(np.float32), cv2.COLOR_RGB2GRAY)
-                elif list_len == 224*224:  # Exact match for grayscale
-                    img = np.array(img_data).reshape((224, 224)).astype(np.float32)
-                else:
-                    # For any other size, try to find the closest reasonable shape
-                    if abs(list_len - 150528) < 10:  # Near 224*224*3
-                        print(f"Found near RGB list_len={list_len}, reshaping to (224,224,3)")
-                        img = np.array(img_data).reshape((224, 224, 3)).astype(np.float32)
-                        img = cv2.cvtColor(img.astype(np.float32), cv2.COLOR_RGB2GRAY)
-                    elif abs(list_len - expected_gray_len) < 10:  # Near 224*224
-                        print(f"Found near grayscale list_len={list_len}, reshaping to (224,224)")
-                        img = np.array(img_data).reshape((224, 224)).astype(np.float32)
-                    else:
-                        # As last resort - if it's divisible by 3, assume it's RGB
-                        # This helps with different image sizes
-                        if list_len % 3 == 0:
-                            side = int(np.sqrt(list_len / 3))
-                            if side * side * 3 == list_len:  # Perfect square
-                                print(f"Reshaping size {list_len} to ({side},{side},3) as likely RGB")
-                                img = np.array(img_data).reshape((side, side, 3)).astype(np.float32)
-                                # Resize to expected 224x224
-                                img = cv2.resize(img, (224, 224))
-                                # Convert to grayscale
-                                img = cv2.cvtColor(img.astype(np.float32), cv2.COLOR_RGB2GRAY)
-                            else:
-                                raise ValueError(f"Cannot find suitable reshape for size {list_len}")
-                        else:
-                            # If not divisible by 3, assume it's grayscale with unusual dimensions
-                            side = int(np.sqrt(list_len))
-                            if side * side == list_len:  # Perfect square
-                                print(f"Reshaping size {list_len} to ({side},{side}) as likely grayscale")
-                                img = np.array(img_data).reshape((side, side)).astype(np.float32)
-                                # Resize to expected 224x224
-                                img = cv2.resize(img, (224, 224))
-                            else:
-                                # If this fails, print more diagnostic info
-                                sample_values = str(img_data[:5])  # First few values
-                                raise ValueError(f"Cannot find suitable reshape for size {list_len}. "
-                                              f"Sample values: {sample_values}. "
-                                              f"Not a perfect square and not divisible by 3.")
-            elif isinstance(img_data, np.ndarray):
-                img = img_data.astype(np.float32)
-                # Convert RGB to grayscale if needed
-                if img.ndim == 3 and img.shape[-1] == 3:
-                    img = cv2.cvtColor(img.astype(np.float32), cv2.COLOR_RGB2GRAY)
-                elif img.ndim == 3 and img.shape[0] == 3:  # CHW format
-                    img = cv2.cvtColor(img.transpose(1, 2, 0).astype(np.float32), cv2.COLOR_RGB2GRAY)
-            else:
-                raise TypeError(f"Unsupported image data type in DataFrame: {type(img_data)}")
-        elif self.root_dir and 'image_path' in self.dataframe.columns:
-            # Load image from file path
-            img_name = os.path.join(self.root_dir, self.dataframe.iloc[idx, 0]) # Assuming first column is path
-            img = io.imread(img_name)
-            if img.ndim == 3: # Convert RGB to grayscale if necessary
-                img = color.rgb2gray(img)
+        row_data = self.dataframe.iloc[idx]
+
+        # Load image - Assume it's already a numpy array
+        if 'Image' in row_data and isinstance(row_data['Image'], np.ndarray):
+            img = row_data['Image'].astype(np.float32) # Ensure float32
+
+            # Convert RGB to grayscale if needed (using cv2 for consistency)
+            if img.ndim == 3 and img.shape[-1] == 3: # HWC format
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            elif img.ndim == 3 and img.shape[0] == 3: # CHW format
+                 img_hwc = img.transpose(1, 2, 0)
+                 img = cv2.cvtColor(img_hwc, cv2.COLOR_RGB2GRAY)
+            # Add check for HW1 format
+            elif img.ndim == 3 and img.shape[-1] == 1:
+                 img = img.squeeze(-1) # HW1 -> HW
+
+            # Final check: ensure img is 2D (HW)
+            if img.ndim != 2:
+                 # Handle error: maybe log, return None, or raise?
+                 print(f"Warning: Image at index {idx} has unexpected shape {img.shape} after processing. Returning None sample.")
+                 # Returning None might cause issues in DataLoader collation. Consider raising an error or returning a placeholder.
+                 # For now, let's raise an error to stop immediately.
+                 raise ValueError(f"Image at index {idx} has unexpected shape {img.shape} after processing.")
+
+        elif self.root_dir and 'image_path' in row_data:
+            # Load image from file path (keep existing logic)
+            img_name = os.path.join(self.root_dir, row_data['image_path'])
+            # Use cv2.imread to handle different formats, read as grayscale directly
+            img = cv2.imread(img_name, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                 raise FileNotFoundError(f"Could not read image file: {img_name}")
             img = img.astype(np.float32)
         else:
-            raise ValueError("DataFrame must contain either 'Image' column or 'image_path' column with root_dir specified.")
-            
-        # Ensure image is grayscale (single channel)
-        if img.ndim == 3:
-            if img.shape[-1] == 3: # HWC -> HW
-                img = cv2.cvtColor(img.astype(np.float32), cv2.COLOR_RGB2GRAY)
-            elif img.shape[0] == 3: # CHW -> HW
-                img = cv2.cvtColor(img.transpose(1, 2, 0).astype(np.float32), cv2.COLOR_RGB2GRAY)
-            elif img.shape[-1] == 1: # HW1 -> HW
-                img = img.squeeze(-1)
-            else:
-                raise ValueError(f"Unexpected image shape: {img.shape}")
-        elif img.ndim != 2:
-            raise ValueError(f"Unexpected image shape: {img.shape}")
+            raise ValueError(f"Row {idx} must contain either a valid 'Image' numpy array or an 'image_path' with root_dir specified.")
 
-        # Apply CLAHE if requested
+        # Apply CLAHE if requested (on the 2D grayscale image)
         if self.apply_clahe:
-            # Convert to uint8 for CLAHE
-            img_uint8 = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
+            # Ensure uint8 for CLAHE
+            img_uint8 = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit, tileGridSize=self.clahe_grid_size)
-            img = clahe.apply(img_uint8)
-            # Convert back to float32 (0-255 range is fine for normalization later)
-            img = img.astype(np.float32)
+            img_clahe = clahe.apply(img_uint8)
+            # Convert back to float32 (range 0-255)
+            img = img_clahe.astype(np.float32)
 
         # Extract landmarks
         landmarks = np.array([0.0, 0.0]) # Default placeholder
         if self.landmark_cols:
-            landmarks = self.dataframe.iloc[idx][self.landmark_cols].values
-            landmarks = landmarks.astype('float').reshape(-1, 2)
+            # Check if all landmark columns exist
+            missing_cols = [col for col in self.landmark_cols if col not in row_data]
+            if missing_cols:
+                raise KeyError(f"Missing landmark columns for index {idx}: {missing_cols}")
+            landmarks = row_data[self.landmark_cols].values.astype('float').reshape(-1, 2)
 
         # Create base sample dictionary
-        sample = {'image': img, 'landmarks': landmarks}
-        
+        sample = {'image': img, 'landmarks': landmarks} # img is now guaranteed 2D (HW) float32
+
         # Load and add depth map if requested
         if self.use_depth:
-             depth_map = self.dataframe.iloc[idx]['depth_map']
-             # Ensure depth map is loaded correctly and has the right shape (H, W)
-             if isinstance(depth_map, np.ndarray) and depth_map.shape == img.shape:
-                 sample['depth'] = depth_map.astype(np.float32)
+             depth_map_data = row_data.get('depth_map') # Use .get for safety
+             if isinstance(depth_map_data, np.ndarray) and depth_map_data.ndim == 2 and depth_map_data.shape == img.shape:
+                 sample['depth'] = depth_map_data.astype(np.float32) # Ensure float32
              else:
                  # Handle potential errors or provide a default depth map
-                 print(f"Warning: Invalid or missing depth map for index {idx}. Using zeros.")
+                 if depth_map_data is None:
+                      print(f"Warning: Depth map missing for index {idx}. Using zeros.")
+                 else:
+                      print(f"Warning: Invalid depth map (type: {type(depth_map_data)}, shape: {getattr(depth_map_data, 'shape', 'N/A')}) for index {idx}. Using zeros.")
                  sample['depth'] = np.zeros_like(img, dtype=np.float32)
-                 
+
         # Apply transforms
         if self.transform:
-            sample = self.transform(sample)
+            sample = self.transform(sample) # Transform expects HW image and HW depth
 
         return sample
 
