@@ -339,16 +339,34 @@ class DataProcessor:
         
         # Validate image data
         if 'Image' in self.df.columns:
-            # Check that all images have the expected format
+            # Check that all images have valid format (both grayscale and RGB)
             valid_images = []
             for idx, row in self.df.iterrows():
                 img_data = row['Image']
-                if isinstance(img_data, list) and len(img_data) == self.image_size[0] * self.image_size[1]:
-                    valid_images.append(True)
-                elif isinstance(img_data, np.ndarray) and img_data.shape[0] * img_data.shape[1] == self.image_size[0] * self.image_size[1]:
-                    valid_images.append(True)
-                else:
-                    valid_images.append(False)
+                is_valid = False
+                
+                # Check lists (flattened images)
+                if isinstance(img_data, list):
+                    list_len = len(img_data)
+                    expected_gray_len = self.image_size[0] * self.image_size[1]
+                    expected_rgb_len = expected_gray_len * 3
+                    
+                    # Accept both grayscale and RGB sizes
+                    if list_len == expected_gray_len or list_len == expected_rgb_len:
+                        is_valid = True
+                
+                # Check numpy arrays
+                elif isinstance(img_data, np.ndarray):
+                    # Accept 2D arrays (grayscale) matching image size
+                    if img_data.ndim == 2 and img_data.shape == self.image_size:
+                        is_valid = True
+                    # Accept 3D arrays (RGB or grayscale with channel) with correct spatial dims
+                    elif img_data.ndim == 3:
+                        if (img_data.shape[-2:] == self.image_size or  # HWC format
+                            img_data.shape[1:] == self.image_size):    # CHW format
+                            is_valid = True
+                
+                valid_images.append(is_valid)
             
             invalid_count = valid_images.count(False)
             if invalid_count > 0:

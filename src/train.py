@@ -19,10 +19,11 @@ class TrainTransform:
         self.base_transforms = base_transforms
         
     def __call__(self, sample):
-        # First apply augmentation
-        augmented = self.train_augmentations(sample)
+        # Apply augmentations first
+        sample = self.train_augmentations(sample)
         # Then apply base transforms (ToTensor, Normalize)
-        return self.base_transforms(augmented)
+        sample = self.base_transforms(sample)
+        return sample
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a landmark detection model')
