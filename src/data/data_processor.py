@@ -113,24 +113,30 @@ class DataProcessor:
 
         print("Generating depth features for dataset... This may take a while.")
         depth_maps = []
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="Generating Depth Maps"):
+        for index, row in tqdm(df.iterrows(), total=len(df), desc="Generating Depth Maps"):
             image_array = row['Image']
             
             # Ensure image_array is a numpy array
             if isinstance(image_array, list):
                 try:
-                    # Assuming flattened list matching self.image_size (e.g., 224*224)
-                    expected_len = self.image_size[0] * self.image_size[1]
-                    if len(image_array) == expected_len:
-                        image_array = np.array(image_array).reshape(self.image_size) # Keep original dtype for now
+                    list_len = len(image_array)
+                    expected_len_gray = self.image_size[0] * self.image_size[1]
+                    expected_len_rgb = expected_len_gray * 3
+
+                    if list_len == expected_len_gray:
+                        # Reshape grayscale list
+                        image_array = np.array(image_array).reshape(self.image_size)
+                    elif list_len == expected_len_rgb:
+                        # Reshape RGB list
+                        image_array = np.array(image_array).reshape((self.image_size[0], self.image_size[1], 3))
                     else:
-                        raise ValueError(f"List length {len(image_array)} does not match expected {expected_len}")
+                        raise ValueError(f"List length {list_len} does not match expected grayscale ({expected_len_gray}) or RGB ({expected_len_rgb})")
                 except ValueError as e:
-                    print(f"Warning: Skipping depth prediction for row index {_.name} due to image list conversion error: {e}")
+                    print(f"Warning: Skipping depth prediction for row index {index} due to image list conversion error: {e}")
                     depth_maps.append(None)
                     continue # Skip to next row
             elif not isinstance(image_array, np.ndarray):
-                print(f"Warning: Skipping depth prediction for row index {_.name} due to unexpected image data type: {type(image_array)}")
+                print(f"Warning: Skipping depth prediction for row index {index} due to unexpected image data type: {type(image_array)}")
                 depth_maps.append(None)
                 continue # Skip to next row
 
