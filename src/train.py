@@ -115,127 +115,43 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16, 
-                                        train_ratio=0.8, val_ratio=0.1, 
-                                        apply_clahe=True, root_dir=None, 
-                                        num_workers=4, balance_classes=False, use_depth=False):
+def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16, num_workers=0, use_depth=False):
     """
-    Create train, validation, and test DataLoaders with proper augmentations
+    Create PyTorch dataloaders with data augmentation for training
     
     Args:
-        df (pandas.DataFrame): DataFrame containing the dataset
+        df (pandas.DataFrame): DataFrame with training data
         landmark_cols (list): List of column names containing landmark coordinates
-        batch_size (int): Batch size for dataloaders
-        train_ratio (float): Ratio of data to use for training
-        val_ratio (float): Ratio of data to use for validation
-        apply_clahe (bool): Whether to apply CLAHE for histogram equalization
-        root_dir (str): Directory containing images (if images are stored as files)
+        batch_size (int): Batch size for dataloader
         num_workers (int): Number of worker threads for dataloader
-        balance_classes (bool): Whether to balance training data using skeletal classification
-        use_depth (bool): Whether to include depth map as an additional input feature
+        use_depth (bool): Whether to use depth features
         
     Returns:
         tuple: (train_loader, val_loader, test_loader)
     """
-    # If 'set' column is already present, use it for splitting
-    if 'set' in df.columns:
-        train_df = df[df['set'] == 'train'].copy()
-        val_df = df[df['set'] == 'dev'].copy()
-        test_df = df[df['set'] == 'test'].copy()
-    else:
-        # Randomly split the data
-        n = len(df)
-        indices = np.random.permutation(n)
-        
-        train_size = int(train_ratio * n)
-        val_size = int(val_ratio * n)
-        
-        train_indices = indices[:train_size]
-        val_indices = indices[train_size:train_size + val_size]
-        test_indices = indices[train_size + val_size:]
-        
-        train_df = df.iloc[train_indices].copy()
-        val_df = df.iloc[val_indices].copy()
-        test_df = df.iloc[test_indices].copy()
-    
-    # Display original class distribution before balancing
-    if balance_classes and 'skeletal_class' in df.columns:
-        # Count classes in original training data
-        if 'skeletal_class' in train_df.columns:
-            train_class_counts = train_df['skeletal_class'].value_counts().sort_index()
-            print("Original training class distribution:")
-            for label, count in train_class_counts.items():
-                class_name = {1: "Class I", 2: "Class II", 3: "Class III"}.get(label, f"Class {label}")
-                print(f"  {class_name}: {count} samples ({count/len(train_df)*100:.1f}%)")
-    
-    # Balance ONLY the training data if requested
-    if balance_classes:
-        # First, make sure we have skeletal class information
-        if 'skeletal_class' not in train_df.columns:
-            print("Computing skeletal classifications for the training set...")
-            from data.patient_classifier import PatientClassifier
-            classifier = PatientClassifier(landmark_cols)
-            train_df = classifier.classify_patients(train_df)
-        
-        # Now balance the training data
-        print("Balancing training data using skeletal classification...")
-        from data.patient_classifier import PatientClassifier
-        classifier = PatientClassifier(landmark_cols)
-        train_df = classifier.balance_classes(train_df, class_column='skeletal_class', balance_method='upsample')
-        print(f"Balanced training data: {len(train_df)} samples")
-        
-        # Show balanced distribution
-        if 'skeletal_class' in train_df.columns:
-            train_class_counts = train_df['skeletal_class'].value_counts().sort_index()
-            print("Balanced training class distribution:")
-            for label, count in train_class_counts.items():
-                class_name = {1: "Class I", 2: "Class II", 3: "Class III"}.get(label, f"Class {label}")
-                print(f"  {class_name}: {count} samples ({count/len(train_df)*100:.1f}%)")
-    
-    # Define data transformations (non-augmentation)
-    base_transforms = transforms.Compose([
-        ToTensor(),
-        Normalize()
-    ])
-    
-    # Training transformations with augmentations
-    train_augmentations = get_train_transforms(include_horizontal_flip=False)
-    
-    # Create custom transform that applies augmentations before tensor conversion
-    train_transform = TrainTransform(train_augmentations, base_transforms)
-    
-    # Create datasets
-    train_dataset = CephalometricDataset(
-        train_df, root_dir=root_dir, transform=train_transform, 
-        landmark_cols=landmark_cols, train=True, apply_clahe=apply_clahe, use_depth=use_depth
+    # Create dataloaders with a specific train/val/test split
+    data_processor = DataProcessor(
+        data_path=None,  # Use None since we're passing the DataFrame directly
+        landmark_cols=landmark_cols,
+        image_size=(224, 224),
+        apply_clahe=args.apply_clahe
     )
     
-    val_dataset = CephalometricDataset(
-        val_df, root_dir=root_dir, transform=base_transforms, 
-        landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe, use_depth=use_depth
-    )
-    
-    test_dataset = CephalometricDataset(
-        test_df, root_dir=root_dir, transform=base_transforms, 
-        landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe, use_depth=use_depth
-    )
+    # If df is provided, use it directly
+    if df is not None:
+        data_processor.df = df
     
     # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, 
-        num_workers=num_workers, pin_memory=True
+    train_loader, val_loader, test_loader = data_processor.create_data_loaders(
+        batch_size=batch_size,
+        train_ratio=0.8,  # 80% for training
+        val_ratio=0.1,    # 10% for validation
+        num_workers=num_workers,
+        balance_classes=False,  # We assume dataset is already balanced or will be handled separately
+        use_depth=use_depth       # Pass the use_depth flag to create_data_loaders
     )
     
-    val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, 
-        num_workers=num_workers, pin_memory=True
-    )
-    
-    test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, 
-        num_workers=num_workers, pin_memory=True
-    )
-    
+    # Return the dataloaders
     return train_loader, val_loader, test_loader
 
 def main():
@@ -318,13 +234,8 @@ def main():
         df=df,
         landmark_cols=landmark_cols,
         batch_size=args.batch_size,
-        train_ratio=0.8,
-        val_ratio=0.1,
-        apply_clahe=args.apply_clahe,
-        root_dir=None,
         num_workers=args.num_workers,
-        balance_classes=args.balance_classes,  # Only the training set will be balanced
-        use_depth=args.use_depth # Pass use_depth flag
+        use_depth=args.use_depth
     )
     
     print(f"Created data loaders:")

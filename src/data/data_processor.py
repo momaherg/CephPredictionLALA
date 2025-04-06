@@ -376,7 +376,7 @@ class DataProcessor:
         
         return self.df
     
-    def create_data_loaders(self, batch_size=32, train_ratio=0.8, val_ratio=0.1, num_workers=4, root_dir=None, balance_classes=False):
+    def create_data_loaders(self, batch_size=32, train_ratio=0.8, val_ratio=0.1, num_workers=4, root_dir=None, balance_classes=False, use_depth=False):
         """
         Create data loaders for training, validation, and testing
         
@@ -387,6 +387,7 @@ class DataProcessor:
             num_workers (int): Number of worker threads for data loading
             root_dir (str): Directory containing image files (if images are stored as files)
             balance_classes (bool): Whether to balance classes based on skeletal classification
+            use_depth (bool): Whether to include depth maps in the input features
             
         Returns:
             tuple: (train_loader, val_loader, test_loader)
@@ -403,7 +404,8 @@ class DataProcessor:
             val_ratio=val_ratio,
             apply_clahe=self.apply_clahe,
             root_dir=root_dir,
-            num_workers=num_workers
+            num_workers=num_workers,
+            use_depth=use_depth  # Pass use_depth parameter
         )
         
         return train_loader, val_loader, test_loader

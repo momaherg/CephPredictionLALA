@@ -228,28 +228,31 @@ if USE_DEPTH_FEATURES:
 # 4. Create PyTorch DataLoaders for model training and evaluation
 
 # %%
-# Define a class for training transforms that can be pickled
-class TrainTransform:
-    def __init__(self, train_augmentations, base_transforms):
-        self.train_augmentations = train_augmentations
-        self.base_transforms = base_transforms
-        
-    def __call__(self, sample):
-        # First apply augmentation
-        augmented = self.train_augmentations(sample)
-        # Then apply base transforms (ToTensor, Normalize)
-        return self.base_transforms(augmented)
+# Load train transformations/augmentations
 
-# Define data transformations
+# Augmentations class that respects landmarks
+train_augmentations = get_train_transforms(include_horizontal_flip=False)
+
+# Create train transform that applies augmentations before tensor conversion
 base_transforms = transforms.Compose([
     ToTensor(),
     Normalize()
 ])
 
-# Get training transformations with augmentations
-train_augmentations = get_train_transforms(include_horizontal_flip=False)
+# Define custom training transform class
+class TrainTransform:
+    def __init__(self, train_augmentations, base_transforms):
+        self.train_augmentations = train_augmentations
+        self.base_transforms = base_transforms
+    
+    def __call__(self, sample):
+        # Apply augmentations first
+        sample = self.train_augmentations(sample)
+        # Then apply base transformations (ToTensor, Normalize)
+        sample = self.base_transforms(sample)
+        return sample
 
-# Create custom transform for training
+# Create transform instance
 train_transform = TrainTransform(train_augmentations, base_transforms)
 
 # Split data into train, val, test
