@@ -58,10 +58,14 @@ class CephalometricDataset(Dataset):
                 expected_gray_len = 224 * 224
                 expected_rgb_len = expected_gray_len * 3
                 
-                if list_len == expected_gray_len:
+                # Allow for small variations in expected sizes
+                is_gray = abs(list_len - expected_gray_len) < 10  # Allow small tolerance
+                is_rgb = abs(list_len - expected_rgb_len) < 10    # Allow small tolerance
+                
+                if is_gray:
                     # Grayscale flattened list
                     img = np.array(img_data).reshape((224, 224)).astype(np.float32)
-                elif list_len == expected_rgb_len:
+                elif is_rgb or list_len == 150528:  # Check for RGB, including explicit check for 150528
                     # RGB flattened list
                     img = np.array(img_data).reshape((224, 224, 3)).astype(np.float32)
                     # Convert RGB to grayscale before continuing
