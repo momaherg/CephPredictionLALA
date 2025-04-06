@@ -47,84 +47,41 @@ class CephalometricDataset(Dataset):
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
-
-        # Load image
-        img_data = self.dataframe.iloc[idx]['Image']
-        depth_data = self.dataframe.iloc[idx]['depth_map'] if self.use_depth and 'depth_map' in self.dataframe.columns else None
-
-        # Handle image data loading (from list or numpy array)
-        img = None
-        if isinstance(img_data, list):
-            try:
-                np_array_flat = np.array(img_data)
-                list_len = np_array_flat.size
-                expected_len_gray = 224 * 224 # Assuming fixed size for now
-                expected_len_rgb = expected_len_gray * 3
-
-                if list_len == expected_len_gray:
-                    img = np_array_flat.reshape((224, 224)).astype(np.float32)
-                elif list_len == expected_len_rgb:
-                    # Reshape and potentially convert to grayscale if needed later, or handle 3 channels
-                    img = np_array_flat.reshape((224, 224, 3)).astype(np.float32)
-                    # If grayscale is always expected later, convert here:
-                    # img = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140]).astype(np.float32)
-                else:
-                     raise ValueError(f"List length {list_len} doesn't match expected gray {expected_len_gray} or RGB {expected_len_rgb}")
-            except ValueError as e:
-                 print(f"Error reshaping image list at index {idx}: {e}")
-                 # Handle error: return None or raise, depending on desired behavior
-                 # For now, let's return None to indicate failure for this sample
-                 return None # Or raise an exception
-        elif isinstance(img_data, np.ndarray):
-            img = img_data.astype(np.float32)
-        else:
-            # Handle unexpected data type
-            print(f"Warning: Unexpected image data type at index {idx}: {type(img_data)}")
-            return None # Indicate failure
-
-        # If the loaded image is RGB but we expect Grayscale later, convert it
-        # (Common if transforms expect single channel input)
-        if img is not None and img.ndim == 3 and img.shape[2] == 3:
-            # Example: Convert RGB to Grayscale using standard weights
-            img = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140]) 
-            # Ensure it's back to (H, W) shape
-            img = img.reshape((224, 224)).astype(np.float32)
-
-        # Ensure image is 2D (H, W) before applying CLAHE/transforms expecting grayscale
-        if img is not None and img.ndim != 2:
-             print(f"Warning: Image at index {idx} is not 2D (shape: {img.shape}) after initial load/conversion. Skipping.")
-             return None # Indicate failure
+        
+        row = self.dataframe.iloc[idx]
+        img_data = row['Image']
+        landmarks = row[self.landmark_cols].values.astype('float').reshape(-1, 2)
+        
+        # --- Simplified Image Loading ---
+        # Assume img_data is always a 2D numpy array (H, W) with dtype float32
+        if not isinstance(img_data, np.ndarray) or img_data.ndim != 2:
+            raise TypeError(f"Unexpected image data type or shape at index {idx}. Expected 2D numpy array, got {type(img_data)} with shape {getattr(img_data, 'shape', 'N/A')}.")
+        
+        img = img_data.astype(np.float32) # Ensure float32 just in case
+        # -----------------------------
 
         # Apply CLAHE if requested
         if self.apply_clahe:
             # Convert to uint8 for CLAHE
             img_uint8 = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
+            # Create CLAHE object on-the-fly
             clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit, tileGridSize=self.clahe_grid_size)
-            img = clahe.apply(img_uint8)
-            # Convert back to float32 (0-255 range is fine for normalization later)
-            img = img.astype(np.float32)
+            img_uint8 = clahe.apply(img_uint8)
+            # Convert back to float32
+            img = img_uint8.astype(np.float32) / 255.0
 
-        # Extract landmarks
-        landmarks = np.array([0.0, 0.0]) # Default placeholder
-        if self.landmark_cols:
-            landmarks = self.dataframe.iloc[idx][self.landmark_cols].values
-            landmarks = landmarks.astype('float').reshape(-1, 2)
-
-        # Create base sample dictionary
         sample = {'image': img, 'landmarks': landmarks}
-        
-        # Load and add depth map if requested
+
+        # Add depth map if requested and available
         if self.use_depth:
-             depth_map = depth_data
-             # Ensure depth map is loaded correctly and has the right shape (H, W)
-             if isinstance(depth_map, np.ndarray) and depth_map.shape == img.shape:
-                 sample['depth'] = depth_map.astype(np.float32)
-             else:
-                 # Handle potential errors or provide a default depth map
-                 print(f"Warning: Invalid or missing depth map for index {idx}. Using zeros.")
-                 sample['depth'] = np.zeros_like(img, dtype=np.float32)
-                 
-        # Apply transforms
+            depth_data = row.get('depth_map', None)
+            if isinstance(depth_data, np.ndarray) and depth_data.ndim == 2 and depth_data.shape == img.shape:
+                sample['depth'] = depth_data.astype(np.float32) # Ensure float32
+            else:
+                # Handle missing/invalid depth map (e.g., add zeros or raise error)
+                print(f"Warning: Missing or invalid depth map for index {idx}. Using zeros.")
+                sample['depth'] = np.zeros_like(img, dtype=np.float32)
+
         if self.transform:
             sample = self.transform(sample)
 

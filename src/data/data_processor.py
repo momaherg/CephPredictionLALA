@@ -149,6 +149,7 @@ class DataProcessor:
 
         print(f"Generating depth features using batch size {self.depth_batch_size}...")
         all_depth_maps = [None] * len(df) # Pre-allocate list for results
+        all_processed_images = [None] * len(df) # Pre-allocate list for processed images
         image_batch_for_depth = [] # Store prepared PIL images for batching
         batch_indices = [] # Store original indices for placing results
         
@@ -159,9 +160,10 @@ class DataProcessor:
         
         for index, row in tqdm(df.iterrows(), total=len(df), desc="Preparing Images for Depth"):
             image_data = row['Image']
-            image_array = None
+            image_array = None # Processed 2D Grayscale array
+            image_array_for_depth = None # Prepared HWC uint8 array for depth model
             
-            # --- Image Data Conversion (remains mostly the same) ---
+            # --- Image Data Conversion --- 
             try:
                 if isinstance(image_data, list):
                     # --- Debugging Start ---
@@ -196,38 +198,53 @@ class DataProcessor:
                 else:
                     raise TypeError(f"Unexpected image data type: {type(image_data)}")
                     
+                # Convert to 2D Grayscale Float32 for storage
+                if image_array.ndim == 3:
+                     if image_array.shape[-1] == 3: # HWC
+                          # Simple average for grayscale conversion
+                          image_array = np.mean(image_array, axis=2)
+                     elif image_array.shape[0] == 3: # CHW
+                          image_array = np.mean(image_array, axis=0)
+                     elif image_array.shape[-1] == 1: # HW1
+                           image_array = image_array.squeeze(axis=-1)
+                     else: 
+                          raise ValueError(f"Cannot convert 3D array with shape {image_array.shape} to grayscale.")
+                
+                # Ensure 2D
+                if image_array.ndim != 2:
+                     raise ValueError(f"Converted image is not 2D (shape: {image_array.shape})")
+                     
+                # Ensure Float32
+                if image_array.dtype != np.float32:
+                     image_array = image_array.astype(np.float32)
+                     
+                # --- Store the processed 2D image ---
+                all_processed_images[df.index.get_loc(index)] = image_array
+                # -------------------------------------
+                    
             except (ValueError, TypeError) as e:
                 print(f"Warning: Skipping depth preparation for row index {index} due to image data conversion error: {e}")
-                # Note: No depth_maps.append here, handled by pre-allocation
+                # Ensure None is stored if conversion fails
+                all_processed_images[df.index.get_loc(index)] = None 
+                all_depth_maps[df.index.get_loc(index)] = None # Also skip depth
                 continue 
             # --- End Image Data Conversion ---
             
-            # --- Image Preparation for Depth Model (remains mostly the same) ---
-            image_array_hwc = None
+            # --- Image Preparation for Depth Model ---
+            # Use the *stored* 2D float32 image_array as the starting point
             try: 
-                # Ensure image is in HWC uint8 format
-                if image_array.ndim == 2: # Grayscale -> HWC
-                     image_array_hwc = np.stack([image_array]*3, axis=-1)
-                elif image_array.ndim == 3 and image_array.shape[0] == 3: # CHW -> HWC
-                     image_array_hwc = image_array.transpose(1, 2, 0)
-                elif image_array.ndim == 3 and image_array.shape[-1] == 1: # HW1 -> HWC
-                    image_array_hwc = np.concatenate([image_array]*3, axis=-1)
-                elif image_array.ndim == 3 and image_array.shape[-1] == 3: # Already HWC
-                    image_array_hwc = image_array
+                # Ensure HWC uint8 format from the 2D float32 array
+                image_array_hwc = np.stack([image_array]*3, axis=-1) # Convert 2D grayscale to HWC
+                
+                # Scale and convert to uint8
+                if image_array_hwc.max() <= 1.0 and image_array_hwc.min() >= 0.0:
+                     image_array_hwc = (image_array_hwc * 255).astype(np.uint8)
+                elif image_array_hwc.max() > 1.0:
+                     image_array_hwc = image_array_hwc.astype(np.uint8)
                 else:
-                    raise ValueError(f"Unexpected image shape {image_array.shape} after conversion")
+                     raise ValueError(f"Cannot reliably convert grayscale range [{image_array.min()}, {image_array.max()}] to uint8")
                 
-                # Ensure uint8, scale if necessary (assuming input range 0-1 or 0-255)
-                if image_array_hwc.dtype != np.uint8:
-                    if image_array_hwc.max() <= 1.0 and image_array_hwc.min() >= 0.0:
-                        image_array_hwc = (image_array_hwc * 255).astype(np.uint8)
-                    elif image_array_hwc.max() > 1.0: # Assume already 0-255 range if max > 1
-                         image_array_hwc = image_array_hwc.astype(np.uint8)
-                    # Handle other cases or raise error if range is unexpected
-                    else:
-                        raise ValueError(f"Cannot reliably convert dtype {image_array_hwc.dtype} with range [{image_array_hwc.min()}, {image_array_hwc.max()}] to uint8")
-                
-                # --- Pre-Prediction Validation ---
+                # --- Pre-Prediction Validation (remains the same) ---
                 if not isinstance(image_array_hwc, np.ndarray):
                      raise TypeError(f"image_array_hwc is not a numpy array (type: {type(image_array_hwc)})")
                 if image_array_hwc.shape != (self.image_size[0], self.image_size[1], 3):
@@ -238,10 +255,11 @@ class DataProcessor:
                 
             except (ValueError, TypeError) as e:
                  print(f"Warning: Skipping depth preparation for row index {index} due to image preparation error: {e}")
+                 all_depth_maps[df.index.get_loc(index)] = None # Skip depth if preparation fails
                  continue
             # --- End: Image Preparation ---
 
-            # --- Batching Logic ---
+            # --- Batching Logic (uses image_array_hwc) ---
             try:
                 # Convert prepared HWC uint8 numpy array to PIL Image
                 image_pil = Image.fromarray(image_array_hwc)
@@ -283,14 +301,19 @@ class DataProcessor:
                 # Clear the batch for the next iteration
                 image_batch_for_depth = []
                 batch_indices = []
-        # --- End Batching Logic ---
+        # --- End Loop ---
         
+        # --- Assign results back to DataFrame ---
+        df['Image'] = all_processed_images
         df['depth_map'] = all_depth_maps
-        # Optional: Drop rows where depth prediction failed
+        # ----------------------------------------
+        
+        # Optional: Drop rows where depth prediction or image processing failed
         initial_len = len(df)
-        df = df.dropna(subset=['depth_map'])
+        # Drop rows where EITHER image processing OR depth prediction failed
+        df = df.dropna(subset=['Image', 'depth_map'])
         if len(df) < initial_len:
-            print(f"Warning: Dropped {initial_len - len(df)} rows due to depth prediction errors.")
+            print(f"Warning: Dropped {initial_len - len(df)} rows due to image processing or depth prediction errors.")
             
         print("Depth features generated and added.")
         return df
