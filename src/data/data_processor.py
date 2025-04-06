@@ -202,11 +202,7 @@ class DataProcessor:
                 continue 
             # --- End Image Data Conversion ---
             
-            # --- Store the converted NumPy array back into the DataFrame ---
-            df.loc[index, 'Image'] = image_array
-            # -------------------------------------------------------------
-
-            # --- Start: Image Preparation for Depth Model ---
+            # --- Image Preparation for Depth Model (remains mostly the same) ---
             image_array_hwc = None
             try: 
                 # Ensure image is in HWC uint8 format

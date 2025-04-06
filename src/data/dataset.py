@@ -45,70 +45,101 @@ class CephalometricDataset(Dataset):
         return len(self.dataframe)
 
     def __getitem__(self, idx):
+        '''Return a single sample from the dataset'''
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
+        # Get row from dataframe
         row = self.dataframe.iloc[idx]
-        
-        # --- Image Loading --- 
         img_data = row['Image']
-        if isinstance(img_data, np.ndarray):
+        
+        # Process image data
+        if isinstance(img_data, list):
+            # Check if it's RGB or grayscale based on list length
+            list_len = len(img_data)
+            expected_gray_len = 224 * 224  # Assuming fixed 224x224 size
+            expected_rgb_len = expected_gray_len * 3
+            
+            if list_len == expected_gray_len:
+                # Grayscale image
+                img = np.array(img_data).reshape((224, 224)).astype(np.float32)
+            elif list_len == expected_rgb_len:
+                # RGB image
+                img = np.array(img_data).reshape((224, 224, 3)).astype(np.float32)
+            else:
+                raise ValueError(f"Cannot reshape list of length {list_len}, expected {expected_gray_len} or {expected_rgb_len}")
+        elif isinstance(img_data, np.ndarray):
             img = img_data.astype(np.float32)
         else:
-             # This should ideally not happen if DataProcessor ran correctly
-             # You might want to log a more specific error or handle list conversion again
-             # For now, raise an error if it's not an ndarray as expected.
-             raise TypeError(f"Expected 'Image' column to contain numpy arrays, but got {type(img_data)} at index {idx}")
-             
-        # --- Landmark Loading ---
-        landmarks = row[self.landmark_cols].values.astype('float32').reshape(-1, 2)
-        
-        # --- Depth Map Loading (if applicable) ---
-        depth_map = None
-        if self.use_depth:
-            depth_data = row.get('depth_map', None) # Use .get for safety
-            if isinstance(depth_data, np.ndarray):
-                 # Ensure depth is float32 and has shape (H, W) - add channel dim later if needed by transforms
-                 depth_map = depth_data.astype(np.float32)
-                 if depth_map.ndim == 3: # Handle cases where it might have an unnecessary channel dim
-                     depth_map = depth_map.squeeze()
-                 if depth_map.shape != (img.shape[0], img.shape[1]): # Check shape consistency with image H,W
-                      raise ValueError(f"Depth map at index {idx} has shape {depth_map.shape}, expected {(img.shape[0], img.shape[1])}")
-            elif depth_data is not None:
-                 raise TypeError(f"Expected 'depth_map' column to contain numpy arrays, but got {type(depth_data)} at index {idx}")
-            # If depth_data is None, depth_map remains None
+            raise TypeError(f"Unexpected image data type: {type(img_data)}")
+            
+        # Convert to grayscale ONLY if not using depth features - keep RGB if using depth
+        if not self.use_depth:
+            # Ensure image is grayscale (single channel)
+            if img.ndim == 3:
+                if img.shape[-1] == 3: # HWC -> HW
+                    img = color.rgb2gray(img)
+                elif img.shape[0] == 3: # CHW -> HW
+                    img = img[0, :, :]
+                elif img.shape[-1] == 1: # HW1 -> HW
+                    img = img.squeeze(-1)
+                else:
+                    raise ValueError(f"Unexpected image shape: {img.shape}")
+            elif img.ndim != 2:
+                raise ValueError(f"Unexpected image shape: {img.shape}")
+        else:
+            # When using depth, ensure HWC format for RGB or grayscale
+            if img.ndim == 2:  # If grayscale, add channel dim
+                img = img[:, :, np.newaxis]
+            elif img.ndim == 3 and img.shape[0] == 3:  # If CHW, convert to HWC
+                img = img.transpose(1, 2, 0)
+            # Now img should be (H, W, 1) for grayscale or (H, W, 3) for RGB
 
-        # --- Apply CLAHE if requested (only to image) ---
+        # Apply CLAHE if requested (only to grayscale or first channel of RGB)
         if self.apply_clahe:
-             # Ensure image is uint8 for CLAHE
-             if img.dtype != np.uint8:
-                 # Scale if float 0-1 range
-                 if img.max() <= 1.0 and img.min() >= 0.0:
-                      img = (img * 255).astype(np.uint8)
-                 else: # Assume 0-255 range otherwise
-                      img = img.astype(np.uint8)
-                      
-             # Apply CLAHE to grayscale version if RGB
-             if img.ndim == 3 and img.shape[-1] == 3:
-                 img_gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-                 clahe_img = self._create_clahe().apply(img_gray)
-                 img = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB) # Convert back to 3 channels
-             elif img.ndim == 2: # Apply directly if grayscale
-                 img = self._create_clahe().apply(img)
-             else:
-                 print(f"Warning: Skipping CLAHE for unexpected image shape {img.shape} at index {idx}")
-                 # Ensure img is float32 again if CLAHE wasn't applied as expected
-                 img = img.astype(np.float32) / 255.0 if img.dtype == np.uint8 else img.astype(np.float32)
-                 
-             # Convert back to float32 (0-1 range) after CLAHE
-             img = img.astype(np.float32) / 255.0
-        
-        # --- Prepare Sample Dictionary ---
+            # Create CLAHE on demand (no more instance attribute)
+            clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit, tileGridSize=self.clahe_grid_size)
+            
+            if img.ndim == 2 or (img.ndim == 3 and img.shape[2] == 1):
+                # Grayscale image or single channel
+                img_to_process = img if img.ndim == 2 else img[:, :, 0]
+                # Convert to uint8 for CLAHE
+                img_uint8 = (img_to_process * 255).astype(np.uint8) if img_to_process.max() <= 1.0 else img_to_process.astype(np.uint8)
+                processed = clahe.apply(img_uint8).astype(np.float32)
+                
+                if img.ndim == 2:
+                    img = processed
+                else:
+                    img[:, :, 0] = processed
+            elif img.ndim == 3 and img.shape[2] == 3:
+                # RGB image - apply CLAHE to each channel separately
+                for c in range(3):
+                    channel = img[:, :, c]
+                    img_uint8 = (channel * 255).astype(np.uint8) if channel.max() <= 1.0 else channel.astype(np.uint8)
+                    img[:, :, c] = clahe.apply(img_uint8).astype(np.float32)
+
+        # Extract landmarks
+        landmarks = np.array([0.0, 0.0]) # Default placeholder
+        if self.landmark_cols:
+            landmarks = row[self.landmark_cols].values
+            landmarks = landmarks.astype('float').reshape(-1, 2)
+
+        # Create base sample dictionary
         sample = {'image': img, 'landmarks': landmarks}
-        if self.use_depth and depth_map is not None:
-             sample['depth'] = depth_map # Add depth map if available
         
-        # --- Apply Transforms --- 
+        # Load and add depth map if requested
+        if self.use_depth:
+            depth_map = row['depth_map']
+            # Ensure depth map is loaded correctly (should be (224, 224) shape)
+            if isinstance(depth_map, np.ndarray) and depth_map.ndim == 2:
+                sample['depth'] = depth_map.astype(np.float32)
+            else:
+                # Handle potential errors or provide a default depth map
+                print(f"Warning: Invalid or missing depth map for index {idx}. Using zeros.")
+                # Create zero depth map of appropriate shape
+                sample['depth'] = np.zeros((224, 224), dtype=np.float32)
+                 
+        # Apply transforms
         if self.transform:
             sample = self.transform(sample)
 
@@ -121,36 +152,49 @@ class ToTensor:
         image, landmarks = sample['image'], sample['landmarks']
         depth = sample.get('depth') # Get depth if exists
 
-        # Handle image:
-        # Ensure image is HWC if it has 3 dims (e.g., after some OpenCV ops)
-        if image.ndim == 3 and image.shape[0] == 3:
-            image = image.transpose((1, 2, 0)) # CHW to HWC
-        elif image.ndim == 2:
-            # Add channel dimension for grayscale image
-            image = image[:, :, np.newaxis]
-            
-        # Handle depth map:
+        # Handle different image formats with and without depth
         if depth is not None:
-             if depth.ndim == 2:
-                 depth = depth[:, :, np.newaxis] # Add channel dim
-             # Concatenate image and depth along the channel axis (C)
-             # Ensure image and depth are compatible (e.g., grayscale image + depth)
-             if image.shape[-1] == 1 and depth.shape[-1] == 1:
-                 image = np.concatenate((image, depth), axis=2) # Now image is H, W, 2
-             else:
-                 print(f"Warning: Image shape {image.shape} or depth shape {depth.shape} not suitable for concatenation. Using image only.")
-                 # Fallback: only use image if concatenation is not straightforward
-                 if image.shape[-1] != 1:
-                      print("Warning: Image has more than 1 channel, cannot combine with depth. Using first channel.")
-                      image = image[:,:,0:1]
-        elif image.shape[-1] != 1: # Ensure image has only 1 channel if no depth
-             print(f"Warning: No depth map, but image has shape {image.shape}. Using first channel.")
-             image = image[:,:,0:1]
-
-        # Transpose C x H x W for PyTorch
-        # Image shape is now (H, W, C) where C=1 (grayscale) or C=2 (grayscale+depth)
-        image = image.transpose((2, 0, 1))
-        image_tensor = torch.from_numpy(image)
+            # Case 1: Image with depth
+            
+            # Ensure image is in HWC format
+            if image.ndim == 3 and image.shape[0] == 3:  # CHW format
+                image = image.transpose((1, 2, 0))
+            elif image.ndim == 2:  # HW format (grayscale)
+                image = image[:, :, np.newaxis]  # Add channel dim -> HWC
+                
+            # Ensure depth is in HW format
+            if depth.ndim == 3:
+                depth = depth.squeeze()  # Remove any singleton dimensions
+            
+            # Add channel dimension to depth map
+            depth = depth[:, :, np.newaxis]
+            
+            # RGB+depth case: stack RGB channels and depth channel
+            if image.shape[2] == 3:
+                # Concatenate R,G,B,D channels -> RGBD (4 channels)
+                combined = np.concatenate([image, depth], axis=2)
+            else:
+                # Concatenate grayscale and depth -> 2 channels
+                combined = np.concatenate([image, depth], axis=2)
+                
+            # Convert to PyTorch tensor with channels first (C,H,W)
+            combined = combined.transpose((2, 0, 1))
+            image_tensor = torch.from_numpy(combined)
+            
+        else:
+            # Case 2: Image without depth
+            
+            # For grayscale: ensure single channel format (C,H,W)
+            if image.ndim == 2:  # HW -> CHW
+                image = image[np.newaxis, :, :]  # Add channel dim at front
+            elif image.ndim == 3:
+                if image.shape[2] == 3 or image.shape[2] == 1:  # HWC -> CHW
+                    image = image.transpose((2, 0, 1))
+                # else assume already CHW format
+                
+            image_tensor = torch.from_numpy(image)
+            
+        # Convert landmarks to tensor
         landmarks_tensor = torch.from_numpy(landmarks)
 
         return {'image': image_tensor, 'landmarks': landmarks_tensor}
@@ -158,40 +202,53 @@ class ToTensor:
 
 class Normalize:
     """Normalize image tensor (and optionally depth channel)."""
-    # Default mean/std for grayscale images. Add values for depth channel if present.
-    def __init__(self, mean=(0.485,), std=(0.229,)): # Default for 1 channel (grayscale)
+    def __init__(self, mean=(0.485,), std=(0.229,)):
+        """
+        Initialize normalizer with appropriate mean/std values.
+        
+        Args:
+            mean: Mean values for RGB or grayscale channels
+            std: Std values for RGB or grayscale channels
+        """
         # Ensure mean and std are tuples or lists
         self.mean = mean if isinstance(mean, (list, tuple)) else (mean,)
         self.std = std if isinstance(std, (list, tuple)) else (std,)
         
-        # Expected mean/std for depth (normalized 0-1)
-        self.depth_mean = [0.5] 
-        self.depth_std = [0.5]  
+        # Default values for different channel configurations
+        self.rgb_mean = [0.485, 0.456, 0.406]  # ImageNet RGB means
+        self.rgb_std = [0.229, 0.224, 0.225]   # ImageNet RGB stds
+        self.depth_mean = [0.5]                # Centered depth mean
+        self.depth_std = [0.5]                 # Centered depth std
 
     def __call__(self, sample):
         image, landmarks = sample['image'], sample['landmarks']
         num_channels = image.shape[0]
         
         # Prepare mean and std tensors based on number of channels
-        if num_channels == 1: # Grayscale only
-            mean = torch.tensor(self.mean).view(-1, 1, 1)
-            std = torch.tensor(self.std).view(-1, 1, 1)
-        elif num_channels == 2: # Grayscale + Depth
-            mean = torch.tensor(list(self.mean) + self.depth_mean).view(-1, 1, 1)
-            std = torch.tensor(list(self.std) + self.depth_std).view(-1, 1, 1)
-        # Add case for 4 channels if RGB + Depth is used later
-        # elif num_channels == 4: # RGB + Depth
-        #     mean = torch.tensor(list(self.mean) + self.depth_mean).view(-1, 1, 1)
-        #     std = torch.tensor(list(self.std) + self.depth_std).view(-1, 1, 1)
+        if num_channels == 1:  # Grayscale only (1 channel)
+            mean = torch.tensor(self.mean[:1]).view(-1, 1, 1)
+            std = torch.tensor(self.std[:1]).view(-1, 1, 1)
+        elif num_channels == 2:  # Grayscale + Depth (2 channels)
+            # First channel: grayscale, Second channel: depth
+            mean = torch.tensor([self.mean[0]] + self.depth_mean).view(-1, 1, 1)
+            std = torch.tensor([self.std[0]] + self.depth_std).view(-1, 1, 1)
+        elif num_channels == 3:  # RGB only (3 channels)
+            # Use RGB normalization values
+            mean = torch.tensor(self.rgb_mean).view(-1, 1, 1)
+            std = torch.tensor(self.rgb_std).view(-1, 1, 1)
+        elif num_channels == 4:  # RGB + Depth (4 channels)
+            # First 3 channels: RGB, Fourth channel: depth
+            mean = torch.tensor(self.rgb_mean + self.depth_mean).view(-1, 1, 1)
+            std = torch.tensor(self.rgb_std + self.depth_std).view(-1, 1, 1)
         else:
-            raise ValueError(f"Normalize expects 1 or 2 channels, but got {num_channels}")
+            raise ValueError(f"Normalize expects 1-4 channels, but got {num_channels}")
             
         # Ensure tensors are on the same device and dtype
         mean = mean.to(image.device).type(image.dtype)
         std = std.to(image.device).type(image.dtype)
 
         # Apply normalization
-        image = (image - mean) / (std + 1e-8) # Add epsilon for stability
+        image = (image - mean) / (std + 1e-8)  # Add epsilon for stability
 
         return {'image': image, 'landmarks': landmarks}
 
