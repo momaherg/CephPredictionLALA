@@ -113,13 +113,11 @@ class HRNet(nn.Module):
     
     Supports different HRNet variants (W32, W48, etc.)
     """
-    def __init__(self, pretrained=True, hrnet_type='w32', input_channels=3):
+    def __init__(self, pretrained=True, hrnet_type='w32'):
         super(HRNet, self).__init__()
         
-        self.input_channels = input_channels
-        
         # Load pretrained HRNet model
-        if pretrained and input_channels == 3:  # Only use pretrained model for RGB inputs
+        if pretrained:
             try:
                 if not TIMM_AVAILABLE:
                     raise ImportError("timm package is not installed")
@@ -135,14 +133,14 @@ class HRNet(nn.Module):
                 print("To fix this issue, install timm: pip install timm")
                 self.backbone = self._create_simplified_backbone()
         else:
-            # Use simplified backbone if pretrained is not required or if using custom input channels
+            # Use simplified backbone if pretrained is not required
             self.backbone = self._create_simplified_backbone()
     
     def _create_simplified_backbone(self):
         # Simplified backbone as a placeholder
         # In practice, this would be a full implementation of HRNet
         backbone = nn.Sequential(
-            nn.Conv2d(self.input_channels, 64, 3, 2, 1),
+            nn.Conv2d(3, 64, 3, 2, 1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, 3, 2, 1),
@@ -157,90 +155,6 @@ class HRNet(nn.Module):
     def forward(self, x):
         # Just return whatever the backbone outputs - we'll handle it in LandmarkHeatmapNet
         return self.backbone(x)
-
-
-class DepthFusionModule(nn.Module):
-    """
-    Module for fusing RGB features with depth features
-    """
-    def __init__(self, in_channels, depth_channels=1, fusion_method='concat'):
-        """
-        Initialize depth fusion module
-        
-        Args:
-            in_channels (int): Number of input channels
-            depth_channels (int): Number of depth channels
-            fusion_method (str): Method to fuse depth features ('concat', 'add', or 'attention')
-        """
-        super(DepthFusionModule, self).__init__()
-        self.fusion_method = fusion_method
-        self.in_channels = in_channels
-        self.depth_channels = depth_channels
-        
-        if fusion_method == 'concat':
-            # Concatenate RGB and depth features
-            self.fusion = nn.Conv2d(in_channels + depth_channels, in_channels, kernel_size=1)
-            self.norm = nn.BatchNorm2d(in_channels)
-            self.act = nn.ReLU(inplace=True)
-        elif fusion_method == 'add':
-            # Process depth features and add to RGB features
-            self.depth_conv = nn.Conv2d(depth_channels, in_channels, kernel_size=1)
-            self.norm = nn.BatchNorm2d(in_channels)
-            self.act = nn.ReLU(inplace=True)
-        elif fusion_method == 'attention':
-            # Use attention mechanism to fuse features
-            self.depth_attn = nn.Sequential(
-                nn.Conv2d(depth_channels, in_channels, kernel_size=1),
-                nn.BatchNorm2d(in_channels),
-                nn.Sigmoid()
-            )
-            self.combined_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-            self.norm = nn.BatchNorm2d(in_channels)
-            self.act = nn.ReLU(inplace=True)
-        else:
-            raise ValueError(f"Unsupported fusion method: {fusion_method}")
-    
-    def forward(self, rgb_features, depth_features):
-        """
-        Forward pass to fuse RGB and depth features
-        
-        Args:
-            rgb_features (torch.Tensor): RGB features from backbone
-            depth_features (torch.Tensor): Depth features
-            
-        Returns:
-            torch.Tensor: Fused features
-        """
-        # Resize depth features to match RGB features if needed
-        if depth_features.shape[2:] != rgb_features.shape[2:]:
-            depth_features = F.interpolate(
-                depth_features, 
-                size=rgb_features.shape[2:],
-                mode='bilinear',
-                align_corners=False
-            )
-        
-        if self.fusion_method == 'concat':
-            # Concatenate along channel dimension
-            fused = torch.cat([rgb_features, depth_features], dim=1)
-            fused = self.fusion(fused)
-            fused = self.norm(fused)
-            fused = self.act(fused)
-        elif self.fusion_method == 'add':
-            # Add processed depth features to RGB features
-            depth_processed = self.depth_conv(depth_features)
-            fused = rgb_features + depth_processed
-            fused = self.norm(fused)
-            fused = self.act(fused)
-        elif self.fusion_method == 'attention':
-            # Use depth as attention weights
-            attention = self.depth_attn(depth_features)
-            fused = rgb_features * attention
-            fused = self.combined_conv(fused)
-            fused = self.norm(fused)
-            fused = self.act(fused)
-        
-        return fused
 
 
 class RefinementMLP(nn.Module):
@@ -324,23 +238,16 @@ class LandmarkHeatmapNet(nn.Module):
     3. Coordinate extraction from heatmaps
     4. Refinement MLP to improve coordinate predictions
     """
-    def __init__(self, num_landmarks=19, output_size=(64, 64), pretrained=True, 
-                 use_refinement=True, hrnet_type='w32', use_depth=False, 
-                 depth_fusion_method='concat'):
+    def __init__(self, num_landmarks=19, output_size=(64, 64), pretrained=True, use_refinement=True, hrnet_type='w32'):
         super(LandmarkHeatmapNet, self).__init__()
         
         self.num_landmarks = num_landmarks
         self.output_size = output_size
         self.use_refinement = use_refinement
         self.hrnet_type = hrnet_type
-        self.use_depth = use_depth
-        self.depth_fusion_method = depth_fusion_method
         
-        # HRNet backbone for RGB input
-        self.hrnet = HRNet(pretrained=pretrained, hrnet_type=hrnet_type, input_channels=3)
-        
-        # Depth fusion module (only created if use_depth=True)
-        self.fusion_module = None
+        # HRNet backbone
+        self.hrnet = HRNet(pretrained=pretrained, hrnet_type=hrnet_type)
         
         # We'll create the heatmap layer after we know the channel size
         self.heatmap_layer = None
@@ -349,42 +256,23 @@ class LandmarkHeatmapNet(nn.Module):
         if use_refinement:
             self.refinement_mlp = RefinementMLP(num_landmarks)
     
-    def forward(self, x, depth_map=None):
+    def forward(self, x):
         """
         Forward pass to generate heatmaps
         
         Args:
             x (torch.Tensor): Input images of shape (batch_size, channels, height, width)
-            depth_map (torch.Tensor, optional): Depth maps of shape (batch_size, 1, height, width)
             
         Returns:
             dict: Dictionary containing heatmaps and optionally refined coordinates
         """
         # Forward pass through HRNet backbone
-        rgb_features = self.hrnet(x)
+        features = self.hrnet(x)
         
         # Handle case where features is a list (from timm model with features_only=True)
-        if isinstance(rgb_features, list):
+        if isinstance(features, list):
             # Use the highest resolution features (last in the list)
-            rgb_features = rgb_features[-1]
-            
-        # Fuse RGB features with depth features if depth is available
-        if self.use_depth and depth_map is not None:
-            # Create fusion module if it doesn't exist
-            if self.fusion_module is None:
-                in_channels = rgb_features.shape[1]
-                self.fusion_module = DepthFusionModule(
-                    in_channels=in_channels,
-                    depth_channels=1,
-                    fusion_method=self.depth_fusion_method
-                ).to(rgb_features.device)
-                print(f"Created depth fusion module with {in_channels} input channels")
-            
-            # Fuse RGB and depth features
-            features = self.fusion_module(rgb_features, depth_map)
-        else:
-            # Just use RGB features if depth is not used
-            features = rgb_features
+            features = features[-1]
         
         # Create the heatmap layer if it doesn't exist or if the channel dimension doesn't match
         if self.heatmap_layer is None or self.heatmap_layer.in_channels != features.shape[1]:
@@ -459,13 +347,12 @@ class LandmarkHeatmapNet(nn.Module):
         """
         return soft_argmax(heatmaps, beta=beta)
     
-    def predict_landmarks(self, x, depth_map=None, use_soft_argmax=True, beta=100):
+    def predict_landmarks(self, x, use_soft_argmax=True, beta=100):
         """
         Predict landmark coordinates from input images
         
         Args:
             x (torch.Tensor): Input images of shape (batch_size, channels, height, width)
-            depth_map (torch.Tensor, optional): Depth maps of shape (batch_size, 1, height, width)
             use_soft_argmax (bool): Whether to use soft-argmax for sub-pixel accuracy
             beta (float): Temperature parameter for softmax (only used if use_soft_argmax=True)
             
@@ -473,7 +360,7 @@ class LandmarkHeatmapNet(nn.Module):
             torch.Tensor: Predicted landmark coordinates of shape (batch_size, num_landmarks, 2)
         """
         # Get model output
-        output = self(x, depth_map)
+        output = self(x)
         
         # If using refinement, return refined coordinates
         if self.use_refinement and 'refined_coords' in output:
@@ -489,8 +376,7 @@ class LandmarkHeatmapNet(nn.Module):
         return coords
 
 
-def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, hrnet_type='w32', 
-                      use_depth=False, depth_fusion_method='concat'):
+def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, hrnet_type='w32'):
     """
     Create a HRNet-based landmark detection model
     
@@ -499,8 +385,6 @@ def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, h
         pretrained (bool): Whether to use pretrained weights for the backbone
         use_refinement (bool): Whether to use refinement MLP
         hrnet_type (str): HRNet variant to use ('w32' or 'w48')
-        use_depth (bool): Whether to use depth features
-        depth_fusion_method (str): Method to fuse depth features ('concat', 'add', 'attention')
         
     Returns:
         LandmarkHeatmapNet: The created model
@@ -510,8 +394,6 @@ def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, h
         output_size=(64, 64),
         pretrained=pretrained,
         use_refinement=use_refinement,
-        hrnet_type=hrnet_type,
-        use_depth=use_depth,
-        depth_fusion_method=depth_fusion_method
+        hrnet_type=hrnet_type
     )
     return model 

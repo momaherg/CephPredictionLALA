@@ -11,7 +11,7 @@ class CephalometricDataset(Dataset):
     def __init__(self, data_frame, root_dir=None, transform=None, 
                  landmark_cols=None, train=True, apply_clahe=True,
                  clahe_clip_limit=2.0, clahe_grid_size=(8,8),
-                 depth_features=None, use_depth=False):
+                 use_depth=False):
         """
         Args:
             data_frame (pandas.DataFrame): DataFrame containing image paths and landmarks
@@ -22,8 +22,7 @@ class CephalometricDataset(Dataset):
             apply_clahe (bool): Whether to apply CLAHE for histogram equalization
             clahe_clip_limit (float): Clip limit for CLAHE
             clahe_grid_size (tuple): Grid size for CLAHE
-            depth_features (dict, optional): Pre-extracted depth features mapping index to depth map
-            use_depth (bool): Whether to include depth features in the output
+            use_depth (bool): Whether to include depth features in the sample
         """
         self.data_frame = data_frame
         self.root_dir = root_dir
@@ -36,8 +35,7 @@ class CephalometricDataset(Dataset):
         self.clahe_clip_limit = clahe_clip_limit
         self.clahe_grid_size = clahe_grid_size
         
-        # Depth features
-        self.depth_features = depth_features
+        # Whether to include depth features
         self.use_depth = use_depth
     
     def __len__(self):
@@ -111,31 +109,26 @@ class CephalometricDataset(Dataset):
         else:
             landmarks = np.array([])
         
+        # Get depth features if available and requested
+        depth_feature = None
+        if self.use_depth and 'depth_feature' in self.data_frame.columns:
+            depth_feature = self.data_frame.iloc[idx]['depth_feature']
+            
+            # If depth feature is None or NaN, create an empty array
+            if depth_feature is None or (hasattr(depth_feature, 'size') and depth_feature.size == 0):
+                # Create an empty depth map of the same size as the image (single channel)
+                depth_feature = np.zeros((img_array.shape[0], img_array.shape[1]), dtype=np.float32)
+        
         # Create sample
         sample = {'image': img_array, 'landmarks': landmarks}
+        
+        # Add depth feature if available
+        if self.use_depth:
+            sample['depth'] = depth_feature
         
         # Apply transformations
         if self.transform:
             sample = self.transform(sample)
-        
-        # Add depth features if available and requested
-        if self.use_depth and self.depth_features is not None:
-            if idx in self.depth_features:
-                depth_map = self.depth_features[idx]
-                # Normalize depth map to [0,1] if it's not already
-                if isinstance(depth_map, torch.Tensor):
-                    if depth_map.max() > 1.0:
-                        depth_map = depth_map / 255.0
-                elif isinstance(depth_map, np.ndarray):
-                    if depth_map.max() > 1.0:
-                        depth_map = depth_map / 255.0
-                    depth_map = torch.from_numpy(depth_map).float()
-                    
-                sample['depth'] = depth_map
-            else:
-                # If depth feature is not available for this index, use a placeholder
-                print(f"Warning: No depth feature available for index {idx}")
-                sample['depth'] = torch.zeros((224, 224), dtype=torch.float32)
         
         return sample
 
@@ -155,11 +148,23 @@ class ToTensor(object):
             'landmarks': torch.from_numpy(landmarks).float(),
         }
         
-        # Copy any additional keys
-        for key in sample:
-            if key not in ['image', 'landmarks']:
-                result[key] = sample[key]
+        # Convert depth to tensor if available
+        if 'depth' in sample and sample['depth'] is not None:
+            depth = sample['depth']
+            # Add channel dimension if needed
+            if len(depth.shape) == 2:
+                depth = np.expand_dims(depth, axis=0)  # (H, W) -> (1, H, W)
+            elif len(depth.shape) == 3 and depth.shape[2] == 1:
+                depth = depth.transpose((2, 0, 1))  # (H, W, 1) -> (1, H, W)
+            elif len(depth.shape) == 3:
+                depth = depth.transpose((2, 0, 1))  # (H, W, C) -> (C, H, W)
                 
+            # Normalize depth to [0, 1] if needed
+            if depth.max() > 1.0:
+                depth = depth.astype(np.float32) / 255.0
+                
+            result['depth'] = torch.from_numpy(depth).float()
+        
         return result
 
 
@@ -171,21 +176,23 @@ class Normalize(object):
         self.std = std
     
     def __call__(self, sample):
-        image = sample['image']
+        image, landmarks = sample['image'], sample['landmarks']
         
         # Normalize image
         for t, m, s in zip(image, self.mean, self.std):
             t.sub_(m).div_(s)
+            
+        result = {'image': image, 'landmarks': landmarks}
         
-        result = {key: value for key, value in sample.items()}
-        result['image'] = image
-        
+        # Pass through depth without normalizing (already normalized)
+        if 'depth' in sample:
+            result['depth'] = sample['depth']
+            
         return result
 
 
 def create_dataloaders(df, landmark_cols, batch_size=32, train_ratio=0.8, val_ratio=0.1, 
-                       apply_clahe=True, root_dir=None, num_workers=4, 
-                       depth_features=None, use_depth=False):
+                       apply_clahe=True, root_dir=None, num_workers=4, use_depth=False):
     """
     Create train, validation and test DataLoaders from a DataFrame
     
@@ -198,8 +205,7 @@ def create_dataloaders(df, landmark_cols, batch_size=32, train_ratio=0.8, val_ra
         apply_clahe (bool): Whether to apply CLAHE for histogram equalization
         root_dir (str): Directory containing images (if images are stored as files)
         num_workers (int): Number of worker threads for dataloader
-        depth_features (dict): Precomputed depth features
-        use_depth (bool): Whether to use depth features
+        use_depth (bool): Whether to include depth features in the sample
         
     Returns:
         tuple: (train_loader, val_loader, test_loader)
@@ -236,49 +242,23 @@ def create_dataloaders(df, landmark_cols, batch_size=32, train_ratio=0.8, val_ra
         Normalize()
     ])
     
-    # Extract depth features for each set if needed
-    train_depth_features = None
-    val_depth_features = None
-    test_depth_features = None
-    
-    if depth_features is not None and use_depth:
-        # Map global indices to set-specific indices
-        if isinstance(depth_features, dict):
-            # For train set
-            train_depth_features = {}
-            for i, global_idx in enumerate(train_df.index):
-                if global_idx in depth_features:
-                    train_depth_features[i] = depth_features[global_idx]
-                    
-            # For validation set
-            val_depth_features = {}
-            for i, global_idx in enumerate(val_df.index):
-                if global_idx in depth_features:
-                    val_depth_features[i] = depth_features[global_idx]
-                    
-            # For test set
-            test_depth_features = {}
-            for i, global_idx in enumerate(test_df.index):
-                if global_idx in depth_features:
-                    test_depth_features[i] = depth_features[global_idx]
-    
     # Create datasets
     train_dataset = CephalometricDataset(
         train_df, root_dir=root_dir, transform=train_transform, 
         landmark_cols=landmark_cols, train=True, apply_clahe=apply_clahe,
-        depth_features=train_depth_features, use_depth=use_depth
+        use_depth=use_depth
     )
     
     val_dataset = CephalometricDataset(
         val_df, root_dir=root_dir, transform=val_transform, 
         landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe,
-        depth_features=val_depth_features, use_depth=use_depth
+        use_depth=use_depth
     )
     
     test_dataset = CephalometricDataset(
         test_df, root_dir=root_dir, transform=val_transform, 
         landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe,
-        depth_features=test_depth_features, use_depth=use_depth
+        use_depth=use_depth
     )
     
     # Create dataloaders

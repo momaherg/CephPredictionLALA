@@ -59,10 +59,7 @@ class LandmarkTrainer:
                  total_steps=None,
                  target_landmark_indices=None,
                  landmark_weights=None,
-                 log_specific_landmark_indices=None,
-                 # Depth feature parameters
-                 use_depth=False,
-                 depth_fusion_method='concat'): # Add depth feature parameters
+                 log_specific_landmark_indices=None): # Indices for specific MED logging
         """
         Initialize trainer
         
@@ -103,8 +100,6 @@ class LandmarkTrainer:
             landmark_weights (list or numpy array, optional): Weights to apply to each landmark's loss.
                                                               Must have length equal to num_landmarks.
             log_specific_landmark_indices (list, optional): Indices of landmarks to log MED for separately.
-            use_depth (bool): Whether to use depth features
-            depth_fusion_method (str): Method to fuse depth features ('concat', 'add', 'attention')
         """
         # Set device
         if device is not None:
@@ -126,9 +121,7 @@ class LandmarkTrainer:
             num_landmarks=num_landmarks, 
             pretrained=True, 
             use_refinement=use_refinement,
-            hrnet_type=hrnet_type,
-            use_depth=use_depth,
-            depth_fusion_method=depth_fusion_method
+            hrnet_type=hrnet_type
         )
         self.model = self.model.to(self.device)
         
@@ -283,10 +276,6 @@ class LandmarkTrainer:
             'train_med_specific': {},
             'val_med_specific': {}
         }
-        
-        # Store depth feature parameters
-        self.use_depth = use_depth
-        self.depth_fusion_method = depth_fusion_method
     
     def train_epoch(self, train_loader):
         """
@@ -313,14 +302,6 @@ class LandmarkTrainer:
             images = batch['image'].to(self.device)
             landmarks = batch['landmarks'].to(self.device)
             
-            # Get depth features if available
-            depth_maps = batch.get('depth', None)
-            if depth_maps is not None and self.use_depth:
-                depth_maps = depth_maps.to(self.device)
-                # Add channel dimension if needed
-                if depth_maps.dim() == 3:  # [B, H, W]
-                    depth_maps = depth_maps.unsqueeze(1)  # [B, 1, H, W]
-            
             # Generate target heatmaps
             target_heatmaps = self.heatmap_generator.generate_heatmaps(landmarks).to(self.device)
             
@@ -328,7 +309,7 @@ class LandmarkTrainer:
             self.optimizer.zero_grad()
             
             # Forward pass
-            outputs = self.model(images, depth_maps) if self.use_depth else self.model(images)
+            outputs = self.model(images)
             
             # Compute loss based on whether refinement is used
             if self.use_refinement:
@@ -358,10 +339,7 @@ class LandmarkTrainer:
             
             # Get landmark predictions for metrics
             with torch.no_grad():
-                if self.use_depth:
-                    predicted_landmarks = self.model.predict_landmarks(images, depth_maps)
-                else:
-                    predicted_landmarks = self.model.predict_landmarks(images)
+                predicted_landmarks = self.model.predict_landmarks(images)
                 all_predictions.append(predicted_landmarks.cpu())
                 all_targets.append(landmarks.cpu())
         
@@ -422,19 +400,11 @@ class LandmarkTrainer:
                 images = batch['image'].to(self.device)
                 landmarks = batch['landmarks'].to(self.device)
                 
-                # Get depth features if available
-                depth_maps = batch.get('depth', None)
-                if depth_maps is not None and self.use_depth:
-                    depth_maps = depth_maps.to(self.device)
-                    # Add channel dimension if needed
-                    if depth_maps.dim() == 3:  # [B, H, W]
-                        depth_maps = depth_maps.unsqueeze(1)  # [B, 1, H, W]
-                
                 # Generate target heatmaps
                 target_heatmaps = self.heatmap_generator.generate_heatmaps(landmarks).to(self.device)
                 
                 # Forward pass
-                outputs = self.model(images, depth_maps) if self.use_depth else self.model(images)
+                outputs = self.model(images)
                 
                 # Compute loss based on whether refinement is used
                 if self.use_refinement:
@@ -450,10 +420,7 @@ class LandmarkTrainer:
                 val_loss += loss.item()
                 
                 # Get landmark predictions for metrics
-                if self.use_depth:
-                    predicted_landmarks = self.model.predict_landmarks(images, depth_maps)
-                else:
-                    predicted_landmarks = self.model.predict_landmarks(images)
+                predicted_landmarks = self.model.predict_landmarks(images)
                 all_predictions.append(predicted_landmarks.cpu())
                 all_targets.append(landmarks.cpu())
         
@@ -693,9 +660,7 @@ class LandmarkTrainer:
             'use_refinement': self.use_refinement,
             'current_heatmap_weight': self.current_heatmap_weight,
             'current_coord_weight': self.current_coord_weight,
-            'scheduler_type': self.scheduler_type,
-            'use_depth': self.use_depth,
-            'depth_fusion_method': self.depth_fusion_method
+            'scheduler_type': self.scheduler_type
         }
         
         # Save scheduler state if it exists
@@ -745,10 +710,6 @@ class LandmarkTrainer:
             else:
                 print(f"Warning: Current scheduler type ({self.scheduler_type}) differs from saved checkpoint ({checkpoint.get('scheduler_type')}).")
                 print("Scheduler state not loaded.")
-        
-        # Load depth feature parameters
-        self.use_depth = checkpoint.get('use_depth', False)
-        self.depth_fusion_method = checkpoint.get('depth_fusion_method', 'concat')
     
     def plot_training_curves(self):
         """
@@ -926,19 +887,8 @@ class LandmarkTrainer:
                 images = batch['image'].to(self.device)
                 landmarks = batch['landmarks'].to(self.device)
                 
-                # Get depth features if available
-                depth_maps = batch.get('depth', None)
-                if depth_maps is not None and self.use_depth:
-                    depth_maps = depth_maps.to(self.device)
-                    # Add channel dimension if needed
-                    if depth_maps.dim() == 3:  # [B, H, W]
-                        depth_maps = depth_maps.unsqueeze(1)  # [B, 1, H, W]
-                
                 # Forward pass
-                if self.use_depth and depth_maps is not None:
-                    predicted_landmarks = self.model.predict_landmarks(images, depth_maps)
-                else:
-                    predicted_landmarks = self.model.predict_landmarks(images)
+                predicted_landmarks = self.model.predict_landmarks(images)
                 
                 # Save predictions and targets
                 all_predictions.append(predicted_landmarks.cpu())
@@ -946,15 +896,8 @@ class LandmarkTrainer:
                 
                 # Save visualizations for the first few batches
                 if save_visualizations and batch_idx < 5:
-                    # Add depth maps to visualization if used
-                    if self.use_depth and depth_maps is not None:
-                        self._save_visualizations_with_depth(
-                            images, predicted_landmarks, landmarks, depth_maps,
-                            os.path.join(vis_dir, f'batch_{batch_idx}'))
-                    else:
-                        self._save_visualizations(
-                            images, predicted_landmarks, landmarks, 
-                            os.path.join(vis_dir, f'batch_{batch_idx}'))
+                    self._save_visualizations(images, predicted_landmarks, landmarks, 
+                                             os.path.join(vis_dir, f'batch_{batch_idx}'))
         
         # Concatenate all predictions and targets
         all_predictions = torch.cat(all_predictions, dim=0)
@@ -1010,68 +953,6 @@ class LandmarkTrainer:
         print(f"\nDetailed report saved to: {report_dir}")
         
         return results
-    
-    def _save_visualizations_with_depth(self, images, predictions, targets, depth_maps, output_dir):
-        """
-        Save visualization images including depth maps
-        
-        Args:
-            images (torch.Tensor): Input images
-            predictions (torch.Tensor): Predicted landmarks
-            targets (torch.Tensor): Ground truth landmarks
-            depth_maps (torch.Tensor): Depth maps
-            output_dir (str): Directory to save visualizations
-        """
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Convert tensors to numpy
-        images = images.cpu().permute(0, 2, 3, 1).numpy()
-        predictions = predictions.cpu().numpy()
-        targets = targets.cpu().numpy()
-        depth_maps = depth_maps.cpu().squeeze(1).numpy()  # Remove channel dimension
-        
-        # Denormalize images if needed
-        if images.max() <= 1.0:
-            images = np.clip(images, 0, 1)
-        else:
-            images = np.clip(images / 255.0, 0, 1)
-        
-        # Plot each image in the batch
-        batch_size = images.shape[0]
-        for i in range(min(batch_size, 4)):  # Limit to 4 images per batch
-            plt.figure(figsize=(15, 5))
-            
-            # Plot original image with landmarks
-            plt.subplot(1, 3, 1)
-            plt.imshow(images[i])
-            plt.scatter(predictions[i, :, 0], predictions[i, :, 1], 
-                      c='blue', marker='o', label='Predicted')
-            plt.scatter(targets[i, :, 0], targets[i, :, 1], 
-                      c='red', marker='x', label='Ground Truth')
-            plt.title('RGB Image with Landmarks')
-            plt.legend()
-            plt.axis('off')
-            
-            # Plot depth map
-            plt.subplot(1, 3, 2)
-            plt.imshow(depth_maps[i], cmap='plasma')
-            plt.title('Depth Map')
-            plt.axis('off')
-            
-            # Plot depth map with landmarks overlay
-            plt.subplot(1, 3, 3)
-            plt.imshow(depth_maps[i], cmap='plasma')
-            plt.scatter(predictions[i, :, 0], predictions[i, :, 1], 
-                      c='blue', marker='o', label='Predicted')
-            plt.scatter(targets[i, :, 0], targets[i, :, 1], 
-                      c='red', marker='x', label='Ground Truth')
-            plt.title('Depth Map with Landmarks')
-            plt.legend()
-            plt.axis('off')
-            
-            # Save figure
-            plt.savefig(os.path.join(output_dir, f'sample_{i}.png'))
-            plt.close()
     
     def _save_visualizations(self, images, predictions, targets, output_dir):
         """
