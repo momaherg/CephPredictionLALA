@@ -131,9 +131,6 @@ LANDMARK_WEIGHTS = None # e.g., [2.0, 1.0, ..., 1.0] (list/array of length NUM_L
 # Specific MED Logging
 LOG_SPECIFIC_LANDMARK_INDICES = None # e.g., [0, 1, 10] to log MED for Sella, Nasion, Gonion
 
-# Depth Features
-USE_DEPTH_FEATURES = False # Set to True to generate and use depth maps
-
 # LR Range Test parameters
 RUN_LR_FINDER = True  # Set to True to run the LR range test before training
 LR_FINDER_START_LR = 1e-7
@@ -210,14 +207,6 @@ except Exception as e:
     df = pd.DataFrame(synthetic_data)
     print(f"Created synthetic dataset with {len(df)} samples")
 
-# Add depth features if requested
-if USE_DEPTH_FEATURES:
-    print("\nAdding Depth Features...")
-    df = data_processor.add_depth_features(df)
-    if 'depth_map' not in df.columns or df['depth_map'].isnull().any():
-        print("Warning: Depth map generation failed or resulted in missing values. Disabling depth features.")
-        USE_DEPTH_FEATURES = False # Fallback if generation fails
-
 # %% [markdown]
 # ## 5. Create DataLoaders with Augmentation
 # 
@@ -228,31 +217,28 @@ if USE_DEPTH_FEATURES:
 # 4. Create PyTorch DataLoaders for model training and evaluation
 
 # %%
-# Load train transformations/augmentations
+# Define a class for training transforms that can be pickled
+class TrainTransform:
+    def __init__(self, train_augmentations, base_transforms):
+        self.train_augmentations = train_augmentations
+        self.base_transforms = base_transforms
+        
+    def __call__(self, sample):
+        # First apply augmentation
+        augmented = self.train_augmentations(sample)
+        # Then apply base transforms (ToTensor, Normalize)
+        return self.base_transforms(augmented)
 
-# Augmentations class that respects landmarks
-train_augmentations = get_train_transforms(include_horizontal_flip=False)
-
-# Create train transform that applies augmentations before tensor conversion
+# Define data transformations
 base_transforms = transforms.Compose([
     ToTensor(),
     Normalize()
 ])
 
-# Define custom training transform class
-class TrainTransform:
-    def __init__(self, train_augmentations, base_transforms):
-        self.train_augmentations = train_augmentations
-        self.base_transforms = base_transforms
-    
-    def __call__(self, sample):
-        # Apply augmentations first
-        sample = self.train_augmentations(sample)
-        # Then apply base transformations (ToTensor, Normalize)
-        sample = self.base_transforms(sample)
-        return sample
+# Get training transformations with augmentations
+train_augmentations = get_train_transforms(include_horizontal_flip=False)
 
-# Create transform instance
+# Create custom transform for training
 train_transform = TrainTransform(train_augmentations, base_transforms)
 
 # Split data into train, val, test
@@ -293,20 +279,17 @@ if BALANCE_CLASSES and 'skeletal_class' in train_df.columns:
 # Create datasets
 train_dataset = CephalometricDataset(
     train_df, root_dir=None, transform=train_transform, 
-    landmark_cols=landmark_cols, train=True, apply_clahe=APPLY_CLAHE,
-    use_depth=USE_DEPTH_FEATURES
+    landmark_cols=landmark_cols, train=True, apply_clahe=APPLY_CLAHE
 )
 
 val_dataset = CephalometricDataset(
     val_df, root_dir=None, transform=base_transforms, 
-    landmark_cols=landmark_cols, train=False, apply_clahe=APPLY_CLAHE,
-    use_depth=USE_DEPTH_FEATURES
+    landmark_cols=landmark_cols, train=False, apply_clahe=APPLY_CLAHE
 )
 
 test_dataset = CephalometricDataset(
     test_df, root_dir=None, transform=base_transforms, 
-    landmark_cols=landmark_cols, train=False, apply_clahe=APPLY_CLAHE,
-    use_depth=USE_DEPTH_FEATURES
+    landmark_cols=landmark_cols, train=False, apply_clahe=APPLY_CLAHE
 )
 
 # Create dataloaders
@@ -376,8 +359,7 @@ trainer = LandmarkTrainer(
     target_landmark_indices=TARGET_LANDMARK_INDICES,
     landmark_weights=LANDMARK_WEIGHTS,
     # Specific MED Logging
-    log_specific_landmark_indices=LOG_SPECIFIC_LANDMARK_INDICES,
-    use_depth_features=USE_DEPTH_FEATURES
+    log_specific_landmark_indices=LOG_SPECIFIC_LANDMARK_INDICES
 )
 
 # Custom max_delta setting for the refinement MLP if needed
@@ -692,8 +674,7 @@ model_config = {
     'norm_epsilon': NORM_EPSILON,
     'target_landmark_indices': TARGET_LANDMARK_INDICES,
     'landmark_weights': LANDMARK_WEIGHTS,
-    'log_specific_landmark_indices': LOG_SPECIFIC_LANDMARK_INDICES,
-    'use_depth_features': USE_DEPTH_FEATURES
+    'log_specific_landmark_indices': LOG_SPECIFIC_LANDMARK_INDICES
 }
 
 save_model_config(OUTPUT_DIR, model_config)

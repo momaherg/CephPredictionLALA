@@ -113,12 +113,13 @@ class HRNet(nn.Module):
     
     Supports different HRNet variants (W32, W48, etc.)
     """
-    def __init__(self, input_channels=3, pretrained=True, hrnet_type='w32'):
+    def __init__(self, pretrained=True, hrnet_type='w32', input_channels=3):
         super(HRNet, self).__init__()
+        
         self.input_channels = input_channels
         
         # Load pretrained HRNet model
-        if pretrained:
+        if pretrained and input_channels == 3:  # Only use pretrained model for RGB inputs
             try:
                 if not TIMM_AVAILABLE:
                     raise ImportError("timm package is not installed")
@@ -127,107 +128,21 @@ class HRNet(nn.Module):
                 model_name = f'hrnet_{hrnet_type}'
                 self.backbone = timm.create_model(model_name, pretrained=True, features_only=True)
                 print(f"Successfully loaded pretrained {model_name} using timm.")
-                
-                # --- Modify the first convolutional layer --- 
-                # This part is highly dependent on the specific timm model structure
-                # We need to find the first conv layer (e.g., backbone.conv1 or similar)
-                first_conv_layer_name = None
-                if hasattr(self.backbone, 'conv1'):
-                    first_conv_layer_name = 'conv1'
-                elif hasattr(self.backbone, 'stem') and hasattr(self.backbone.stem, '0') and isinstance(self.backbone.stem[0], nn.Conv2d):
-                    # Common pattern: stem might be a Sequential block
-                    first_conv_layer_name = 'stem.0' # Need to access nested module
-                else:
-                     # Add more checks or raise an error if the layer isn't found
-                     warnings.warn(f"Could not automatically find the first conv layer for {model_name}. Input channel modification might fail.")
-
-                if first_conv_layer_name is not None:
-                    try:
-                        # Get original layer and its weights
-                        original_layer = self.backbone
-                        for part in first_conv_layer_name.split('.'):
-                             original_layer = getattr(original_layer, part)
-                             
-                        original_weights = original_layer.weight.clone().detach()
-                        original_bias = original_layer.bias.clone().detach() if original_layer.bias is not None else None
-                        out_channels = original_layer.out_channels
-                        kernel_size = original_layer.kernel_size
-                        stride = original_layer.stride
-                        padding = original_layer.padding
-                        dilation = original_layer.dilation
-                        groups = original_layer.groups
-                        
-                        print(f"Modifying first conv layer ({first_conv_layer_name}) to accept {input_channels} channels.")
-                        
-                        # Create new layer
-                        new_layer = nn.Conv2d(input_channels, out_channels, kernel_size=kernel_size,
-                                              stride=stride, padding=padding, dilation=dilation,
-                                              groups=groups, bias=(original_bias is not None))
-
-                        # Copy weights with care
-                        with torch.no_grad():
-                            num_original_channels = original_weights.shape[1]
-                            
-                            # Properly handle different input channel cases
-                            if input_channels == 1:  # Single channel (grayscale)
-                                # Average the RGB weights for the grayscale channel
-                                avg_weights = original_weights.mean(dim=1, keepdim=True)
-                                new_layer.weight.data = avg_weights
-                                
-                            elif input_channels == 2:  # Dual channel (grayscale + depth)
-                                # For grayscale, average the RGB weights
-                                gray_weights = original_weights.mean(dim=1, keepdim=True)
-                                # For depth, use a copy of grayscale weights or initialize fresh
-                                # Option 1: Copy grayscale weights for depth channel
-                                depth_weights = gray_weights.clone()
-                                # Concatenate along input channel dimension
-                                new_weights = torch.cat([gray_weights, depth_weights], dim=1)
-                                new_layer.weight.data = new_weights
-                                
-                            elif input_channels > num_original_channels:  # More channels than original
-                                # Copy original weights for the first num_original_channels
-                                new_weights = new_layer.weight.data
-                                new_weights[:, :num_original_channels, :, :] = original_weights
-                                
-                                # Initialize additional channels using average of original
-                                avg_weights = original_weights.mean(dim=1, keepdim=True)
-                                for i in range(num_original_channels, input_channels):
-                                    new_weights[:, i:i+1, :, :] = avg_weights
-                                
-                                new_layer.weight.data = new_weights
-                            else:  # input_channels <= num_original_channels and not 1 or 2
-                                # Just copy the first input_channels
-                                new_layer.weight.data[:, :input_channels, :, :] = original_weights[:, :input_channels, :, :]
-                                
-                            # Copy bias if it exists
-                            if original_bias is not None:
-                                new_layer.bias.data = original_bias
-                                
-                        # Replace the original layer with the new one
-                        layer_parent = self.backbone
-                        parts = first_conv_layer_name.split('.')
-                        for part in parts[:-1]:
-                            layer_parent = getattr(layer_parent, part)
-                        setattr(layer_parent, parts[-1], new_layer)
-                        print(f"Successfully modified {first_conv_layer_name}.")
-                        
-                    except Exception as e:
-                         warnings.warn(f"Failed to modify the first conv layer: {e}")
             except Exception as e:
                 # Fallback to a simplified backbone if pretrained model is not available
                 logging.warning(f"Error loading pretrained HRNet-{hrnet_type.upper()}: {str(e)}")
                 print(f"Warning: Pretrained HRNet-{hrnet_type.upper()} not available. Using simplified backbone.")
                 print("To fix this issue, install timm: pip install timm")
-                self.backbone = self._create_simplified_backbone(input_channels=input_channels)
+                self.backbone = self._create_simplified_backbone()
         else:
-            # Use simplified backbone if pretrained is not required
-            # Modify simplified backbone input layer as well
-            self.backbone = self._create_simplified_backbone(input_channels=input_channels)
+            # Use simplified backbone if pretrained is not required or if using custom input channels
+            self.backbone = self._create_simplified_backbone()
     
-    def _create_simplified_backbone(self, input_channels=3):
+    def _create_simplified_backbone(self):
         # Simplified backbone as a placeholder
+        # In practice, this would be a full implementation of HRNet
         backbone = nn.Sequential(
-            nn.Conv2d(input_channels, 64, 3, 2, 1), # Use input_channels here
+            nn.Conv2d(self.input_channels, 64, 3, 2, 1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, 3, 2, 1),
@@ -242,6 +157,90 @@ class HRNet(nn.Module):
     def forward(self, x):
         # Just return whatever the backbone outputs - we'll handle it in LandmarkHeatmapNet
         return self.backbone(x)
+
+
+class DepthFusionModule(nn.Module):
+    """
+    Module for fusing RGB features with depth features
+    """
+    def __init__(self, in_channels, depth_channels=1, fusion_method='concat'):
+        """
+        Initialize depth fusion module
+        
+        Args:
+            in_channels (int): Number of input channels
+            depth_channels (int): Number of depth channels
+            fusion_method (str): Method to fuse depth features ('concat', 'add', or 'attention')
+        """
+        super(DepthFusionModule, self).__init__()
+        self.fusion_method = fusion_method
+        self.in_channels = in_channels
+        self.depth_channels = depth_channels
+        
+        if fusion_method == 'concat':
+            # Concatenate RGB and depth features
+            self.fusion = nn.Conv2d(in_channels + depth_channels, in_channels, kernel_size=1)
+            self.norm = nn.BatchNorm2d(in_channels)
+            self.act = nn.ReLU(inplace=True)
+        elif fusion_method == 'add':
+            # Process depth features and add to RGB features
+            self.depth_conv = nn.Conv2d(depth_channels, in_channels, kernel_size=1)
+            self.norm = nn.BatchNorm2d(in_channels)
+            self.act = nn.ReLU(inplace=True)
+        elif fusion_method == 'attention':
+            # Use attention mechanism to fuse features
+            self.depth_attn = nn.Sequential(
+                nn.Conv2d(depth_channels, in_channels, kernel_size=1),
+                nn.BatchNorm2d(in_channels),
+                nn.Sigmoid()
+            )
+            self.combined_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+            self.norm = nn.BatchNorm2d(in_channels)
+            self.act = nn.ReLU(inplace=True)
+        else:
+            raise ValueError(f"Unsupported fusion method: {fusion_method}")
+    
+    def forward(self, rgb_features, depth_features):
+        """
+        Forward pass to fuse RGB and depth features
+        
+        Args:
+            rgb_features (torch.Tensor): RGB features from backbone
+            depth_features (torch.Tensor): Depth features
+            
+        Returns:
+            torch.Tensor: Fused features
+        """
+        # Resize depth features to match RGB features if needed
+        if depth_features.shape[2:] != rgb_features.shape[2:]:
+            depth_features = F.interpolate(
+                depth_features, 
+                size=rgb_features.shape[2:],
+                mode='bilinear',
+                align_corners=False
+            )
+        
+        if self.fusion_method == 'concat':
+            # Concatenate along channel dimension
+            fused = torch.cat([rgb_features, depth_features], dim=1)
+            fused = self.fusion(fused)
+            fused = self.norm(fused)
+            fused = self.act(fused)
+        elif self.fusion_method == 'add':
+            # Add processed depth features to RGB features
+            depth_processed = self.depth_conv(depth_features)
+            fused = rgb_features + depth_processed
+            fused = self.norm(fused)
+            fused = self.act(fused)
+        elif self.fusion_method == 'attention':
+            # Use depth as attention weights
+            attention = self.depth_attn(depth_features)
+            fused = rgb_features * attention
+            fused = self.combined_conv(fused)
+            fused = self.norm(fused)
+            fused = self.act(fused)
+        
+        return fused
 
 
 class RefinementMLP(nn.Module):
@@ -325,17 +324,23 @@ class LandmarkHeatmapNet(nn.Module):
     3. Coordinate extraction from heatmaps
     4. Refinement MLP to improve coordinate predictions
     """
-    def __init__(self, num_landmarks=19, output_size=(64, 64), pretrained=True, use_refinement=True, hrnet_type='w32', input_channels=1):
+    def __init__(self, num_landmarks=19, output_size=(64, 64), pretrained=True, 
+                 use_refinement=True, hrnet_type='w32', use_depth=False, 
+                 depth_fusion_method='concat'):
         super(LandmarkHeatmapNet, self).__init__()
         
         self.num_landmarks = num_landmarks
         self.output_size = output_size
         self.use_refinement = use_refinement
         self.hrnet_type = hrnet_type
-        self.input_channels = input_channels
+        self.use_depth = use_depth
+        self.depth_fusion_method = depth_fusion_method
         
-        # HRNet backbone - pass input_channels
-        self.hrnet = HRNet(pretrained=pretrained, hrnet_type=hrnet_type, input_channels=input_channels)
+        # HRNet backbone for RGB input
+        self.hrnet = HRNet(pretrained=pretrained, hrnet_type=hrnet_type, input_channels=3)
+        
+        # Depth fusion module (only created if use_depth=True)
+        self.fusion_module = None
         
         # We'll create the heatmap layer after we know the channel size
         self.heatmap_layer = None
@@ -344,23 +349,42 @@ class LandmarkHeatmapNet(nn.Module):
         if use_refinement:
             self.refinement_mlp = RefinementMLP(num_landmarks)
     
-    def forward(self, x):
+    def forward(self, x, depth_map=None):
         """
         Forward pass to generate heatmaps
         
         Args:
             x (torch.Tensor): Input images of shape (batch_size, channels, height, width)
+            depth_map (torch.Tensor, optional): Depth maps of shape (batch_size, 1, height, width)
             
         Returns:
             dict: Dictionary containing heatmaps and optionally refined coordinates
         """
         # Forward pass through HRNet backbone
-        features = self.hrnet(x)
+        rgb_features = self.hrnet(x)
         
         # Handle case where features is a list (from timm model with features_only=True)
-        if isinstance(features, list):
+        if isinstance(rgb_features, list):
             # Use the highest resolution features (last in the list)
-            features = features[-1]
+            rgb_features = rgb_features[-1]
+            
+        # Fuse RGB features with depth features if depth is available
+        if self.use_depth and depth_map is not None:
+            # Create fusion module if it doesn't exist
+            if self.fusion_module is None:
+                in_channels = rgb_features.shape[1]
+                self.fusion_module = DepthFusionModule(
+                    in_channels=in_channels,
+                    depth_channels=1,
+                    fusion_method=self.depth_fusion_method
+                ).to(rgb_features.device)
+                print(f"Created depth fusion module with {in_channels} input channels")
+            
+            # Fuse RGB and depth features
+            features = self.fusion_module(rgb_features, depth_map)
+        else:
+            # Just use RGB features if depth is not used
+            features = rgb_features
         
         # Create the heatmap layer if it doesn't exist or if the channel dimension doesn't match
         if self.heatmap_layer is None or self.heatmap_layer.in_channels != features.shape[1]:
@@ -435,12 +459,13 @@ class LandmarkHeatmapNet(nn.Module):
         """
         return soft_argmax(heatmaps, beta=beta)
     
-    def predict_landmarks(self, x, use_soft_argmax=True, beta=100):
+    def predict_landmarks(self, x, depth_map=None, use_soft_argmax=True, beta=100):
         """
         Predict landmark coordinates from input images
         
         Args:
             x (torch.Tensor): Input images of shape (batch_size, channels, height, width)
+            depth_map (torch.Tensor, optional): Depth maps of shape (batch_size, 1, height, width)
             use_soft_argmax (bool): Whether to use soft-argmax for sub-pixel accuracy
             beta (float): Temperature parameter for softmax (only used if use_soft_argmax=True)
             
@@ -448,7 +473,7 @@ class LandmarkHeatmapNet(nn.Module):
             torch.Tensor: Predicted landmark coordinates of shape (batch_size, num_landmarks, 2)
         """
         # Get model output
-        output = self(x)
+        output = self(x, depth_map)
         
         # If using refinement, return refined coordinates
         if self.use_refinement and 'refined_coords' in output:
@@ -464,7 +489,8 @@ class LandmarkHeatmapNet(nn.Module):
         return coords
 
 
-def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, hrnet_type='w32', input_channels=1):
+def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, hrnet_type='w32', 
+                      use_depth=False, depth_fusion_method='concat'):
     """
     Create a HRNet-based landmark detection model
     
@@ -473,7 +499,8 @@ def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, h
         pretrained (bool): Whether to use pretrained weights for the backbone
         use_refinement (bool): Whether to use refinement MLP
         hrnet_type (str): HRNet variant to use ('w32' or 'w48')
-        input_channels (int): Number of input channels (1 for grayscale, 2 for grayscale+depth, etc.)
+        use_depth (bool): Whether to use depth features
+        depth_fusion_method (str): Method to fuse depth features ('concat', 'add', 'attention')
         
     Returns:
         LandmarkHeatmapNet: The created model
@@ -484,6 +511,7 @@ def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, h
         pretrained=pretrained,
         use_refinement=use_refinement,
         hrnet_type=hrnet_type,
-        input_channels=input_channels
+        use_depth=use_depth,
+        depth_fusion_method=depth_fusion_method
     )
     return model 

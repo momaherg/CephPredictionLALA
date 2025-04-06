@@ -1,24 +1,11 @@
 import os
 import pandas as pd
 import numpy as np
-from tqdm import tqdm # Add tqdm for progress bar
-import torch # Add torch
-from PIL import Image # Add PIL
-
 from .dataset import create_dataloaders
 from .patient_classifier import PatientClassifier
 
-# Try importing transformers for depth prediction
-try:
-    from transformers import DepthProImageProcessorFast, DepthProForDepthEstimation
-    TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    TRANSFORMERS_AVAILABLE = False
-    print("Warning: Transformers library not found. Depth feature generation will be unavailable.")
-    print("Install it with: pip install transformers accelerate")
-
 class DataProcessor:
-    def __init__(self, data_path, landmark_cols=None, image_size=(224, 224), apply_clahe=True, depth_batch_size=16):
+    def __init__(self, data_path, landmark_cols=None, image_size=(224, 224), apply_clahe=True):
         """
         Initialize the data processor
         
@@ -27,274 +14,19 @@ class DataProcessor:
             landmark_cols (list): List of column names containing landmark coordinates
             image_size (tuple): Size of images (height, width)
             apply_clahe (bool): Whether to apply CLAHE for histogram equalization
-            depth_batch_size (int): Batch size for depth prediction
         """
         self.data_path = data_path
         self.landmark_cols = landmark_cols
         self.image_size = image_size
         self.apply_clahe = apply_clahe
         self.df = None
-        self.depth_batch_size = depth_batch_size
         
         # Create classifier if landmark columns are provided
         if landmark_cols:
             self.classifier = PatientClassifier(landmark_cols)
         else:
             self.classifier = None
-        
-        # Device for depth model inference
-        self.inference_device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-        print(f"DataProcessor using device: {self.inference_device} for potential depth inference.")
-        self.depth_model = None
-        self.depth_processor = None
     
-    def _load_depth_model(self):
-        """Loads the DepthPro model and processor if not already loaded."""
-        if not TRANSFORMERS_AVAILABLE:
-            print("Error: Transformers library not available. Cannot load depth model.")
-            return False
-        if self.depth_model is None or self.depth_processor is None:
-            try:
-                print("Loading DepthPro model (apple/DepthPro-hf)... This might take a moment.")
-                self.depth_processor = DepthProImageProcessorFast.from_pretrained("apple/DepthPro-hf")
-                self.depth_model = DepthProForDepthEstimation.from_pretrained("apple/DepthPro-hf").to(self.inference_device)
-                print("DepthPro model loaded successfully.")
-                return True
-            except Exception as e:
-                print(f"Error loading DepthPro model: {e}")
-                self.depth_model = None
-                self.depth_processor = None
-                return False
-        return True
-
-    def _predict_depth(self, image_array):
-        """Predicts depth for a single image array (H, W, C)."""
-        if self.depth_model is None or self.depth_processor is None:
-            if not self._load_depth_model():
-                return None # Return None if model couldn't be loaded
-                
-        try:
-            # Convert NumPy array (H, W, C) to PIL Image
-            # Ensure it's uint8
-            if image_array.dtype != np.uint8:
-                 image_array = image_array.astype(np.uint8)
-            image_pil = Image.fromarray(image_array)
-            
-            # Prepare inputs
-            inputs = self.depth_processor(images=image_pil, return_tensors="pt").to(self.inference_device)
-
-            # Predict depth
-            with torch.no_grad():
-                outputs = self.depth_model(**inputs)
-
-            # Post-process
-            post_processed_output = self.depth_processor.post_process_depth_estimation(
-                outputs, target_sizes=[(image_pil.height, image_pil.width)],
-            )
-            
-            # Extract, normalize (0-1), and convert depth map
-            depth_map = post_processed_output[0]["predicted_depth"]
-            depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-6) # Normalize 0-1
-            depth_map = depth_map.squeeze().detach().cpu().numpy() # (H, W)
-            
-            return depth_map.astype(np.float32) # Store as float32
-
-        except Exception as e:
-            print(f"Error during depth prediction: {e}")
-            return None
-
-    def _predict_depth_batch(self, image_batch_pil): # Changed to accept PIL image batch
-        """Predicts depth for a batch of PIL images."""
-        if self.depth_model is None or self.depth_processor is None:
-            if not self._load_depth_model():
-                return [None] * len(image_batch_pil) # Return list of Nones
-                
-        try:
-            # Prepare inputs for the batch
-            inputs = self.depth_processor(images=image_batch_pil, return_tensors="pt").to(self.inference_device)
-
-            # Predict depth for the batch
-            with torch.no_grad():
-                outputs = self.depth_model(**inputs)
-
-            # Post-process batch
-            target_sizes = [(img.height, img.width) for img in image_batch_pil]
-            post_processed_output = self.depth_processor.post_process_depth_estimation(
-                outputs, target_sizes=target_sizes,
-            )
-            
-            batch_depth_maps = []
-            for i in range(len(image_batch_pil)):
-                # Extract, normalize (0-1), and convert depth map for each image in the batch
-                depth_map = post_processed_output[i]["predicted_depth"]
-                depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-6) # Normalize 0-1
-                depth_map = depth_map.squeeze().detach().cpu().numpy() # (H, W)
-                batch_depth_maps.append(depth_map.astype(np.float32))
-            
-            return batch_depth_maps
-
-        except Exception as e:
-            print(f"Error during batch depth prediction: {e}")
-            return [None] * len(image_batch_pil) # Return list of Nones on error
-
-    def add_depth_features(self, df):
-        """Generates and adds depth maps to the DataFrame using batching."""
-        if 'Image' not in df.columns:
-            print("Error: DataFrame must contain an 'Image' column with image arrays.")
-            return df
-            
-        if not self._load_depth_model(): # Ensure model is loaded
-             print("Skipping depth feature generation due to model loading error.")
-             return df
-
-        print(f"Generating depth features using batch size {self.depth_batch_size}...")
-        all_depth_maps = [None] * len(df) # Pre-allocate list for results
-        image_batch_for_depth = [] # Store prepared PIL images for batching
-        batch_indices = [] # Store original indices for placing results
-        
-        saved_depth_count = 0
-        max_depth_saves = 2
-        depth_save_dir = "./outputs/depth_previews"
-        os.makedirs(depth_save_dir, exist_ok=True)
-        
-        for index, row in tqdm(df.iterrows(), total=len(df), desc="Preparing Images for Depth"):
-            image_data = row['Image']
-            image_array = None
-            
-            # --- Image Data Conversion (remains mostly the same) ---
-            try:
-                if isinstance(image_data, list):
-                    # --- Debugging Start ---
-                    # print(f"\n[Debug Index {index}] Detected list input.")
-                    try:
-                        np_array_flat = np.array(image_data) # Convert list to numpy array first
-                    except Exception as e:
-                         # print(f"[Debug Index {index}] Error during np.array(list): {e}")
-                         raise TypeError("Failed to convert list to np array")
-                         
-                    list_len = np_array_flat.size
-                    dtype = np_array_flat.dtype
-                    expected_len_gray = self.image_size[0] * self.image_size[1]
-                    expected_len_rgb = expected_len_gray * 3
-                    # print(f"[Debug Index {index}] List Length: {list_len}, Dtype: {dtype}")
-                    # print(f"[Debug Index {index}] Expected Gray Length: {expected_len_gray}, Expected RGB Length: {expected_len_rgb}")
-                    # --- Debugging End ---
-                    
-                    if list_len == expected_len_gray:
-                        # print(f"[Debug Index {index}] Matched Gray Length. Reshaping to {self.image_size}.")
-                        image_array = np_array_flat.reshape(self.image_size) # Reshape grayscale
-                    elif list_len == expected_len_rgb:
-                        # print(f"[Debug Index {index}] Matched RGB Length. Reshaping to {(self.image_size[0], self.image_size[1], 3)}.")
-                        image_array = np_array_flat.reshape((self.image_size[0], self.image_size[1], 3)) # Reshape RGB
-                    else:
-                        raise ValueError(f"List length {list_len} does not match expected grayscale ({expected_len_gray}) or RGB ({expected_len_rgb})")
-                
-                elif isinstance(image_data, np.ndarray):
-                    # print(f"\n[Debug Index {index}] Detected numpy array input. Shape: {image_data.shape}, Dtype: {image_data.dtype}")
-                    image_array = image_data # Already a numpy array
-                
-                else:
-                    raise TypeError(f"Unexpected image data type: {type(image_data)}")
-                    
-            except (ValueError, TypeError) as e:
-                print(f"Warning: Skipping depth preparation for row index {index} due to image data conversion error: {e}")
-                # Note: No depth_maps.append here, handled by pre-allocation
-                continue 
-            # --- End Image Data Conversion ---
-            
-            # --- Image Preparation for Depth Model (remains mostly the same) ---
-            image_array_hwc = None
-            try: 
-                # Ensure image is in HWC uint8 format
-                if image_array.ndim == 2: # Grayscale -> HWC
-                     image_array_hwc = np.stack([image_array]*3, axis=-1)
-                elif image_array.ndim == 3 and image_array.shape[0] == 3: # CHW -> HWC
-                     image_array_hwc = image_array.transpose(1, 2, 0)
-                elif image_array.ndim == 3 and image_array.shape[-1] == 1: # HW1 -> HWC
-                    image_array_hwc = np.concatenate([image_array]*3, axis=-1)
-                elif image_array.ndim == 3 and image_array.shape[-1] == 3: # Already HWC
-                    image_array_hwc = image_array
-                else:
-                    raise ValueError(f"Unexpected image shape {image_array.shape} after conversion")
-                
-                # Ensure uint8, scale if necessary (assuming input range 0-1 or 0-255)
-                if image_array_hwc.dtype != np.uint8:
-                    if image_array_hwc.max() <= 1.0 and image_array_hwc.min() >= 0.0:
-                        image_array_hwc = (image_array_hwc * 255).astype(np.uint8)
-                    elif image_array_hwc.max() > 1.0: # Assume already 0-255 range if max > 1
-                         image_array_hwc = image_array_hwc.astype(np.uint8)
-                    # Handle other cases or raise error if range is unexpected
-                    else:
-                        raise ValueError(f"Cannot reliably convert dtype {image_array_hwc.dtype} with range [{image_array_hwc.min()}, {image_array_hwc.max()}] to uint8")
-                
-                # --- Pre-Prediction Validation ---
-                if not isinstance(image_array_hwc, np.ndarray):
-                     raise TypeError(f"image_array_hwc is not a numpy array (type: {type(image_array_hwc)})")
-                if image_array_hwc.shape != (self.image_size[0], self.image_size[1], 3):
-                    raise ValueError(f"image_array_hwc has incorrect shape {image_array_hwc.shape}. Expected {(self.image_size[0], self.image_size[1], 3)}")
-                if image_array_hwc.dtype != np.uint8:
-                    raise ValueError(f"image_array_hwc has incorrect dtype {image_array_hwc.dtype}. Expected np.uint8")
-                # --- End Pre-Prediction Validation ---
-                
-            except (ValueError, TypeError) as e:
-                 print(f"Warning: Skipping depth preparation for row index {index} due to image preparation error: {e}")
-                 continue
-            # --- End: Image Preparation ---
-
-            # --- Batching Logic ---
-            try:
-                # Convert prepared HWC uint8 numpy array to PIL Image
-                image_pil = Image.fromarray(image_array_hwc)
-                image_batch_for_depth.append(image_pil)
-                batch_indices.append(index) # Keep track of original index
-            except Exception as e:
-                print(f"Warning: Skipping row index {index} due to PIL conversion error: {e}")
-                continue
-                
-            # If batch is full or it's the last item, process the batch
-            if len(image_batch_for_depth) == self.depth_batch_size or index == df.index[-1]:
-                if image_batch_for_depth: # Ensure batch isn't empty
-                    # Predict depth for the current batch
-                    batch_results = self._predict_depth_batch(image_batch_for_depth)
-                    
-                    # Place results in the correct position using batch_indices
-                    for i, original_index in enumerate(batch_indices):
-                        predicted_depth = batch_results[i]
-                        all_depth_maps[df.index.get_loc(original_index)] = predicted_depth # Use get_loc for robustness
-                        
-                        # Save preview if prediction was successful and limit not reached
-                        if predicted_depth is not None and saved_depth_count < max_depth_saves:
-                            try:
-                                depth_img_array = (predicted_depth * 255).astype(np.uint8)
-                                depth_pil_preview = Image.fromarray(depth_img_array)
-                                depth_save_path = os.path.join(depth_save_dir, f"depth_preview_idx_{original_index}.png")
-                                depth_pil_preview.save(depth_save_path)
-                                
-                                # Save corresponding input preview (retrieve from image_batch_for_depth)
-                                input_img_pil = image_batch_for_depth[i]
-                                input_save_path = os.path.join(depth_save_dir, f"input_preview_idx_{original_index}.png")
-                                input_img_pil.save(input_save_path)
-                                
-                                print(f"Saved depth/input previews for index {original_index}")
-                                saved_depth_count += 1
-                            except Exception as e:
-                                 print(f"Warning: Could not save depth/input preview for index {original_index}: {e}")
-                                 
-                # Clear the batch for the next iteration
-                image_batch_for_depth = []
-                batch_indices = []
-        # --- End Batching Logic ---
-        
-        df['depth_map'] = all_depth_maps
-        # Optional: Drop rows where depth prediction failed
-        initial_len = len(df)
-        df = df.dropna(subset=['depth_map'])
-        if len(df) < initial_len:
-            print(f"Warning: Dropped {initial_len - len(df)} rows due to depth prediction errors.")
-            
-        print("Depth features generated and added.")
-        return df
-
     def load_data(self):
         """
         Load the dataset from a CSV file or pandas pickle file
@@ -312,13 +44,12 @@ class DataProcessor:
         print(f"Loaded dataset with {len(self.df)} records and {len(self.df.columns)} columns")
         return self.df
     
-    def preprocess_data(self, balance_classes=False, add_depth=False):
+    def preprocess_data(self, balance_classes=False):
         """
         Preprocess the loaded dataset
         
         Args:
             balance_classes (bool): Whether to balance classes based on skeletal classification
-            add_depth (bool): Whether to generate and add depth features.
             
         Returns:
             pandas.DataFrame: The preprocessed dataset
@@ -339,34 +70,16 @@ class DataProcessor:
         
         # Validate image data
         if 'Image' in self.df.columns:
-            # Check that all images have valid format (both grayscale and RGB)
+            # Check that all images have the expected format
             valid_images = []
             for idx, row in self.df.iterrows():
                 img_data = row['Image']
-                is_valid = False
-                
-                # Check lists (flattened images)
-                if isinstance(img_data, list):
-                    list_len = len(img_data)
-                    expected_gray_len = self.image_size[0] * self.image_size[1]
-                    expected_rgb_len = expected_gray_len * 3
-                    
-                    # Accept both grayscale and RGB sizes
-                    if list_len == expected_gray_len or list_len == expected_rgb_len:
-                        is_valid = True
-                
-                # Check numpy arrays
-                elif isinstance(img_data, np.ndarray):
-                    # Accept 2D arrays (grayscale) matching image size
-                    if img_data.ndim == 2 and img_data.shape == self.image_size:
-                        is_valid = True
-                    # Accept 3D arrays (RGB or grayscale with channel) with correct spatial dims
-                    elif img_data.ndim == 3:
-                        if (img_data.shape[-2:] == self.image_size or  # HWC format
-                            img_data.shape[1:] == self.image_size):    # CHW format
-                            is_valid = True
-                
-                valid_images.append(is_valid)
+                if isinstance(img_data, list) and len(img_data) == self.image_size[0] * self.image_size[1]:
+                    valid_images.append(True)
+                elif isinstance(img_data, np.ndarray) and img_data.shape[0] * img_data.shape[1] == self.image_size[0] * self.image_size[1]:
+                    valid_images.append(True)
+                else:
+                    valid_images.append(False)
             
             invalid_count = valid_images.count(False)
             if invalid_count > 0:
@@ -376,11 +89,7 @@ class DataProcessor:
                 self.df = self.df[valid_images]
                 print(f"Removed invalid images. Remaining records: {len(self.df)}")
         
-        # Generate depth features if requested
-        if add_depth:
-            self.df = self.add_depth_features(self.df)
-        
-        # Compute patient classes and balance if requested (AFTER potentially adding depth)
+        # Compute patient classes and balance if requested
         if balance_classes and self.classifier is not None:
             print("Computing skeletal classifications for patients...")
             self.df = self.classifier.classify_patients(self.df)
@@ -394,7 +103,7 @@ class DataProcessor:
         
         return self.df
     
-    def create_data_loaders(self, batch_size=32, train_ratio=0.8, val_ratio=0.1, num_workers=4, root_dir=None, balance_classes=False, use_depth=False):
+    def create_data_loaders(self, batch_size=32, train_ratio=0.8, val_ratio=0.1, num_workers=4, root_dir=None, balance_classes=False):
         """
         Create data loaders for training, validation, and testing
         
@@ -405,7 +114,6 @@ class DataProcessor:
             num_workers (int): Number of worker threads for data loading
             root_dir (str): Directory containing image files (if images are stored as files)
             balance_classes (bool): Whether to balance classes based on skeletal classification
-            use_depth (bool): Whether to include depth maps in the input features
             
         Returns:
             tuple: (train_loader, val_loader, test_loader)
@@ -422,8 +130,7 @@ class DataProcessor:
             val_ratio=val_ratio,
             apply_clahe=self.apply_clahe,
             root_dir=root_dir,
-            num_workers=num_workers,
-            use_depth=use_depth  # Pass use_depth parameter
+            num_workers=num_workers
         )
         
         return train_loader, val_loader, test_loader

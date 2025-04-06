@@ -19,7 +19,6 @@ class RandomRotation:
     
     def __call__(self, sample):
         image, landmarks = sample['image'], sample['landmarks']
-        depth = sample.get('depth') # Get depth if it exists
         
         if random.random() < self.p:
             # Generate a random angle between -max_angle and max_angle
@@ -35,15 +34,6 @@ class RandomRotation:
             # Rotate the image
             rotated_image = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
             
-            # Rotate depth map if it exists
-            rotated_depth = None
-            if depth is not None:
-                rotated_depth = cv2.warpAffine(depth, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0) # Use constant border for depth
-            
-            new_sample = {'image': rotated_image}
-            if rotated_depth is not None:
-                new_sample['depth'] = rotated_depth
-                
             # Rotate landmarks
             if landmarks.size > 0:
                 # Add a column of ones to the landmarks
@@ -53,11 +43,9 @@ class RandomRotation:
                 # Transform landmarks
                 transformed_landmarks = M.dot(points_ones.T).T
                 
-                new_sample['landmarks'] = transformed_landmarks
-            else:
-                new_sample['landmarks'] = landmarks # Keep empty landmarks if input was empty
-                
-            return new_sample
+                return {'image': rotated_image, 'landmarks': transformed_landmarks}
+            
+            return {'image': rotated_image, 'landmarks': landmarks}
         
         return sample
 
@@ -76,7 +64,6 @@ class RandomScaling:
     
     def __call__(self, sample):
         image, landmarks = sample['image'], sample['landmarks']
-        depth = sample.get('depth')
         
         if random.random() < self.p:
             # Generate a random scale factor
@@ -92,15 +79,6 @@ class RandomScaling:
             # Scale the image
             scaled_image = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
             
-            # Scale depth map if it exists
-            scaled_depth = None
-            if depth is not None:
-                scaled_depth = cv2.warpAffine(depth, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            
-            new_sample = {'image': scaled_image}
-            if scaled_depth is not None:
-                new_sample['depth'] = scaled_depth
-                
             # Scale landmarks
             if landmarks.size > 0:
                 # Scale landmarks around the center
@@ -110,11 +88,9 @@ class RandomScaling:
                 scaled_landmarks[:, 0] = center[0] + (scaled_landmarks[:, 0] - center[0]) * scale
                 scaled_landmarks[:, 1] = center[1] + (scaled_landmarks[:, 1] - center[1]) * scale
                 
-                new_sample['landmarks'] = scaled_landmarks
-            else:
-                new_sample['landmarks'] = landmarks
-                
-            return new_sample
+                return {'image': scaled_image, 'landmarks': scaled_landmarks}
+            
+            return {'image': scaled_image, 'landmarks': landmarks}
         
         return sample
 
@@ -133,7 +109,6 @@ class RandomShift:
     
     def __call__(self, sample):
         image, landmarks = sample['image'], sample['landmarks']
-        depth = sample.get('depth')
         
         if random.random() < self.p:
             # Generate random shifts in pixels
@@ -147,24 +122,12 @@ class RandomShift:
             shifted_image = cv2.warpAffine(image, M, (image.shape[1], image.shape[0]), 
                                           flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
             
-            # Shift depth map if it exists
-            shifted_depth = None
-            if depth is not None:
-                shifted_depth = cv2.warpAffine(depth, M, (depth.shape[1], depth.shape[0]),
-                                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-
-            new_sample = {'image': shifted_image}
-            if shifted_depth is not None:
-                new_sample['depth'] = shifted_depth
-                
             # Shift landmarks
             if landmarks.size > 0:
                 transformed_landmarks = landmarks + np.array([tx, ty])
-                new_sample['landmarks'] = transformed_landmarks
-            else:
-                new_sample['landmarks'] = landmarks
-
-            return new_sample
+                return {'image': shifted_image, 'landmarks': transformed_landmarks}
+            
+            return {'image': shifted_image, 'landmarks': landmarks}
         
         return sample
 

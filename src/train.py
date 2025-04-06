@@ -19,11 +19,10 @@ class TrainTransform:
         self.base_transforms = base_transforms
         
     def __call__(self, sample):
-        # Apply augmentations first
-        sample = self.train_augmentations(sample)
+        # First apply augmentation
+        augmented = self.train_augmentations(sample)
         # Then apply base transforms (ToTensor, Normalize)
-        sample = self.base_transforms(sample)
-        return sample
+        return self.base_transforms(augmented)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a landmark detection model')
@@ -82,10 +81,6 @@ def parse_args():
     parser.add_argument('--nesterov', action='store_true',
                         help='Enable Nesterov momentum for SGD optimizer')
     
-    # Feature Flags
-    parser.add_argument('--use_depth', action='store_true',
-                        help='Generate and use depth map as an additional input feature channel.')
-    
     # Loss Normalization arguments
     parser.add_argument('--no_loss_norm', action='store_true',
                         help='Disable running average loss normalization in CombinedLoss')
@@ -104,6 +99,14 @@ def parse_args():
     parser.add_argument('--log_specific_med', type=int, nargs='*', default=None,
                         help='List of landmark indices (0-based) to log MED for separately during training.')
     
+    # Depth Feature Arguments
+    parser.add_argument('--use_depth', action='store_true',
+                        help='Use depth features for training')
+    parser.add_argument('--depth_fusion_method', type=str, choices=['concat', 'add', 'attention'], default='concat',
+                        help='Method to fuse depth features with RGB features')
+    parser.add_argument('--depth_cache_dir', type=str, default=None,
+                        help='Directory to cache depth features (if not provided, features will be extracted on-the-fly)')
+    
     return parser.parse_args()
 
 def set_seed(seed):
@@ -116,43 +119,126 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16, num_workers=0, use_depth=False):
+def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16, 
+                                        train_ratio=0.8, val_ratio=0.1, 
+                                        apply_clahe=True, root_dir=None, 
+                                        num_workers=4, balance_classes=False):
     """
-    Create PyTorch dataloaders with data augmentation for training
+    Create train, validation, and test DataLoaders with proper augmentations
     
     Args:
-        df (pandas.DataFrame): DataFrame with training data
+        df (pandas.DataFrame): DataFrame containing the dataset
         landmark_cols (list): List of column names containing landmark coordinates
-        batch_size (int): Batch size for dataloader
+        batch_size (int): Batch size for dataloaders
+        train_ratio (float): Ratio of data to use for training
+        val_ratio (float): Ratio of data to use for validation
+        apply_clahe (bool): Whether to apply CLAHE for histogram equalization
+        root_dir (str): Directory containing images (if images are stored as files)
         num_workers (int): Number of worker threads for dataloader
-        use_depth (bool): Whether to use depth features
+        balance_classes (bool): Whether to balance training data using skeletal classification
         
     Returns:
         tuple: (train_loader, val_loader, test_loader)
     """
-    # Create dataloaders with a specific train/val/test split
-    data_processor = DataProcessor(
-        data_path=None,  # Use None since we're passing the DataFrame directly
-        landmark_cols=landmark_cols,
-        image_size=(224, 224),
-        apply_clahe=args.apply_clahe
+    # If 'set' column is already present, use it for splitting
+    if 'set' in df.columns:
+        train_df = df[df['set'] == 'train'].copy()
+        val_df = df[df['set'] == 'dev'].copy()
+        test_df = df[df['set'] == 'test'].copy()
+    else:
+        # Randomly split the data
+        n = len(df)
+        indices = np.random.permutation(n)
+        
+        train_size = int(train_ratio * n)
+        val_size = int(val_ratio * n)
+        
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size:train_size + val_size]
+        test_indices = indices[train_size + val_size:]
+        
+        train_df = df.iloc[train_indices].copy()
+        val_df = df.iloc[val_indices].copy()
+        test_df = df.iloc[test_indices].copy()
+    
+    # Display original class distribution before balancing
+    if balance_classes and 'skeletal_class' in df.columns:
+        # Count classes in original training data
+        if 'skeletal_class' in train_df.columns:
+            train_class_counts = train_df['skeletal_class'].value_counts().sort_index()
+            print("Original training class distribution:")
+            for label, count in train_class_counts.items():
+                class_name = {1: "Class I", 2: "Class II", 3: "Class III"}.get(label, f"Class {label}")
+                print(f"  {class_name}: {count} samples ({count/len(train_df)*100:.1f}%)")
+    
+    # Balance ONLY the training data if requested
+    if balance_classes:
+        # First, make sure we have skeletal class information
+        if 'skeletal_class' not in train_df.columns:
+            print("Computing skeletal classifications for the training set...")
+            from data.patient_classifier import PatientClassifier
+            classifier = PatientClassifier(landmark_cols)
+            train_df = classifier.classify_patients(train_df)
+        
+        # Now balance the training data
+        print("Balancing training data using skeletal classification...")
+        from data.patient_classifier import PatientClassifier
+        classifier = PatientClassifier(landmark_cols)
+        train_df = classifier.balance_classes(train_df, class_column='skeletal_class', balance_method='upsample')
+        print(f"Balanced training data: {len(train_df)} samples")
+        
+        # Show balanced distribution
+        if 'skeletal_class' in train_df.columns:
+            train_class_counts = train_df['skeletal_class'].value_counts().sort_index()
+            print("Balanced training class distribution:")
+            for label, count in train_class_counts.items():
+                class_name = {1: "Class I", 2: "Class II", 3: "Class III"}.get(label, f"Class {label}")
+                print(f"  {class_name}: {count} samples ({count/len(train_df)*100:.1f}%)")
+    
+    # Define data transformations (non-augmentation)
+    base_transforms = transforms.Compose([
+        ToTensor(),
+        Normalize()
+    ])
+    
+    # Training transformations with augmentations
+    train_augmentations = get_train_transforms(include_horizontal_flip=False)
+    
+    # Create custom transform that applies augmentations before tensor conversion
+    train_transform = TrainTransform(train_augmentations, base_transforms)
+    
+    # Create datasets
+    train_dataset = CephalometricDataset(
+        train_df, root_dir=root_dir, transform=train_transform, 
+        landmark_cols=landmark_cols, train=True, apply_clahe=apply_clahe
     )
     
-    # If df is provided, use it directly
-    if df is not None:
-        data_processor.df = df
+    val_dataset = CephalometricDataset(
+        val_df, root_dir=root_dir, transform=base_transforms, 
+        landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe
+    )
+    
+    test_dataset = CephalometricDataset(
+        test_df, root_dir=root_dir, transform=base_transforms, 
+        landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe
+    )
     
     # Create dataloaders
-    train_loader, val_loader, test_loader = data_processor.create_data_loaders(
-        batch_size=batch_size,
-        train_ratio=0.8,  # 80% for training
-        val_ratio=0.1,    # 10% for validation
-        num_workers=num_workers,
-        balance_classes=False,  # We assume dataset is already balanced or will be handled separately
-        use_depth=use_depth       # Pass the use_depth flag to create_data_loaders
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, 
+        num_workers=num_workers, pin_memory=True
     )
     
-    # Return the dataloaders
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, 
+        num_workers=num_workers, pin_memory=True
+    )
+    
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False, 
+        num_workers=num_workers, pin_memory=True
+    )
+    
     return train_loader, val_loader, test_loader
 
 def main():
@@ -171,180 +257,214 @@ def main():
        'upper 1 apex_x', 'upper 1 apex_y', 'lower 1 tip_x', 'lower 1 tip_y',
        'lower 1 apex_x', 'lower 1 apex_y', 'ANS_x', 'ANS_y', 'PNS_x', 'PNS_y',
        'Gonion _x', 'Gonion _y', 'Menton_x', 'Menton_y', 'ST Nasion_x',
-       'ST Nasion_y', 'Tip of the nose_x', 'Tip of the nose_y', 'Subnasal_x',
-       'Subnasal_y', 'Upper lip_x', 'Upper lip_y', 'Lower lip_x',
-       'Lower lip_y', 'ST Pogonion_x', 'ST Pogonion_y', 'gnathion_x',
-       'gnathion_y']
+       'ST Nasion_y', 'ST A point_x', 'ST A point_y', 'ST B point_x',
+       'ST B point_y', 'ST Upper lip_x', 'ST Upper lip_y', 'ST Lower lip_x',
+       'ST Lower lip_y', 'ST Menton_x', 'ST Menton_y', 'ST Pogonion_x',
+       'ST Pogonion_y']
     
-    # Extract landmark names for evaluation
-    landmark_names = []
-    for i in range(0, len(landmark_cols), 2):
-        # Extract name from column (removing _x or _y suffix)
-        name = landmark_cols[i].replace('_x', '')
-        landmark_names.append(name)
+    # Fix inconsistent column names
+    landmark_cols = [col.replace('Gonion _', 'Gonion_') for col in landmark_cols]
     
-    # Initialize data processor
-    data_processor = DataProcessor(
-        data_path=args.data_path,
-        landmark_cols=landmark_cols,
-        image_size=(224, 224),
-        apply_clahe=args.apply_clahe
-    )
-    
-    # Load and preprocess data - but DON'T balance here!
-    # We only want to balance the training set, not all data
-    df = data_processor.preprocess_data(balance_classes=False, add_depth=args.use_depth)
-    
-    # Compute skeletal classifications for reporting, if class balancing is requested
-    if args.balance_classes and df is not None:
-        print("Computing skeletal classifications for reporting purposes...")
-        df = data_processor.compute_patient_classes()
-    
-    # Get dataset statistics
-    stats = data_processor.get_data_stats()
-    print("Dataset Statistics:")
-    print(f"Total samples: {stats['total_samples']}")
-    
-    if 'set_counts' in stats:
-        print("Set counts:")
-        for set_name, count in stats['set_counts'].items():
-            print(f"  {set_name}: {count}")
-    
-    if 'class_counts' in stats:
-        print("Class counts:")
-        for class_name, count in stats['class_counts'].items():
-            print(f"  {class_name}: {count}")
-    
-    if 'skeletal_class_counts' in stats:
-        print("Overall Skeletal Class Distribution:")
-        for class_label, count in stats['skeletal_class_counts'].items():
-            class_name = stats['skeletal_class_names'].get(class_label, str(class_label))
-            print(f"  {class_name}: {count} patients ({count/stats['total_samples']*100:.1f}%)")
-    
-    # Check MPS availability for Mac users
-    if args.use_mps and platform.system() == 'Darwin':
-        if torch.backends.mps.is_available():
-            print("MPS (Metal Performance Shaders) is available for Mac GPU acceleration.")
+    # Load data
+    print(f"Loading data from {args.data_path}")
+    try:
+        if args.data_path.endswith('.csv'):
+            df = pd.read_csv(args.data_path)
+        elif args.data_path.endswith('.parquet'):
+            df = pd.read_parquet(args.data_path)
+        elif args.data_path.endswith('.h5') or args.data_path.endswith('.hdf5'):
+            df = pd.read_hdf(args.data_path)
         else:
-            print("WARNING: MPS requested but not available. Falling back to CPU.")
-            args.use_mps = False
-    
-    # Create data loaders with augmentation (only balance the training set)
-    print("Creating dataloaders with augmentation for training set...")
-    train_loader, val_loader, test_loader = create_dataloader_with_augmentations(
-        df=df,
-        landmark_cols=landmark_cols,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        use_depth=args.use_depth
-    )
-    
-    print(f"Created data loaders:")
-    print(f"  Training samples: {len(train_loader.dataset)} {'(balanced)' if args.balance_classes else ''}")
-    print(f"  Validation samples: {len(val_loader.dataset)} (original distribution)")
-    print(f"  Test samples: {len(test_loader.dataset)} (original distribution)")
+            raise ValueError(f"Unsupported file format: {args.data_path}")
+        
+        print(f"Loaded data: {len(df)} samples")
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return
     
     # Determine device
-    device = None
     if args.force_cpu:
-        device = torch.device('cpu')
-        print("Using CPU as requested with --force_cpu")
+        device = torch.device("cpu")
+        print("Forcing CPU usage")
+    elif args.use_mps and torch.backends.mps.is_available() and platform.system() == 'Darwin':
+        device = torch.device("mps")
+        print("Using MPS device (Apple Silicon GPU)")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("Using CUDA device")
+    else:
+        device = torch.device("cpu")
+        print("Using CPU device")
     
-    # Log training configuration
-    print("\nTraining Configuration:")
-    print(f"  Model: HRNet-W32 with{'' if args.use_refinement else 'out'} refinement MLP")
+    # Process data
+    processor = DataProcessor(df, landmark_cols=landmark_cols)
+    df = processor.process_data()
     
-    # Log optimizer info
-    print(f"  Optimizer: {args.optimizer.upper()}")
-    if args.optimizer == 'sgd':
-        print(f"    Momentum: {args.momentum}")
-        print(f"    Nesterov: {args.nesterov}")
-    print(f"  Learning rate: {args.learning_rate}")
-    print(f"  Weight decay: {args.weight_decay}")
+    # Extract and cache depth features if enabled
+    depth_features = None
+    if args.use_depth:
+        from utils.depth_features import DepthFeatureExtractor
+        
+        print("Initializing depth feature extraction...")
+        cache_dir = args.depth_cache_dir or os.path.join(args.output_dir, 'depth_cache')
+        
+        depth_extractor = DepthFeatureExtractor(cache_dir=cache_dir, device=device)
+        
+        # Create temporary dataset to extract features
+        from data.dataset import CephalometricDataset
+        temp_transform = transforms.Compose([ToTensor()])
+        
+        # Split the dataframe if not already split
+        if 'set' not in df.columns:
+            print("Splitting data into train/val/test sets")
+            np.random.seed(args.seed)
+            n = len(df)
+            indices = np.random.permutation(n)
+            
+            train_ratio = 0.8
+            val_ratio = 0.1
+            
+            train_size = int(train_ratio * n)
+            val_size = int(val_ratio * n)
+            
+            train_indices = indices[:train_size]
+            val_indices = indices[train_size:train_size + val_size]
+            test_indices = indices[train_size + val_size:]
+            
+            df.loc[:, 'set'] = 'test'  # Default to test
+            df.loc[train_indices, 'set'] = 'train'
+            df.loc[val_indices, 'set'] = 'dev'
+        
+        # Create temporary datasets for feature extraction
+        train_df = df[df['set'] == 'train'].copy()
+        val_df = df[df['set'] == 'dev'].copy()
+        test_df = df[df['set'] == 'test'].copy()
+        
+        temp_train_dataset = CephalometricDataset(
+            train_df, transform=temp_transform, 
+            landmark_cols=landmark_cols, apply_clahe=args.apply_clahe
+        )
+        
+        temp_val_dataset = CephalometricDataset(
+            val_df, transform=temp_transform, 
+            landmark_cols=landmark_cols, apply_clahe=args.apply_clahe
+        )
+        
+        temp_test_dataset = CephalometricDataset(
+            test_df, transform=temp_transform, 
+            landmark_cols=landmark_cols, apply_clahe=args.apply_clahe
+        )
+        
+        print("Extracting depth features for training set...")
+        train_features = depth_extractor.process_and_cache_dataset(temp_train_dataset, cache_suffix="train")
+        
+        print("Extracting depth features for validation set...")
+        val_features = depth_extractor.process_and_cache_dataset(temp_val_dataset, cache_suffix="val")
+        
+        print("Extracting depth features for test set...")
+        test_features = depth_extractor.process_and_cache_dataset(temp_test_dataset, cache_suffix="test")
+        
+        # Combine all features into a global index mapping
+        depth_features = {}
+        
+        # For train set
+        for i, global_idx in enumerate(train_df.index):
+            if i in train_features:
+                depth_features[global_idx] = train_features[i]
+                
+        # For validation set
+        for i, global_idx in enumerate(val_df.index):
+            if i in val_features:
+                depth_features[global_idx] = val_features[i]
+                
+        # For test set
+        for i, global_idx in enumerate(test_df.index):
+            if i in test_features:
+                depth_features[global_idx] = test_features[i]
+        
+        print(f"Extracted depth features for {len(depth_features)} images")
+        
+        # Save sample depth visualizations
+        os.makedirs(os.path.join(args.output_dir, 'depth_samples'), exist_ok=True)
+        
+        # Get a few samples from the training set
+        for i in range(min(5, len(temp_train_dataset))):
+            sample = temp_train_dataset[i]
+            image = sample['image']
+            # Convert from tensor to numpy for visualization
+            if isinstance(image, torch.Tensor):
+                image = image.permute(1, 2, 0).numpy()
+                
+            save_path = os.path.join(args.output_dir, 'depth_samples', f'sample_{i}.png')
+            depth_extractor.save_depth_visualization(image, save_path)
     
-    print(f"  Batch size: {args.batch_size}")
-    print(f"  Number of epochs: {args.num_epochs}")
-    if args.use_refinement:
-        print(f"  Heatmap loss weight: {args.heatmap_weight}")
-        print(f"  Coordinate loss weight: {args.coord_weight}")
-    if args.balance_classes:
-        print(f"  Training data balance method: {args.balance_method} (validation and test sets maintain original distribution)")
-    print(f"  Device: {'MPS (Mac GPU)' if args.use_mps else 'CUDA' if torch.cuda.is_available() and not args.force_cpu else 'CPU'}")
-    print(f"  Output directory: {args.output_dir}")
+    # Create dataloaders
+    print("Creating dataloaders...")
+    train_loader, val_loader, test_loader = create_dataloaders(
+        df, landmark_cols, batch_size=args.batch_size, 
+        apply_clahe=args.apply_clahe, num_workers=args.num_workers,
+        balance_classes=args.balance_classes, depth_features=depth_features,
+        use_depth=args.use_depth
+    )
+    print(f"Created dataloaders: train={len(train_loader.dataset)} samples, val={len(val_loader.dataset)} samples, test={len(test_loader.dataset)} samples")
+    
+    # Calculate total steps for OneCycleLR if needed
+    total_steps = None
+    if args.scheduler == 'onecycle':
+        steps_per_epoch = len(train_loader)
+        total_steps = steps_per_epoch * args.num_epochs
+    
+    # Set scheduler params - default to num_epochs/2 for T_max if not specified
+    if args.scheduler == 'cosine' and args.lr_t_max == 10:
+        lr_t_max = args.num_epochs // 2
+    else:
+        lr_t_max = args.lr_t_max
     
     # Create trainer
+    print("Creating landmark trainer...")
     trainer = LandmarkTrainer(
-        num_landmarks=args.num_landmarks,
+        num_landmarks=args.num_landmarks // 2,  # Each landmark has x,y coordinates
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
-        device=device,  # Auto-select or forced CPU
+        device=device,
         output_dir=args.output_dir,
         use_refinement=args.use_refinement,
         heatmap_weight=args.heatmap_weight,
         coord_weight=args.coord_weight,
         use_mps=args.use_mps,
-        # Weight scheduling parameters
-        use_weight_schedule=args.use_weight_schedule,
-        initial_heatmap_weight=args.initial_heatmap_weight,
-        initial_coord_weight=args.initial_coord_weight,
-        final_heatmap_weight=args.final_heatmap_weight,
-        final_coord_weight=args.final_coord_weight,
-        weight_schedule_epochs=args.weight_schedule_epochs,
-        # Learning rate scheduler parameters
-        scheduler_type=None if args.scheduler == 'none' else args.scheduler,
+        hrnet_type='w32',
+        scheduler_type=args.scheduler if args.scheduler != 'none' else None,
         lr_patience=args.lr_patience,
         lr_factor=args.lr_factor,
         lr_min=args.lr_min,
-        lr_t_max=args.lr_t_max if args.lr_t_max > 0 else args.num_epochs // 2,
-        # OneCycleLR parameters
+        lr_t_max=lr_t_max,
         max_lr=args.max_lr,
         pct_start=args.pct_start,
         div_factor=args.div_factor,
         final_div_factor=args.final_div_factor,
-        # Optimizer parameters
         optimizer_type=args.optimizer,
         momentum=args.momentum,
         nesterov=args.nesterov,
-        # Loss normalization parameters
         use_loss_normalization=not args.no_loss_norm,
         norm_decay=args.loss_norm_decay,
         norm_epsilon=args.loss_norm_epsilon,
-        # Per-Landmark Weighting/Focusing
+        total_steps=total_steps,
         target_landmark_indices=args.target_indices,
         landmark_weights=args.landmark_weights,
-        # Specific MED Logging
         log_specific_landmark_indices=args.log_specific_med,
-        use_depth_features=args.use_depth # Pass use_depth flag
+        use_depth=args.use_depth,
+        depth_fusion_method=args.depth_fusion_method
     )
     
-    # Train model
-    print("\nStarting training...")
-    trainer.train(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        num_epochs=args.num_epochs,
-        save_freq=args.save_freq
-    )
+    # Train the model
+    print("Starting training...")
+    trainer.train(train_loader, val_loader, num_epochs=args.num_epochs, save_freq=args.save_freq)
     
-    # Evaluate model on test set
-    print("Evaluating model on test set...")
-    results = trainer.evaluate(
-        test_loader, 
-        save_visualizations=True,
-        landmark_names=landmark_names,
-        landmark_cols=landmark_cols  # Pass landmark columns for skeletal classification
-    )
+    # Evaluate the final model
+    print("\nEvaluating the final model on test set...")
+    trainer.evaluate(test_loader, save_visualizations=True)
     
-    # Print evaluation results
-    print("\nEvaluation Results:")
-    print(f"Mean Euclidean Distance: {results['mean_euclidean_distance']:.2f} pixels")
-    print(f"Success Rate (2mm): {results['success_rate_2mm'] * 100:.2f}%")
-    print(f"Success Rate (4mm): {results['success_rate_4mm'] * 100:.2f}%")
-    
-    print("\nDetailed per-landmark metrics have been saved to:")
-    print(f"  {os.path.join(args.output_dir, 'evaluation', 'reports')}")
-    
-    print("\nTraining completed successfully!")
+    print("Training and evaluation completed successfully!")
 
 if __name__ == "__main__":
     main() 
