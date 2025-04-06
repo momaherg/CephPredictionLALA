@@ -14,7 +14,7 @@ class CephalometricDataset(Dataset):
 
     def __init__(self, dataframe, root_dir=None, transform=None, landmark_cols=None, 
                  train=True, apply_clahe=False, clahe_clip_limit=2.0, 
-                 clahe_grid_size=(8, 8), use_depth=False):
+                 clahe_grid_size=(8, 8), use_depth=False, image_size=(224, 224)):
         """
         Args:
             dataframe (pandas.DataFrame): DataFrame with annotations and image data.
@@ -26,6 +26,7 @@ class CephalometricDataset(Dataset):
             clahe_clip_limit (float): Clip limit for CLAHE.
             clahe_grid_size (tuple): Grid size for CLAHE.
             use_depth (bool): Whether to load and include the depth map.
+            image_size (tuple): Expected image size.
         """
         self.dataframe = dataframe
         self.root_dir = root_dir
@@ -36,6 +37,7 @@ class CephalometricDataset(Dataset):
         self.clahe_clip_limit = clahe_clip_limit
         self.clahe_grid_size = clahe_grid_size
         self.use_depth = use_depth
+        self.image_size = image_size
         
         # Check if depth column exists if use_depth is True
         if self.use_depth and 'depth_map' not in self.dataframe.columns:

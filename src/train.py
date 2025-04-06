@@ -217,7 +217,7 @@ def create_dataloader_with_augmentations(df, landmark_cols, batch_size=16,
     
     test_dataset = CephalometricDataset(
         test_df, root_dir=root_dir, transform=base_transforms, 
-        landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe, use_depth=use_depth
+        landmark_cols=landmark_cols, train=False, apply_clahe=apply_clahe, use_depth=use_depth, image_size=(224, 224)
     )
     
     # Create dataloaders
