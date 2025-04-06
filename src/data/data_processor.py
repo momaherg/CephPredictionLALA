@@ -113,54 +113,118 @@ class DataProcessor:
 
         print("Generating depth features for dataset... This may take a while.")
         depth_maps = []
+        saved_depth_count = 0
+        max_depth_saves = 2 # Number of depth maps to save for preview
+        depth_save_dir = "./outputs/depth_previews"
+        os.makedirs(depth_save_dir, exist_ok=True) # Create directory if it doesn't exist
+        
         for index, row in tqdm(df.iterrows(), total=len(df), desc="Generating Depth Maps"):
-            image_array = row['Image']
+            image_data = row['Image']
+            image_array = None # Initialize image_array for this iteration
             
-            # Ensure image_array is a numpy array
-            if isinstance(image_array, list):
-                try:
-                    list_len = len(image_array)
+            # --- Start: Image Data Conversion --- 
+            try:
+                if isinstance(image_data, list):
+                    # --- Debugging Start ---
+                    print(f"\n[Debug Index {index}] Detected list input.")
+                    try:
+                        np_array_flat = np.array(image_data) # Convert list to numpy array first
+                    except Exception as e:
+                         print(f"[Debug Index {index}] Error during np.array(list): {e}")
+                         raise TypeError("Failed to convert list to np array")
+                         
+                    list_len = np_array_flat.size
+                    dtype = np_array_flat.dtype
                     expected_len_gray = self.image_size[0] * self.image_size[1]
                     expected_len_rgb = expected_len_gray * 3
-
+                    print(f"[Debug Index {index}] List Length: {list_len}, Dtype: {dtype}")
+                    print(f"[Debug Index {index}] Expected Gray Length: {expected_len_gray}, Expected RGB Length: {expected_len_rgb}")
+                    # --- Debugging End ---
+                    
                     if list_len == expected_len_gray:
-                        # Reshape grayscale list
-                        image_array = np.array(image_array).reshape(self.image_size)
+                        print(f"[Debug Index {index}] Matched Gray Length. Reshaping to {self.image_size}.")
+                        image_array = np_array_flat.reshape(self.image_size) # Reshape grayscale
                     elif list_len == expected_len_rgb:
-                        # Reshape RGB list
-                        image_array = np.array(image_array).reshape((self.image_size[0], self.image_size[1], 3))
+                        print(f"[Debug Index {index}] Matched RGB Length. Reshaping to {(self.image_size[0], self.image_size[1], 3)}.")
+                        image_array = np_array_flat.reshape((self.image_size[0], self.image_size[1], 3)) # Reshape RGB
                     else:
                         raise ValueError(f"List length {list_len} does not match expected grayscale ({expected_len_gray}) or RGB ({expected_len_rgb})")
-                except ValueError as e:
-                    print(f"Warning: Skipping depth prediction for row index {index} due to image list conversion error: {e}")
-                    depth_maps.append(None)
-                    continue # Skip to next row
-            elif not isinstance(image_array, np.ndarray):
-                print(f"Warning: Skipping depth prediction for row index {index} due to unexpected image data type: {type(image_array)}")
+                
+                elif isinstance(image_data, np.ndarray):
+                    print(f"\n[Debug Index {index}] Detected numpy array input. Shape: {image_data.shape}, Dtype: {image_data.dtype}")
+                    image_array = image_data # Already a numpy array
+                
+                else:
+                    raise TypeError(f"Unexpected image data type: {type(image_data)}")
+                    
+            except (ValueError, TypeError) as e:
+                print(f"Warning: Skipping depth prediction for row index {index} due to image data conversion error: {e}")
                 depth_maps.append(None)
                 continue # Skip to next row
-
-            # Ensure image is in HWC format (common output from preprocessing)
-            if image_array.ndim == 2: # Grayscale -> Add channel dim -> Repeat channel
-                 image_array = np.stack([image_array]*3, axis=-1)
-            elif image_array.ndim == 3 and image_array.shape[0] == 3: # CHW -> HWC
-                 image_array = image_array.transpose(1, 2, 0)
-            elif image_array.ndim == 3 and image_array.shape[-1] == 1: # HW1 -> HWC
-                image_array = np.concatenate([image_array]*3, axis=-1)
-            elif image_array.ndim != 3 or image_array.shape[-1] != 3: # Check if HWC
-                print(f"Warning: Skipping depth prediction for image with unexpected shape {image_array.shape}")
-                depth_maps.append(None) # Append None if shape is wrong
-                continue
+            # --- End: Image Data Conversion ---
+            
+            # --- Start: Image Preparation for Depth Model ---
+            try: 
+                # Ensure image is in HWC uint8 format
+                if image_array.ndim == 2: # Grayscale -> HWC
+                     image_array_hwc = np.stack([image_array]*3, axis=-1)
+                elif image_array.ndim == 3 and image_array.shape[0] == 3: # CHW -> HWC
+                     image_array_hwc = image_array.transpose(1, 2, 0)
+                elif image_array.ndim == 3 and image_array.shape[-1] == 1: # HW1 -> HWC
+                    image_array_hwc = np.concatenate([image_array]*3, axis=-1)
+                elif image_array.ndim == 3 and image_array.shape[-1] == 3: # Already HWC
+                    image_array_hwc = image_array
+                else:
+                    raise ValueError(f"Unexpected image shape {image_array.shape} after conversion")
                 
-            # Check if image needs rescaling if not uint8 (e.g., float 0-1)
-            if image_array.dtype != np.uint8:
-                if image_array.max() <= 1.0:
-                    image_array = (image_array * 255).astype(np.uint8)
-                else: # Assume already 0-255 if max > 1.0 but not uint8
-                    image_array = image_array.astype(np.uint8)
-                    
-            depth_map = self._predict_depth(image_array)
+                # Ensure uint8, scale if necessary (assuming input range 0-1 or 0-255)
+                if image_array_hwc.dtype != np.uint8:
+                    if image_array_hwc.max() <= 1.0 and image_array_hwc.min() >= 0.0:
+                        image_array_hwc = (image_array_hwc * 255).astype(np.uint8)
+                    elif image_array_hwc.max() > 1.0: # Assume already 0-255 range if max > 1
+                         image_array_hwc = image_array_hwc.astype(np.uint8)
+                    # Handle other cases or raise error if range is unexpected
+                    else:
+                        raise ValueError(f"Cannot reliably convert dtype {image_array_hwc.dtype} with range [{image_array_hwc.min()}, {image_array_hwc.max()}] to uint8")
+                
+                # --- Pre-Prediction Validation ---
+                if not isinstance(image_array_hwc, np.ndarray):
+                     raise TypeError(f"image_array_hwc is not a numpy array (type: {type(image_array_hwc)})")
+                if image_array_hwc.shape != (self.image_size[0], self.image_size[1], 3):
+                    raise ValueError(f"image_array_hwc has incorrect shape {image_array_hwc.shape}. Expected {(self.image_size[0], self.image_size[1], 3)}")
+                if image_array_hwc.dtype != np.uint8:
+                    raise ValueError(f"image_array_hwc has incorrect dtype {image_array_hwc.dtype}. Expected np.uint8")
+                # --- End Pre-Prediction Validation ---
+                
+            except (ValueError, TypeError) as e:
+                 print(f"Warning: Skipping depth prediction for row index {index} due to image preparation error: {e}")
+                 depth_maps.append(None)
+                 continue
+            # --- End: Image Preparation ---
+
+            # Predict depth    
+            depth_map = self._predict_depth(image_array_hwc)
             depth_maps.append(depth_map)
+            
+            # Save preview if prediction was successful and limit not reached
+            if depth_map is not None and saved_depth_count < max_depth_saves:
+                try:
+                    # Save Depth Map
+                    depth_img_array = (depth_map * 255).astype(np.uint8) # Scale 0-1 float to 0-255 uint8
+                    depth_pil = Image.fromarray(depth_img_array)
+                    depth_save_path = os.path.join(depth_save_dir, f"depth_preview_idx_{index}.png")
+                    depth_pil.save(depth_save_path)
+                    
+                    # Save Corresponding Input Image
+                    input_img_pil = Image.fromarray(image_array_hwc) # Use the prepared HWC uint8 image
+                    input_save_path = os.path.join(depth_save_dir, f"input_preview_idx_{index}.png")
+                    input_img_pil.save(input_save_path)
+                    
+                    print(f"Saved depth map preview to: {depth_save_path}")
+                    print(f"Saved corresponding input preview to: {input_save_path}")
+                    saved_depth_count += 1
+                except Exception as e:
+                     print(f"Warning: Could not save depth/input preview for index {index}: {e}")
         
         df['depth_map'] = depth_maps
         # Optional: Drop rows where depth prediction failed
