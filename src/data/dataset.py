@@ -47,41 +47,68 @@ class CephalometricDataset(Dataset):
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
-        
+
         row = self.dataframe.iloc[idx]
+        
+        # --- Image Loading --- 
         img_data = row['Image']
-        landmarks = row[self.landmark_cols].values.astype('float').reshape(-1, 2)
+        if isinstance(img_data, np.ndarray):
+            img = img_data.astype(np.float32)
+        else:
+             # This should ideally not happen if DataProcessor ran correctly
+             # You might want to log a more specific error or handle list conversion again
+             # For now, raise an error if it's not an ndarray as expected.
+             raise TypeError(f"Expected 'Image' column to contain numpy arrays, but got {type(img_data)} at index {idx}")
+             
+        # --- Landmark Loading ---
+        landmarks = row[self.landmark_cols].values.astype('float32').reshape(-1, 2)
         
-        # --- Simplified Image Loading ---
-        # Assume img_data is always a 2D numpy array (H, W) with dtype float32
-        if not isinstance(img_data, np.ndarray) or img_data.ndim != 2:
-            raise TypeError(f"Unexpected image data type or shape at index {idx}. Expected 2D numpy array, got {type(img_data)} with shape {getattr(img_data, 'shape', 'N/A')}.")
-        
-        img = img_data.astype(np.float32) # Ensure float32 just in case
-        # -----------------------------
-
-        # Apply CLAHE if requested
-        if self.apply_clahe:
-            # Convert to uint8 for CLAHE
-            img_uint8 = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
-            # Create CLAHE object on-the-fly
-            clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit, tileGridSize=self.clahe_grid_size)
-            img_uint8 = clahe.apply(img_uint8)
-            # Convert back to float32
-            img = img_uint8.astype(np.float32) / 255.0
-
-        sample = {'image': img, 'landmarks': landmarks}
-
-        # Add depth map if requested and available
+        # --- Depth Map Loading (if applicable) ---
+        depth_map = None
         if self.use_depth:
-            depth_data = row.get('depth_map', None)
-            if isinstance(depth_data, np.ndarray) and depth_data.ndim == 2 and depth_data.shape == img.shape:
-                sample['depth'] = depth_data.astype(np.float32) # Ensure float32
-            else:
-                # Handle missing/invalid depth map (e.g., add zeros or raise error)
-                print(f"Warning: Missing or invalid depth map for index {idx}. Using zeros.")
-                sample['depth'] = np.zeros_like(img, dtype=np.float32)
+            depth_data = row.get('depth_map', None) # Use .get for safety
+            if isinstance(depth_data, np.ndarray):
+                 # Ensure depth is float32 and has shape (H, W) - add channel dim later if needed by transforms
+                 depth_map = depth_data.astype(np.float32)
+                 if depth_map.ndim == 3: # Handle cases where it might have an unnecessary channel dim
+                     depth_map = depth_map.squeeze()
+                 if depth_map.shape != (img.shape[0], img.shape[1]): # Check shape consistency with image H,W
+                      raise ValueError(f"Depth map at index {idx} has shape {depth_map.shape}, expected {(img.shape[0], img.shape[1])}")
+            elif depth_data is not None:
+                 raise TypeError(f"Expected 'depth_map' column to contain numpy arrays, but got {type(depth_data)} at index {idx}")
+            # If depth_data is None, depth_map remains None
 
+        # --- Apply CLAHE if requested (only to image) ---
+        if self.apply_clahe:
+             # Ensure image is uint8 for CLAHE
+             if img.dtype != np.uint8:
+                 # Scale if float 0-1 range
+                 if img.max() <= 1.0 and img.min() >= 0.0:
+                      img = (img * 255).astype(np.uint8)
+                 else: # Assume 0-255 range otherwise
+                      img = img.astype(np.uint8)
+                      
+             # Apply CLAHE to grayscale version if RGB
+             if img.ndim == 3 and img.shape[-1] == 3:
+                 img_gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+                 clahe_img = self._create_clahe().apply(img_gray)
+                 img = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB) # Convert back to 3 channels
+             elif img.ndim == 2: # Apply directly if grayscale
+                 img = self._create_clahe().apply(img)
+             else:
+                 print(f"Warning: Skipping CLAHE for unexpected image shape {img.shape} at index {idx}")
+                 # Ensure img is float32 again if CLAHE wasn't applied as expected
+                 img = img.astype(np.float32) / 255.0 if img.dtype == np.uint8 else img.astype(np.float32)
+                 
+             # Convert back to float32 (0-1 range) after CLAHE
+             img = img.astype(np.float32) / 255.0
+        
+        # --- Prepare Sample Dictionary ---
+        sample = {'image': img, 'landmarks': landmarks}
+        if self.use_depth and depth_map is not None:
+             sample['depth'] = depth_map # Add depth map if available
+        
+        # --- Apply Transforms --- 
         if self.transform:
             sample = self.transform(sample)
 
