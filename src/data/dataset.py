@@ -58,21 +58,50 @@ class CephalometricDataset(Dataset):
                 expected_gray_len = 224 * 224
                 expected_rgb_len = expected_gray_len * 3
                 
-                # Allow for small variations in expected sizes
-                is_gray = abs(list_len - expected_gray_len) < 10  # Allow small tolerance
-                is_rgb = abs(list_len - expected_rgb_len) < 10    # Allow small tolerance
-                
-                if is_gray:
-                    # Grayscale flattened list
-                    img = np.array(img_data).reshape((224, 224)).astype(np.float32)
-                elif is_rgb or list_len == 150528:  # Check for RGB, including explicit check for 150528
-                    # RGB flattened list
+                # Direct way: check list dimensions
+                if list_len == 150528:  # Exact match for 224*224*3
+                    # This is an RGB flat image - reshape to 3D and convert to grayscale
                     img = np.array(img_data).reshape((224, 224, 3)).astype(np.float32)
-                    # Convert RGB to grayscale before continuing
-                    if img.ndim == 3 and img.shape[-1] == 3:
-                        img = cv2.cvtColor(img.astype(np.float32), cv2.COLOR_RGB2GRAY)
+                    img = cv2.cvtColor(img.astype(np.float32), cv2.COLOR_RGB2GRAY)
+                elif list_len == 224*224:  # Exact match for grayscale
+                    img = np.array(img_data).reshape((224, 224)).astype(np.float32)
                 else:
-                    raise ValueError(f"Cannot reshape list of length {list_len} into a 224x224 image or 224x224x3 image")
+                    # For any other size, try to find the closest reasonable shape
+                    if abs(list_len - 150528) < 10:  # Near 224*224*3
+                        print(f"Found near RGB list_len={list_len}, reshaping to (224,224,3)")
+                        img = np.array(img_data).reshape((224, 224, 3)).astype(np.float32)
+                        img = cv2.cvtColor(img.astype(np.float32), cv2.COLOR_RGB2GRAY)
+                    elif abs(list_len - expected_gray_len) < 10:  # Near 224*224
+                        print(f"Found near grayscale list_len={list_len}, reshaping to (224,224)")
+                        img = np.array(img_data).reshape((224, 224)).astype(np.float32)
+                    else:
+                        # As last resort - if it's divisible by 3, assume it's RGB
+                        # This helps with different image sizes
+                        if list_len % 3 == 0:
+                            side = int(np.sqrt(list_len / 3))
+                            if side * side * 3 == list_len:  # Perfect square
+                                print(f"Reshaping size {list_len} to ({side},{side},3) as likely RGB")
+                                img = np.array(img_data).reshape((side, side, 3)).astype(np.float32)
+                                # Resize to expected 224x224
+                                img = cv2.resize(img, (224, 224))
+                                # Convert to grayscale
+                                img = cv2.cvtColor(img.astype(np.float32), cv2.COLOR_RGB2GRAY)
+                            else:
+                                raise ValueError(f"Cannot find suitable reshape for size {list_len}")
+                        else:
+                            # If not divisible by 3, assume it's grayscale with unusual dimensions
+                            side = int(np.sqrt(list_len))
+                            if side * side == list_len:  # Perfect square
+                                print(f"Reshaping size {list_len} to ({side},{side}) as likely grayscale")
+                                img = np.array(img_data).reshape((side, side)).astype(np.float32)
+                                # Resize to expected 224x224
+                                img = cv2.resize(img, (224, 224))
+                            else:
+                                # If this fails, print more diagnostic info
+                                sample_values = str(img_data[:5])  # First few values
+                                raise ValueError(f"Cannot find suitable reshape for size {list_len}. "
+                                              f"Sample values: {sample_values}. "
+                                              f"Not a perfect square and not divisible by 3.")
             elif isinstance(img_data, np.ndarray):
                 img = img_data.astype(np.float32)
                 # Convert RGB to grayscale if needed
