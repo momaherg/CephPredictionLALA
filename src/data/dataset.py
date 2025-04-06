@@ -14,7 +14,7 @@ class CephalometricDataset(Dataset):
 
     def __init__(self, dataframe, root_dir=None, transform=None, landmark_cols=None, 
                  train=True, apply_clahe=False, clahe_clip_limit=2.0, 
-                 clahe_grid_size=(8, 8), use_depth=False, image_size=(224, 224)):
+                 clahe_grid_size=(8, 8), use_depth=False):
         """
         Args:
             dataframe (pandas.DataFrame): DataFrame with annotations and image data.
@@ -26,7 +26,6 @@ class CephalometricDataset(Dataset):
             clahe_clip_limit (float): Clip limit for CLAHE.
             clahe_grid_size (tuple): Grid size for CLAHE.
             use_depth (bool): Whether to load and include the depth map.
-            image_size (tuple): Expected image size.
         """
         self.dataframe = dataframe
         self.root_dir = root_dir
@@ -37,7 +36,6 @@ class CephalometricDataset(Dataset):
         self.clahe_clip_limit = clahe_clip_limit
         self.clahe_grid_size = clahe_grid_size
         self.use_depth = use_depth
-        self.image_size = image_size
         
         # Check if depth column exists if use_depth is True
         if self.use_depth and 'depth_map' not in self.dataframe.columns:
@@ -51,68 +49,51 @@ class CephalometricDataset(Dataset):
             idx = idx.tolist()
 
         # Load image
-        if 'Image' in self.dataframe.columns:
-            # Image data is directly in the DataFrame (e.g., as numpy array)
-            img_data = self.dataframe.iloc[idx]['Image']
-            
-            # Handle image data (list or numpy array)
-            if isinstance(img_data, list):
-                list_len = len(img_data)
-                expected_len_gray = self.image_size[0] * self.image_size[1]
-                expected_len_rgb = expected_len_gray * 3
-                
-                if list_len == expected_len_gray:
-                    # Reshape grayscale list
-                    img = np.array(img_data).reshape(self.image_size) # Shape (H, W)
-                elif list_len == expected_len_rgb:
-                    # Reshape RGB list and convert to grayscale
-                    img_rgb = np.array(img_data).reshape((self.image_size[0], self.image_size[1], 3))
-                    # Convert HWC to grayscale (using simple mean, could use weighted avg) 
-                    img = img_rgb.mean(axis=2) # Shape (H, W)
-                else:
-                    raise ValueError(f"Row {idx}: List length {list_len} does not match expected grayscale ({expected_len_gray}) or RGB ({expected_len_rgb})")
-            
-            elif isinstance(img_data, np.ndarray):
-                img = img_data
-                # Ensure grayscale if numpy array is provided
-                if img.ndim == 3:
-                    if img.shape[0] == 3: # CHW -> HWC -> Gray
-                        img = img.transpose(1, 2, 0).mean(axis=2)
-                    elif img.shape[-1] == 3: # HWC -> Gray
-                        img = img.mean(axis=2)
-                    elif img.shape[-1] == 1: # HW1 -> HW
-                        img = img.squeeze(axis=-1)
-                # If img.ndim == 2, it's already grayscale HW
-            else:
-                raise TypeError(f"Row {idx}: Unexpected image data type: {type(img_data)}")
+        img_data = self.dataframe.iloc[idx]['Image']
+        depth_data = self.dataframe.iloc[idx]['depth_map'] if self.use_depth and 'depth_map' in self.dataframe.columns else None
 
-            # Ensure img is 2D after processing
-            if img.ndim != 2:
-                 raise ValueError(f"Row {idx}: Image processing failed, expected 2D array, got shape {img.shape}")
-                 
-            img = img.astype(np.float32) # Ensure float32 for transforms
-        elif self.root_dir and 'image_path' in self.dataframe.columns:
-            # Load image from file path
-            img_name = os.path.join(self.root_dir, self.dataframe.iloc[idx, 0]) # Assuming first column is path
-            img = io.imread(img_name)
-            if img.ndim == 3: # Convert RGB to grayscale if necessary
-                img = color.rgb2gray(img)
-            img = img.astype(np.float32)
+        # Handle image data loading (from list or numpy array)
+        img = None
+        if isinstance(img_data, list):
+            try:
+                np_array_flat = np.array(img_data)
+                list_len = np_array_flat.size
+                expected_len_gray = 224 * 224 # Assuming fixed size for now
+                expected_len_rgb = expected_len_gray * 3
+
+                if list_len == expected_len_gray:
+                    img = np_array_flat.reshape((224, 224)).astype(np.float32)
+                elif list_len == expected_len_rgb:
+                    # Reshape and potentially convert to grayscale if needed later, or handle 3 channels
+                    img = np_array_flat.reshape((224, 224, 3)).astype(np.float32)
+                    # If grayscale is always expected later, convert here:
+                    # img = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140]).astype(np.float32)
+                else:
+                     raise ValueError(f"List length {list_len} doesn't match expected gray {expected_len_gray} or RGB {expected_len_rgb}")
+            except ValueError as e:
+                 print(f"Error reshaping image list at index {idx}: {e}")
+                 # Handle error: return None or raise, depending on desired behavior
+                 # For now, let's return None to indicate failure for this sample
+                 return None # Or raise an exception
+        elif isinstance(img_data, np.ndarray):
+            img = img_data.astype(np.float32)
         else:
-            raise ValueError("DataFrame must contain either 'Image' column or 'image_path' column with root_dir specified.")
-            
-        # Ensure image is grayscale (single channel)
-        if img.ndim == 3:
-             if img.shape[-1] == 3: # HWC -> HW
-                 img = color.rgb2gray(img)
-             elif img.shape[0] == 3: # CHW -> HW
-                 img = img[0, :, :]
-             elif img.shape[-1] == 1: # HW1 -> HW
-                  img = img.squeeze(-1)
-             else:
-                  raise ValueError(f"Unexpected image shape: {img.shape}")
-        elif img.ndim != 2:
-            raise ValueError(f"Unexpected image shape: {img.shape}")
+            # Handle unexpected data type
+            print(f"Warning: Unexpected image data type at index {idx}: {type(img_data)}")
+            return None # Indicate failure
+
+        # If the loaded image is RGB but we expect Grayscale later, convert it
+        # (Common if transforms expect single channel input)
+        if img is not None and img.ndim == 3 and img.shape[2] == 3:
+            # Example: Convert RGB to Grayscale using standard weights
+            img = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140]) 
+            # Ensure it's back to (H, W) shape
+            img = img.reshape((224, 224)).astype(np.float32)
+
+        # Ensure image is 2D (H, W) before applying CLAHE/transforms expecting grayscale
+        if img is not None and img.ndim != 2:
+             print(f"Warning: Image at index {idx} is not 2D (shape: {img.shape}) after initial load/conversion. Skipping.")
+             return None # Indicate failure
 
         # Apply CLAHE if requested
         if self.apply_clahe:
@@ -134,7 +115,7 @@ class CephalometricDataset(Dataset):
         
         # Load and add depth map if requested
         if self.use_depth:
-             depth_map = self.dataframe.iloc[idx]['depth_map']
+             depth_map = depth_data
              # Ensure depth map is loaded correctly and has the right shape (H, W)
              if isinstance(depth_map, np.ndarray) and depth_map.shape == img.shape:
                  sample['depth'] = depth_map.astype(np.float32)
