@@ -113,7 +113,7 @@ class HRNet(nn.Module):
     
     Supports different HRNet variants (W32, W48, etc.)
     """
-    def __init__(self, pretrained=True, hrnet_type='w32', input_channels=3):
+    def __init__(self, input_channels=3, pretrained=True, hrnet_type='w32'):
         super(HRNet, self).__init__()
         self.input_channels = input_channels
         
@@ -127,66 +127,86 @@ class HRNet(nn.Module):
                 model_name = f'hrnet_{hrnet_type}'
                 self.backbone = timm.create_model(model_name, pretrained=True, features_only=True)
                 print(f"Successfully loaded pretrained {model_name} using timm.")
+                
+                # --- Modify the first convolutional layer --- 
+                # This part is highly dependent on the specific timm model structure
+                # We need to find the first conv layer (e.g., backbone.conv1 or similar)
+                first_conv_layer_name = None
+                if hasattr(self.backbone, 'conv1'):
+                    first_conv_layer_name = 'conv1'
+                elif hasattr(self.backbone, 'stem') and hasattr(self.backbone.stem, '0') and isinstance(self.backbone.stem[0], nn.Conv2d):
+                    # Common pattern: stem might be a Sequential block
+                    first_conv_layer_name = 'stem.0' # Need to access nested module
+                else:
+                     # Add more checks or raise an error if the layer isn't found
+                     warnings.warn(f"Could not automatically find the first conv layer for {model_name}. Input channel modification might fail.")
 
-                # Modify the first layer if input_channels is not 3
-                if input_channels != 3:
-                    print(f"Modifying first conv layer to accept {input_channels} channels.")
-                    first_conv_layer_name = 'conv1' # Common name, might need adjustment based on timm model structure
-                    original_conv = getattr(self.backbone.feature_info.module_name(first_conv_layer_name), first_conv_layer_name)
-                    
-                    # Get original weights and parameters
-                    original_weights = original_conv.weight.data
-                    out_channels = original_conv.out_channels
-                    kernel_size = original_conv.kernel_size
-                    stride = original_conv.stride
-                    padding = original_conv.padding
-                    dilation = original_conv.dilation
-                    groups = original_conv.groups
-                    bias_term = original_conv.bias is not None
-
-                    # Create new layer
-                    new_conv = nn.Conv2d(input_channels, out_channels, kernel_size=kernel_size,
-                                       stride=stride, padding=padding, dilation=dilation,
-                                       groups=groups, bias=bias_term)
-
-                    # Copy RGB weights and initialize others
-                    new_weights = new_conv.weight.data
-                    new_weights[:, :3, :, :] = original_weights[:, :3, :, :] # Copy RGB
-                    if input_channels > 3:
-                        # Initialize remaining channels (e.g., depth) by averaging RGB weights
-                        rgb_avg = original_weights[:, :3, :, :].mean(dim=1, keepdim=True)
-                        for i in range(3, input_channels):
-                             new_weights[:, i:i+1, :, :] = rgb_avg
-
-                    # Assign new weights and bias (if exists)
-                    new_conv.weight.data = new_weights
-                    if bias_term:
-                        new_conv.bias.data = original_conv.bias.data
+                if first_conv_layer_name is not None:
+                    try:
+                        # Get original layer and its weights
+                        original_layer = self.backbone
+                        for part in first_conv_layer_name.split('.'):
+                             original_layer = getattr(original_layer, part)
+                             
+                        original_weights = original_layer.weight.clone().detach()
+                        original_bias = original_layer.bias.clone().detach() if original_layer.bias is not None else None
+                        out_channels = original_layer.out_channels
+                        kernel_size = original_layer.kernel_size
+                        stride = original_layer.stride
+                        padding = original_layer.padding
+                        dilation = original_layer.dilation
+                        groups = original_layer.groups
                         
-                    # Replace the layer in the backbone
-                    # This part might need adjustment depending on how timm structures the model
-                    # Trying a common pattern: find the module containing the conv layer
-                    module_path = self.backbone.feature_info.module_name(first_conv_layer_name)
-                    module = self.backbone
-                    for part in module_path.split('.'):
-                         if part: # Avoid empty splits
-                            module = getattr(module, part)
-                    setattr(module, first_conv_layer_name, new_conv)
-                    print(f"Replaced {first_conv_layer_name} in {module_path}")
+                        print(f"Modifying first conv layer ({first_conv_layer_name}) to accept {input_channels} channels.")
+                        
+                        # Create new layer
+                        new_layer = nn.Conv2d(input_channels, out_channels, kernel_size=kernel_size,
+                                              stride=stride, padding=padding, dilation=dilation,
+                                              groups=groups, bias=(original_bias is not None))
 
+                        # Copy weights for existing channels (usually 3: RGB)
+                        with torch.no_grad():
+                            num_original_channels = original_weights.shape[1]
+                            # Copy RGB weights
+                            new_layer.weight[:, :num_original_channels, :, :] = original_weights
+                            
+                            # Initialize weights for new channels (e.g., depth)
+                            if input_channels > num_original_channels:
+                                # Simple approach: average the RGB weights for the new channel(s)
+                                avg_rgb_weights = original_weights.mean(dim=1, keepdim=True)
+                                # Repeat the averaged weights for the new channels
+                                for i in range(num_original_channels, input_channels):
+                                    new_layer.weight[:, i:i+1, :, :] = avg_rgb_weights
+                                    
+                            # Copy bias if it exists
+                            if original_bias is not None:
+                                new_layer.bias.data = original_bias
+                                
+                        # Replace the original layer with the new one
+                        layer_parent = self.backbone
+                        parts = first_conv_layer_name.split('.')
+                        for part in parts[:-1]:
+                            layer_parent = getattr(layer_parent, part)
+                        setattr(layer_parent, parts[-1], new_layer)
+                        print(f"Successfully modified {first_conv_layer_name}.")
+                        
+                    except Exception as e:
+                         warnings.warn(f"Failed to modify the first conv layer: {e}")
             except Exception as e:
                 # Fallback to a simplified backbone if pretrained model is not available
-                logging.warning(f"Error loading or modifying pretrained HRNet-{hrnet_type.upper()}: {str(e)}")
-                print(f"Warning: Using simplified backbone with {input_channels} input channels.")
-                self.backbone = self._create_simplified_backbone(input_channels)
+                logging.warning(f"Error loading pretrained HRNet-{hrnet_type.upper()}: {str(e)}")
+                print(f"Warning: Pretrained HRNet-{hrnet_type.upper()} not available. Using simplified backbone.")
+                print("To fix this issue, install timm: pip install timm")
+                self.backbone = self._create_simplified_backbone(input_channels=input_channels)
         else:
             # Use simplified backbone if pretrained is not required
-            self.backbone = self._create_simplified_backbone(input_channels)
+            # Modify simplified backbone input layer as well
+            self.backbone = self._create_simplified_backbone(input_channels=input_channels)
     
-    def _create_simplified_backbone(self, input_channels):
+    def _create_simplified_backbone(self, input_channels=3):
         # Simplified backbone as a placeholder
         backbone = nn.Sequential(
-            nn.Conv2d(input_channels, 64, 3, 2, 1),
+            nn.Conv2d(input_channels, 64, 3, 2, 1), # Use input_channels here
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, 3, 2, 1),
@@ -284,15 +304,16 @@ class LandmarkHeatmapNet(nn.Module):
     3. Coordinate extraction from heatmaps
     4. Refinement MLP to improve coordinate predictions
     """
-    def __init__(self, num_landmarks=19, output_size=(64, 64), pretrained=True, use_refinement=True, hrnet_type='w32', input_channels=3):
+    def __init__(self, num_landmarks=19, output_size=(64, 64), pretrained=True, use_refinement=True, hrnet_type='w32', input_channels=1):
         super(LandmarkHeatmapNet, self).__init__()
         
         self.num_landmarks = num_landmarks
         self.output_size = output_size
         self.use_refinement = use_refinement
         self.hrnet_type = hrnet_type
+        self.input_channels = input_channels
         
-        # HRNet backbone with specified input channels
+        # HRNet backbone - pass input_channels
         self.hrnet = HRNet(pretrained=pretrained, hrnet_type=hrnet_type, input_channels=input_channels)
         
         # We'll create the heatmap layer after we know the channel size
@@ -422,7 +443,7 @@ class LandmarkHeatmapNet(nn.Module):
         return coords
 
 
-def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, hrnet_type='w32', input_channels=3):
+def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, hrnet_type='w32', input_channels=1):
     """
     Create a HRNet-based landmark detection model
     
@@ -431,7 +452,7 @@ def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, h
         pretrained (bool): Whether to use pretrained weights for the backbone
         use_refinement (bool): Whether to use refinement MLP
         hrnet_type (str): HRNet variant to use ('w32' or 'w48')
-        input_channels (int): Number of input channels (3 for RGB, 4 for RGB+Depth)
+        input_channels (int): Number of input channels (1 for grayscale, 2 for grayscale+depth, etc.)
         
     Returns:
         LandmarkHeatmapNet: The created model

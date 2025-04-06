@@ -101,8 +101,9 @@ class LandmarkTrainer:
             landmark_weights (list or numpy array, optional): Weights to apply to each landmark's loss.
                                                               Must have length equal to num_landmarks.
             log_specific_landmark_indices (list, optional): Indices of landmarks to log MED for separately.
-            use_depth_features (bool): Whether to use depth features in the model
+            use_depth_features (bool): Whether to use depth features
         """
+        self.use_depth_features = use_depth_features # Store the flag
         # Set device
         if device is not None:
             self.device = device
@@ -118,14 +119,16 @@ class LandmarkTrainer:
                 self.device = torch.device('cpu')
                 print("Using CPU device")
         
+        # Determine input channels based on depth feature usage
+        input_channels = 2 if use_depth_features else 1 # Assuming grayscale image + optional depth
+        
         # Create model
-        input_channels = 4 if use_depth_features else 3 # Determine input channels
         self.model = create_hrnet_model(
             num_landmarks=num_landmarks, 
             pretrained=True, 
             use_refinement=use_refinement,
             hrnet_type=hrnet_type,
-            input_channels=input_channels # Pass correct number of channels
+            input_channels=input_channels # Pass input channels to model creator
         )
         self.model = self.model.to(self.device)
         

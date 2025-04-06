@@ -1,8 +1,21 @@
 import os
 import pandas as pd
 import numpy as np
+from tqdm import tqdm # Add tqdm for progress bar
+import torch # Add torch
+from PIL import Image # Add PIL
+
 from .dataset import create_dataloaders
 from .patient_classifier import PatientClassifier
+
+# Try importing transformers for depth prediction
+try:
+    from transformers import DepthProImageProcessorFast, DepthProForDepthEstimation
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+    print("Warning: Transformers library not found. Depth feature generation will be unavailable.")
+    print("Install it with: pip install transformers accelerate")
 
 class DataProcessor:
     def __init__(self, data_path, landmark_cols=None, image_size=(224, 224), apply_clahe=True):
@@ -26,7 +39,114 @@ class DataProcessor:
             self.classifier = PatientClassifier(landmark_cols)
         else:
             self.classifier = None
+        
+        # Device for depth model inference
+        self.inference_device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+        print(f"DataProcessor using device: {self.inference_device} for potential depth inference.")
+        self.depth_model = None
+        self.depth_processor = None
     
+    def _load_depth_model(self):
+        """Loads the DepthPro model and processor if not already loaded."""
+        if not TRANSFORMERS_AVAILABLE:
+            print("Error: Transformers library not available. Cannot load depth model.")
+            return False
+        if self.depth_model is None or self.depth_processor is None:
+            try:
+                print("Loading DepthPro model (apple/DepthPro-hf)... This might take a moment.")
+                self.depth_processor = DepthProImageProcessorFast.from_pretrained("apple/DepthPro-hf")
+                self.depth_model = DepthProForDepthEstimation.from_pretrained("apple/DepthPro-hf").to(self.inference_device)
+                print("DepthPro model loaded successfully.")
+                return True
+            except Exception as e:
+                print(f"Error loading DepthPro model: {e}")
+                self.depth_model = None
+                self.depth_processor = None
+                return False
+        return True
+
+    def _predict_depth(self, image_array):
+        """Predicts depth for a single image array (H, W, C)."""
+        if self.depth_model is None or self.depth_processor is None:
+            if not self._load_depth_model():
+                return None # Return None if model couldn't be loaded
+                
+        try:
+            # Convert NumPy array (H, W, C) to PIL Image
+            # Ensure it's uint8
+            if image_array.dtype != np.uint8:
+                 image_array = image_array.astype(np.uint8)
+            image_pil = Image.fromarray(image_array)
+            
+            # Prepare inputs
+            inputs = self.depth_processor(images=image_pil, return_tensors="pt").to(self.inference_device)
+
+            # Predict depth
+            with torch.no_grad():
+                outputs = self.depth_model(**inputs)
+
+            # Post-process
+            post_processed_output = self.depth_processor.post_process_depth_estimation(
+                outputs, target_sizes=[(image_pil.height, image_pil.width)],
+            )
+            
+            # Extract, normalize (0-1), and convert depth map
+            depth_map = post_processed_output[0]["predicted_depth"]
+            depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-6) # Normalize 0-1
+            depth_map = depth_map.squeeze().detach().cpu().numpy() # (H, W)
+            
+            return depth_map.astype(np.float32) # Store as float32
+
+        except Exception as e:
+            print(f"Error during depth prediction: {e}")
+            return None
+
+    def add_depth_features(self, df):
+        """Generates and adds depth maps to the DataFrame."""
+        if 'Image' not in df.columns:
+            print("Error: DataFrame must contain an 'Image' column with image arrays.")
+            return df
+            
+        if not self._load_depth_model(): # Ensure model is loaded
+             print("Skipping depth feature generation due to model loading error.")
+             return df
+
+        print("Generating depth features for dataset... This may take a while.")
+        depth_maps = []
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="Generating Depth Maps"):
+            image_array = row['Image']
+            # Ensure image is in HWC format (common output from preprocessing)
+            if image_array.ndim == 2: # Grayscale -> Add channel dim -> Repeat channel
+                 image_array = np.stack([image_array]*3, axis=-1)
+            elif image_array.ndim == 3 and image_array.shape[0] == 3: # CHW -> HWC
+                 image_array = image_array.transpose(1, 2, 0)
+            elif image_array.ndim == 3 and image_array.shape[-1] == 1: # HW1 -> HWC
+                image_array = np.concatenate([image_array]*3, axis=-1)
+            elif image_array.ndim != 3 or image_array.shape[-1] != 3: # Check if HWC
+                print(f"Warning: Skipping depth prediction for image with unexpected shape {image_array.shape}")
+                depth_maps.append(None) # Append None if shape is wrong
+                continue
+                
+            # Check if image needs rescaling if not uint8 (e.g., float 0-1)
+            if image_array.dtype != np.uint8:
+                if image_array.max() <= 1.0:
+                    image_array = (image_array * 255).astype(np.uint8)
+                else: # Assume already 0-255 if max > 1.0 but not uint8
+                    image_array = image_array.astype(np.uint8)
+                    
+            depth_map = self._predict_depth(image_array)
+            depth_maps.append(depth_map)
+        
+        df['depth_map'] = depth_maps
+        # Optional: Drop rows where depth prediction failed
+        initial_len = len(df)
+        df = df.dropna(subset=['depth_map'])
+        if len(df) < initial_len:
+            print(f"Warning: Dropped {initial_len - len(df)} rows due to depth prediction errors.")
+            
+        print("Depth features generated and added.")
+        return df
+
     def load_data(self):
         """
         Load the dataset from a CSV file or pandas pickle file
@@ -44,12 +164,13 @@ class DataProcessor:
         print(f"Loaded dataset with {len(self.df)} records and {len(self.df.columns)} columns")
         return self.df
     
-    def preprocess_data(self, balance_classes=False):
+    def preprocess_data(self, balance_classes=False, add_depth=False):
         """
         Preprocess the loaded dataset
         
         Args:
             balance_classes (bool): Whether to balance classes based on skeletal classification
+            add_depth (bool): Whether to generate and add depth features.
             
         Returns:
             pandas.DataFrame: The preprocessed dataset
@@ -89,7 +210,11 @@ class DataProcessor:
                 self.df = self.df[valid_images]
                 print(f"Removed invalid images. Remaining records: {len(self.df)}")
         
-        # Compute patient classes and balance if requested
+        # Generate depth features if requested
+        if add_depth:
+            self.df = self.add_depth_features(self.df)
+        
+        # Compute patient classes and balance if requested (AFTER potentially adding depth)
         if balance_classes and self.classifier is not None:
             print("Computing skeletal classifications for patients...")
             self.df = self.classifier.classify_patients(self.df)
