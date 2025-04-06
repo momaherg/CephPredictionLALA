@@ -164,20 +164,41 @@ class HRNet(nn.Module):
                                               stride=stride, padding=padding, dilation=dilation,
                                               groups=groups, bias=(original_bias is not None))
 
-                        # Copy weights for existing channels (usually 3: RGB)
+                        # Copy weights with care
                         with torch.no_grad():
                             num_original_channels = original_weights.shape[1]
-                            # Copy RGB weights
-                            new_layer.weight[:, :num_original_channels, :, :] = original_weights
                             
-                            # Initialize weights for new channels (e.g., depth)
-                            if input_channels > num_original_channels:
-                                # Simple approach: average the RGB weights for the new channel(s)
-                                avg_rgb_weights = original_weights.mean(dim=1, keepdim=True)
-                                # Repeat the averaged weights for the new channels
+                            # Properly handle different input channel cases
+                            if input_channels == 1:  # Single channel (grayscale)
+                                # Average the RGB weights for the grayscale channel
+                                avg_weights = original_weights.mean(dim=1, keepdim=True)
+                                new_layer.weight.data = avg_weights
+                                
+                            elif input_channels == 2:  # Dual channel (grayscale + depth)
+                                # For grayscale, average the RGB weights
+                                gray_weights = original_weights.mean(dim=1, keepdim=True)
+                                # For depth, use a copy of grayscale weights or initialize fresh
+                                # Option 1: Copy grayscale weights for depth channel
+                                depth_weights = gray_weights.clone()
+                                # Concatenate along input channel dimension
+                                new_weights = torch.cat([gray_weights, depth_weights], dim=1)
+                                new_layer.weight.data = new_weights
+                                
+                            elif input_channels > num_original_channels:  # More channels than original
+                                # Copy original weights for the first num_original_channels
+                                new_weights = new_layer.weight.data
+                                new_weights[:, :num_original_channels, :, :] = original_weights
+                                
+                                # Initialize additional channels using average of original
+                                avg_weights = original_weights.mean(dim=1, keepdim=True)
                                 for i in range(num_original_channels, input_channels):
-                                    new_layer.weight[:, i:i+1, :, :] = avg_rgb_weights
-                                    
+                                    new_weights[:, i:i+1, :, :] = avg_weights
+                                
+                                new_layer.weight.data = new_weights
+                            else:  # input_channels <= num_original_channels and not 1 or 2
+                                # Just copy the first input_channels
+                                new_layer.weight.data[:, :input_channels, :, :] = original_weights[:, :input_channels, :, :]
+                                
                             # Copy bias if it exists
                             if original_bias is not None:
                                 new_layer.bias.data = original_bias
