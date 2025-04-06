@@ -73,6 +73,11 @@ USE_REFINEMENT = True  # Whether to use refinement MLP
 MAX_DELTA = 2.0  # Maximum allowed delta for refinement
 HRNET_TYPE = 'w32'  # HRNet variant: 'w32' (default) or 'w48' (larger model)
 
+# Depth feature parameters
+USE_DEPTH = False  # Whether to use depth features
+DEPTH_FUSION_METHOD = 'concat'  # Method to fuse depth features: 'concat', 'add', 'attention'
+DEPTH_CACHE_DIR = './outputs/depth_cache'  # Directory to cache depth features
+
 # Loss parameters
 HEATMAP_WEIGHT = 1.0  # Weight for heatmap loss (used when not using weight scheduling)
 COORD_WEIGHT = 0.1  # Weight for coordinate loss (used when not using weight scheduling)
@@ -277,19 +282,99 @@ if BALANCE_CLASSES and 'skeletal_class' in train_df.columns:
         print(f"  {class_name}: {count} samples ({count/len(train_df)*100:.1f}%)")
 
 # Create datasets
+if USE_DEPTH:
+    print("\nInitializing depth feature extraction...")
+    from src.utils.depth_features import DepthFeatureExtractor
+    
+    # Create depth feature cache directory
+    os.makedirs(DEPTH_CACHE_DIR, exist_ok=True)
+    
+    # Initialize depth extractor
+    depth_extractor = DepthFeatureExtractor(
+        cache_dir=DEPTH_CACHE_DIR,
+        device=device
+    )
+    
+    # Create temporary datasets for feature extraction
+    temp_transform = transforms.Compose([ToTensor()])
+    
+    temp_train_dataset = CephalometricDataset(
+        train_df, transform=temp_transform, 
+        landmark_cols=landmark_cols, apply_clahe=APPLY_CLAHE
+    )
+    
+    temp_val_dataset = CephalometricDataset(
+        val_df, transform=temp_transform, 
+        landmark_cols=landmark_cols, apply_clahe=APPLY_CLAHE
+    )
+    
+    temp_test_dataset = CephalometricDataset(
+        test_df, transform=temp_transform, 
+        landmark_cols=landmark_cols, apply_clahe=APPLY_CLAHE
+    )
+    
+    print("Extracting depth features for training set...")
+    train_features = depth_extractor.process_and_cache_dataset(temp_train_dataset, cache_suffix="train")
+    
+    print("Extracting depth features for validation set...")
+    val_features = depth_extractor.process_and_cache_dataset(temp_val_dataset, cache_suffix="val")
+    
+    print("Extracting depth features for test set...")
+    test_features = depth_extractor.process_and_cache_dataset(temp_test_dataset, cache_suffix="test")
+    
+    # Combine all features into a global index mapping
+    depth_features = {}
+    
+    # For train set
+    for i, global_idx in enumerate(train_df.index):
+        if i in train_features:
+            depth_features[global_idx] = train_features[i]
+            
+    # For validation set
+    for i, global_idx in enumerate(val_df.index):
+        if i in val_features:
+            depth_features[global_idx] = val_features[i]
+            
+    # For test set
+    for i, global_idx in enumerate(test_df.index):
+        if i in test_features:
+            depth_features[global_idx] = test_features[i]
+    
+    print(f"Extracted depth features for {len(depth_features)} images")
+    
+    # Save sample depth visualizations
+    vis_dir = os.path.join(OUTPUT_DIR, 'depth_samples')
+    os.makedirs(vis_dir, exist_ok=True)
+    
+    for i in range(min(5, len(temp_train_dataset))):
+        sample = temp_train_dataset[i]
+        image = sample['image']
+        # Convert from tensor to numpy for visualization
+        if isinstance(image, torch.Tensor):
+            image = image.permute(1, 2, 0).numpy()
+            
+        save_path = os.path.join(vis_dir, f'sample_{i}.png')
+        depth_extractor.save_depth_visualization(image, save_path)
+else:
+    depth_features = None
+
+# Create datasets
 train_dataset = CephalometricDataset(
     train_df, root_dir=None, transform=train_transform, 
-    landmark_cols=landmark_cols, train=True, apply_clahe=APPLY_CLAHE
+    landmark_cols=landmark_cols, train=True, apply_clahe=APPLY_CLAHE,
+    depth_features=train_features if USE_DEPTH else None, use_depth=USE_DEPTH
 )
 
 val_dataset = CephalometricDataset(
     val_df, root_dir=None, transform=base_transforms, 
-    landmark_cols=landmark_cols, train=False, apply_clahe=APPLY_CLAHE
+    landmark_cols=landmark_cols, train=False, apply_clahe=APPLY_CLAHE,
+    depth_features=val_features if USE_DEPTH else None, use_depth=USE_DEPTH
 )
 
 test_dataset = CephalometricDataset(
     test_df, root_dir=None, transform=base_transforms, 
-    landmark_cols=landmark_cols, train=False, apply_clahe=APPLY_CLAHE
+    landmark_cols=landmark_cols, train=False, apply_clahe=APPLY_CLAHE,
+    depth_features=test_features if USE_DEPTH else None, use_depth=USE_DEPTH
 )
 
 # Create dataloaders
@@ -359,7 +444,10 @@ trainer = LandmarkTrainer(
     target_landmark_indices=TARGET_LANDMARK_INDICES,
     landmark_weights=LANDMARK_WEIGHTS,
     # Specific MED Logging
-    log_specific_landmark_indices=LOG_SPECIFIC_LANDMARK_INDICES
+    log_specific_landmark_indices=LOG_SPECIFIC_LANDMARK_INDICES,
+    # Depth feature parameters
+    use_depth=USE_DEPTH,
+    depth_fusion_method=DEPTH_FUSION_METHOD
 )
 
 # Custom max_delta setting for the refinement MLP if needed
@@ -372,6 +460,12 @@ total_params = sum(p.numel() for p in trainer.model.parameters() if p.requires_g
 print(f"Model created with {total_params:,} trainable parameters")
 print(f"HRNet type: {HRNET_TYPE.upper()}")
 print(f"Refinement MLP: {'Enabled' if USE_REFINEMENT else 'Disabled'}")
+
+# Print depth feature info
+print(f"Depth features: {'Enabled' if USE_DEPTH else 'Disabled'}")
+if USE_DEPTH:
+    print(f"  Fusion method: {DEPTH_FUSION_METHOD}")
+    print(f"  Cache directory: {DEPTH_CACHE_DIR}")
 
 # Print optimizer info
 print(f"Optimizer: {OPTIMIZER_TYPE.upper()}")
@@ -423,7 +517,9 @@ if RUN_LR_FINDER:
         hrnet_type=HRNET_TYPE,
         optimizer_type=OPTIMIZER_TYPE,
         momentum=MOMENTUM,
-        nesterov=NESTEROV
+        nesterov=NESTEROV,
+        use_depth=USE_DEPTH,
+        depth_fusion_method=DEPTH_FUSION_METHOD
         # Schedulers and weight scheduling are not needed for the finder itself
     )
     
@@ -555,51 +651,112 @@ plt.show()
 
 # %%
 def visualize_sample_predictions(trainer, test_loader, num_samples=3):
-    """Visualize sample predictions from the test set"""
+    """
+    Visualize sample predictions from the test set
+    
+    Args:
+        trainer (LandmarkTrainer): Trained model
+        test_loader (DataLoader): Test data loader
+        num_samples (int): Number of samples to visualize
+    """
     trainer.model.eval()
     
-    # Get samples from test loader
-    data_iter = iter(test_loader)
-    samples = next(data_iter)
-    
-    images = samples['image'].to(trainer.device)
-    gt_landmarks = samples['landmarks'].cpu().numpy()
-    
-    # Make predictions
-    with torch.no_grad():
-        pred_landmarks = trainer.model.predict_landmarks(images).cpu().numpy()
-    
-    # Convert images to numpy
-    images = images.cpu().permute(0, 2, 3, 1).numpy()
-    
-    # Normalize images for display
-    if images.max() <= 1.0:
-        images = np.clip(images, 0, 1)
-    else:
-        images = np.clip(images / 255.0, 0, 1)
-    
-    # Plot predictions vs ground truth
-    fig, axes = plt.subplots(1, num_samples, figsize=(5*num_samples, 5))
-    
-    for i in range(min(num_samples, len(images))):
-        ax = axes[i] if num_samples > 1 else axes
-        ax.imshow(images[i])
+    # Get a batch of data
+    for batch_idx, batch in enumerate(test_loader):
+        if batch_idx > 0:  # Only use the first batch
+            break
         
-        # Plot ground truth landmarks
-        ax.scatter(gt_landmarks[i, :, 0], gt_landmarks[i, :, 1], 
-                  c='green', marker='x', s=50, label='Ground Truth')
+        # Get images and landmarks
+        images = batch['image'].to(trainer.device)
+        true_landmarks = batch['landmarks'].to(trainer.device)
         
-        # Plot predicted landmarks
-        ax.scatter(pred_landmarks[i, :, 0], pred_landmarks[i, :, 1], 
-                  c='red', marker='o', s=30, label='Prediction')
+        # Get depth maps if available
+        depth_maps = None
+        if USE_DEPTH and 'depth' in batch:
+            depth_maps = batch['depth'].to(trainer.device)
+            if depth_maps.dim() == 3:  # [B, H, W]
+                depth_maps = depth_maps.unsqueeze(1)  # [B, 1, H, W]
         
-        ax.set_title(f'Sample {i+1}')
-        ax.axis('off')
+        # Get predictions
+        with torch.no_grad():
+            if USE_DEPTH and depth_maps is not None:
+                predictions = trainer.model.predict_landmarks(images, depth_maps)
+            else:
+                predictions = trainer.model.predict_landmarks(images)
+        
+        # Convert to numpy for plotting
+        images_np = images.cpu().permute(0, 2, 3, 1).numpy()
+        true_landmarks_np = true_landmarks.cpu().numpy()
+        predictions_np = predictions.cpu().numpy()
+        
+        if USE_DEPTH and depth_maps is not None:
+            depth_maps_np = depth_maps.cpu().squeeze(1).numpy()  # Remove channel dimension
+        
+        # Denormalize images
+        if images_np.max() <= 1.0:
+            # Using ImageNet normalization
+            mean = np.array([0.485, 0.456, 0.406])
+            std = np.array([0.229, 0.224, 0.225])
+            
+            # Denormalize: x = x*std + mean for each channel
+            for i in range(len(images_np)):
+                images_np[i] = images_np[i] * std + mean
+            
+            # Clip to valid range [0, 1]
+            images_np = np.clip(images_np, 0, 1)
+        
+        # Create figure
+        for i in range(min(num_samples, len(images_np))):
+            if USE_DEPTH and depth_maps is not None:
+                fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+                
+                # Plot original image with landmarks
+                axs[0].imshow(images_np[i])
+                axs[0].scatter(predictions_np[i, :, 0], predictions_np[i, :, 1], 
+                              c='blue', marker='o', label='Predicted')
+                axs[0].scatter(true_landmarks_np[i, :, 0], true_landmarks_np[i, :, 1], 
+                              c='red', marker='x', label='Ground Truth')
+                axs[0].set_title('RGB Image with Landmarks')
+                axs[0].legend()
+                axs[0].axis('off')
+                
+                # Plot depth map
+                axs[1].imshow(depth_maps_np[i], cmap='plasma')
+                axs[1].set_title('Depth Map')
+                axs[1].axis('off')
+                
+                # Plot depth map with landmarks overlay
+                axs[2].imshow(depth_maps_np[i], cmap='plasma')
+                axs[2].scatter(predictions_np[i, :, 0], predictions_np[i, :, 1], 
+                              c='blue', marker='o', label='Predicted')
+                axs[2].scatter(true_landmarks_np[i, :, 0], true_landmarks_np[i, :, 1], 
+                              c='red', marker='x', label='Ground Truth')
+                axs[2].set_title('Depth Map with Landmarks')
+                axs[2].legend()
+                axs[2].axis('off')
+            else:
+                # Regular visualization without depth
+                plt.figure(figsize=(10, 10))
+                plt.imshow(images_np[i])
+                plt.scatter(predictions_np[i, :, 0], predictions_np[i, :, 1], 
+                          c='blue', marker='o', label='Predicted')
+                plt.scatter(true_landmarks_np[i, :, 0], true_landmarks_np[i, :, 1], 
+                          c='red', marker='x', label='Ground Truth')
+                plt.title('Landmark Predictions')
+                plt.legend()
+                plt.axis('off')
+            
+            # Calculate MED for this sample
+            sample_pred = predictions_np[i:i+1]
+            sample_true = true_landmarks_np[i:i+1]
+            med = np.mean(np.sqrt(np.sum((sample_pred - sample_true) ** 2, axis=2)))
+            
+            plt.suptitle(f'Mean Euclidean Distance: {med:.2f} pixels')
+            plt.tight_layout()
+            plt.savefig(os.path.join(OUTPUT_DIR, f'prediction_sample_{i}.png'))
+            plt.close()
     
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, 'sample_predictions.png'))
-    plt.show()
+    print(f"Prediction visualizations saved to {OUTPUT_DIR}")
 
 # Visualize some predictions
 try:
@@ -613,14 +770,115 @@ except Exception as e:
 # %%
 # Function to save a custom model configuration
 def save_model_config(output_dir, config):
-    """Save model configuration to a file"""
-    os.makedirs(output_dir, exist_ok=True)
+    """Save the model configuration to a file"""
     config_path = os.path.join(output_dir, 'model_config.txt')
-    
     with open(config_path, 'w') as f:
-        for key, value in config.items():
-            f.write(f"{key}: {value}\n")
-    
+        # General info
+        f.write("# Model Configuration\n\n")
+        f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"HRNet Type: {config['hrnet_type'].upper()}\n")
+        f.write(f"Number of Landmarks: {config['num_landmarks']}\n")
+        f.write(f"Refinement MLP: {'Enabled' if config['use_refinement'] else 'Disabled'}\n")
+        f.write(f"Max Delta: {config.get('max_delta', 'Not specified')}\n\n")
+        
+        # Depth feature parameters
+        f.write("# Depth Feature Parameters\n")
+        f.write(f"Use Depth Features: {'Enabled' if config['use_depth'] else 'Disabled'}\n")
+        if config['use_depth']:
+            f.write(f"Depth Fusion Method: {config['depth_fusion_method']}\n")
+            f.write(f"Depth Cache Directory: {DEPTH_CACHE_DIR}\n")
+        f.write("\n")
+        
+        # Training parameters
+        f.write("# Training Parameters\n")
+        f.write(f"Batch Size: {config['batch_size']}\n")
+        f.write(f"Number of Epochs: {config['num_epochs']}\n")
+        f.write(f"Learning Rate: {config['learning_rate']}\n")
+        f.write(f"Weight Decay: {config['weight_decay']}\n\n")
+        
+        # Optimizer parameters
+        f.write("# Optimizer Parameters\n")
+        f.write(f"Optimizer: {config['optimizer_type'].upper()}\n")
+        if config['optimizer_type'] == 'sgd':
+            f.write(f"Momentum: {config['momentum']}\n")
+            f.write(f"Nesterov: {config['nesterov']}\n")
+        f.write("\n")
+        
+        # LR scheduler parameters
+        f.write("# Learning Rate Scheduler Parameters\n")
+        f.write(f"Scheduler Type: {config['scheduler_type'] if config['scheduler_type'] else 'None'}\n")
+        if config['scheduler_type']:
+            if config['scheduler_type'] == 'plateau':
+                f.write(f"Patience: {config['lr_patience']}\n")
+                f.write(f"Factor: {config['lr_factor']}\n")
+            elif config['scheduler_type'] == 'cosine':
+                f.write(f"T Max: {config['lr_t_max']}\n")
+            elif config['scheduler_type'] == 'onecycle':
+                f.write(f"Max LR: {config['max_lr']}\n")
+                f.write(f"Pct Start: {config['pct_start']}\n")
+                f.write(f"Div Factor: {config['div_factor']}\n")
+                f.write(f"Final Div Factor: {config['final_div_factor']}\n")
+            f.write(f"Min LR: {config['lr_min']}\n")
+        f.write("\n")
+        
+        # Loss parameters
+        f.write("# Loss Parameters\n")
+        f.write(f"Loss Weight Scheduling: {'Enabled' if config['use_weight_schedule'] else 'Disabled'}\n")
+        if config['use_weight_schedule']:
+            f.write(f"Initial Heatmap Weight: {config['initial_heatmap_weight']}\n")
+            f.write(f"Initial Coordinate Weight: {config['initial_coord_weight']}\n")
+            f.write(f"Final Heatmap Weight: {config['final_heatmap_weight']}\n")
+            f.write(f"Final Coordinate Weight: {config['final_coord_weight']}\n")
+            f.write(f"Weight Schedule Epochs: {config['weight_schedule_epochs']}\n")
+        else:
+            f.write(f"Heatmap Weight: {config['heatmap_weight']}\n")
+            f.write(f"Coordinate Weight: {config['coord_weight']}\n")
+        f.write("\n")
+        
+        # Loss normalization parameters
+        f.write("# Loss Normalization Parameters\n")
+        f.write(f"Use Loss Normalization: {'Enabled' if config['use_loss_normalization'] else 'Disabled'}\n")
+        if config['use_loss_normalization']:
+            f.write(f"Normalization Decay: {config['norm_decay']}\n")
+            f.write(f"Normalization Epsilon: {config['norm_epsilon']}\n")
+        f.write("\n")
+        
+        # Per-landmark weighting
+        f.write("# Per-Landmark Weighting Parameters\n")
+        if config['target_landmark_indices']:
+            f.write(f"Target Landmark Indices: {config['target_landmark_indices']}\n")
+        else:
+            f.write("Target Landmark Indices: None (all landmarks used)\n")
+        
+        if config['landmark_weights']:
+            f.write(f"Landmark Weights: {config['landmark_weights']}\n")
+        else:
+            f.write("Landmark Weights: None (equal weighting)\n")
+        f.write("\n")
+        
+        # Specific MED logging
+        f.write("# Specific MED Logging\n")
+        if config['log_specific_landmark_indices']:
+            f.write(f"Log Specific Landmark Indices: {config['log_specific_landmark_indices']}\n")
+        else:
+            f.write("Log Specific Landmark Indices: None\n")
+        f.write("\n")
+        
+        # Data parameters
+        f.write("# Data Parameters\n")
+        f.write(f"Data Path: {config['data_path']}\n")
+        f.write(f"Apply CLAHE: {config['apply_clahe']}\n")
+        f.write(f"Balance Classes: {'Enabled' if config['balance_classes'] else 'Disabled'}\n")
+        if config['balance_classes']:
+            f.write(f"Balance Method: {config['balance_method']}\n")
+        f.write("\n")
+        
+        # Hardware parameters
+        f.write("# Hardware Parameters\n")
+        f.write(f"Device: {device}\n")
+        f.write(f"Use MPS: {config['use_mps']}\n")
+        f.write(f"Number of Workers: {config['num_workers']}\n")
+        
     print(f"Model configuration saved to {config_path}")
 
 # Create and save model configuration
@@ -674,7 +932,13 @@ model_config = {
     'norm_epsilon': NORM_EPSILON,
     'target_landmark_indices': TARGET_LANDMARK_INDICES,
     'landmark_weights': LANDMARK_WEIGHTS,
-    'log_specific_landmark_indices': LOG_SPECIFIC_LANDMARK_INDICES
+    'log_specific_landmark_indices': LOG_SPECIFIC_LANDMARK_INDICES,
+    'use_depth': USE_DEPTH,
+    'depth_fusion_method': DEPTH_FUSION_METHOD,
+    'data_path': DATA_PATH,
+    'apply_clahe': APPLY_CLAHE,
+    'use_mps': USE_MPS,
+    'num_workers': NUM_WORKERS
 }
 
 save_model_config(OUTPUT_DIR, model_config)

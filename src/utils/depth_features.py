@@ -185,4 +185,4 @@ class DepthFeatureExtractor:
         plt.savefig(save_path)
         plt.close()
         
-        print(f"Saved depth visualization to {save_path}")
+        print(f"Saved depth visualization to {save_path}") 
