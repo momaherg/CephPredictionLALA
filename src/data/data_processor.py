@@ -115,6 +115,25 @@ class DataProcessor:
         depth_maps = []
         for _, row in tqdm(df.iterrows(), total=len(df), desc="Generating Depth Maps"):
             image_array = row['Image']
+            
+            # Ensure image_array is a numpy array
+            if isinstance(image_array, list):
+                try:
+                    # Assuming flattened list matching self.image_size (e.g., 224*224)
+                    expected_len = self.image_size[0] * self.image_size[1]
+                    if len(image_array) == expected_len:
+                        image_array = np.array(image_array).reshape(self.image_size) # Keep original dtype for now
+                    else:
+                        raise ValueError(f"List length {len(image_array)} does not match expected {expected_len}")
+                except ValueError as e:
+                    print(f"Warning: Skipping depth prediction for row index {_.name} due to image list conversion error: {e}")
+                    depth_maps.append(None)
+                    continue # Skip to next row
+            elif not isinstance(image_array, np.ndarray):
+                print(f"Warning: Skipping depth prediction for row index {_.name} due to unexpected image data type: {type(image_array)}")
+                depth_maps.append(None)
+                continue # Skip to next row
+
             # Ensure image is in HWC format (common output from preprocessing)
             if image_array.ndim == 2: # Grayscale -> Add channel dim -> Repeat channel
                  image_array = np.stack([image_array]*3, axis=-1)
