@@ -18,7 +18,7 @@ except ImportError:
     print("Install it with: pip install transformers accelerate")
 
 class DataProcessor:
-    def __init__(self, data_path, landmark_cols=None, image_size=(224, 224), apply_clahe=True):
+    def __init__(self, data_path, landmark_cols=None, image_size=(224, 224), apply_clahe=True, depth_batch_size=16):
         """
         Initialize the data processor
         
@@ -27,12 +27,14 @@ class DataProcessor:
             landmark_cols (list): List of column names containing landmark coordinates
             image_size (tuple): Size of images (height, width)
             apply_clahe (bool): Whether to apply CLAHE for histogram equalization
+            depth_batch_size (int): Batch size for depth prediction
         """
         self.data_path = data_path
         self.landmark_cols = landmark_cols
         self.image_size = image_size
         self.apply_clahe = apply_clahe
         self.df = None
+        self.depth_batch_size = depth_batch_size
         
         # Create classifier if landmark columns are provided
         if landmark_cols:
@@ -101,8 +103,42 @@ class DataProcessor:
             print(f"Error during depth prediction: {e}")
             return None
 
+    def _predict_depth_batch(self, image_batch_pil): # Changed to accept PIL image batch
+        """Predicts depth for a batch of PIL images."""
+        if self.depth_model is None or self.depth_processor is None:
+            if not self._load_depth_model():
+                return [None] * len(image_batch_pil) # Return list of Nones
+                
+        try:
+            # Prepare inputs for the batch
+            inputs = self.depth_processor(images=image_batch_pil, return_tensors="pt").to(self.inference_device)
+
+            # Predict depth for the batch
+            with torch.no_grad():
+                outputs = self.depth_model(**inputs)
+
+            # Post-process batch
+            target_sizes = [(img.height, img.width) for img in image_batch_pil]
+            post_processed_output = self.depth_processor.post_process_depth_estimation(
+                outputs, target_sizes=target_sizes,
+            )
+            
+            batch_depth_maps = []
+            for i in range(len(image_batch_pil)):
+                # Extract, normalize (0-1), and convert depth map for each image in the batch
+                depth_map = post_processed_output[i]["predicted_depth"]
+                depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-6) # Normalize 0-1
+                depth_map = depth_map.squeeze().detach().cpu().numpy() # (H, W)
+                batch_depth_maps.append(depth_map.astype(np.float32))
+            
+            return batch_depth_maps
+
+        except Exception as e:
+            print(f"Error during batch depth prediction: {e}")
+            return [None] * len(image_batch_pil) # Return list of Nones on error
+
     def add_depth_features(self, df):
-        """Generates and adds depth maps to the DataFrame."""
+        """Generates and adds depth maps to the DataFrame using batching."""
         if 'Image' not in df.columns:
             print("Error: DataFrame must contain an 'Image' column with image arrays.")
             return df
@@ -111,18 +147,21 @@ class DataProcessor:
              print("Skipping depth feature generation due to model loading error.")
              return df
 
-        print("Generating depth features for dataset... This may take a while.")
-        depth_maps = []
-        saved_depth_count = 0
-        max_depth_saves = 2 # Number of depth maps to save for preview
-        depth_save_dir = "./outputs/depth_previews"
-        os.makedirs(depth_save_dir, exist_ok=True) # Create directory if it doesn't exist
+        print(f"Generating depth features using batch size {self.depth_batch_size}...")
+        all_depth_maps = [None] * len(df) # Pre-allocate list for results
+        image_batch_for_depth = [] # Store prepared PIL images for batching
+        batch_indices = [] # Store original indices for placing results
         
-        for index, row in tqdm(df.iterrows(), total=len(df), desc="Generating Depth Maps"):
+        saved_depth_count = 0
+        max_depth_saves = 2
+        depth_save_dir = "./outputs/depth_previews"
+        os.makedirs(depth_save_dir, exist_ok=True)
+        
+        for index, row in tqdm(df.iterrows(), total=len(df), desc="Preparing Images for Depth"):
             image_data = row['Image']
-            image_array = None # Initialize image_array for this iteration
+            image_array = None
             
-            # --- Start: Image Data Conversion --- 
+            # --- Image Data Conversion (remains mostly the same) ---
             try:
                 if isinstance(image_data, list):
                     # --- Debugging Start ---
@@ -158,12 +197,13 @@ class DataProcessor:
                     raise TypeError(f"Unexpected image data type: {type(image_data)}")
                     
             except (ValueError, TypeError) as e:
-                print(f"Warning: Skipping depth prediction for row index {index} due to image data conversion error: {e}")
-                depth_maps.append(None)
-                continue # Skip to next row
-            # --- End: Image Data Conversion ---
+                print(f"Warning: Skipping depth preparation for row index {index} due to image data conversion error: {e}")
+                # Note: No depth_maps.append here, handled by pre-allocation
+                continue 
+            # --- End Image Data Conversion ---
             
-            # --- Start: Image Preparation for Depth Model ---
+            # --- Image Preparation for Depth Model (remains mostly the same) ---
+            image_array_hwc = None
             try: 
                 # Ensure image is in HWC uint8 format
                 if image_array.ndim == 2: # Grayscale -> HWC
@@ -197,36 +237,55 @@ class DataProcessor:
                 # --- End Pre-Prediction Validation ---
                 
             except (ValueError, TypeError) as e:
-                 print(f"Warning: Skipping depth prediction for row index {index} due to image preparation error: {e}")
-                 depth_maps.append(None)
+                 print(f"Warning: Skipping depth preparation for row index {index} due to image preparation error: {e}")
                  continue
             # --- End: Image Preparation ---
 
-            # Predict depth    
-            depth_map = self._predict_depth(image_array_hwc)
-            depth_maps.append(depth_map)
-            
-            # Save preview if prediction was successful and limit not reached
-            if depth_map is not None and saved_depth_count < max_depth_saves:
-                try:
-                    # Save Depth Map
-                    depth_img_array = (depth_map * 255).astype(np.uint8) # Scale 0-1 float to 0-255 uint8
-                    depth_pil = Image.fromarray(depth_img_array)
-                    depth_save_path = os.path.join(depth_save_dir, f"depth_preview_idx_{index}.png")
-                    depth_pil.save(depth_save_path)
+            # --- Batching Logic ---
+            try:
+                # Convert prepared HWC uint8 numpy array to PIL Image
+                image_pil = Image.fromarray(image_array_hwc)
+                image_batch_for_depth.append(image_pil)
+                batch_indices.append(index) # Keep track of original index
+            except Exception as e:
+                print(f"Warning: Skipping row index {index} due to PIL conversion error: {e}")
+                continue
+                
+            # If batch is full or it's the last item, process the batch
+            if len(image_batch_for_depth) == self.depth_batch_size or index == df.index[-1]:
+                if image_batch_for_depth: # Ensure batch isn't empty
+                    # Predict depth for the current batch
+                    batch_results = self._predict_depth_batch(image_batch_for_depth)
                     
-                    # Save Corresponding Input Image
-                    input_img_pil = Image.fromarray(image_array_hwc) # Use the prepared HWC uint8 image
-                    input_save_path = os.path.join(depth_save_dir, f"input_preview_idx_{index}.png")
-                    input_img_pil.save(input_save_path)
-                    
-                    print(f"Saved depth map preview to: {depth_save_path}")
-                    print(f"Saved corresponding input preview to: {input_save_path}")
-                    saved_depth_count += 1
-                except Exception as e:
-                     print(f"Warning: Could not save depth/input preview for index {index}: {e}")
+                    # Place results in the correct position using batch_indices
+                    for i, original_index in enumerate(batch_indices):
+                        predicted_depth = batch_results[i]
+                        all_depth_maps[df.index.get_loc(original_index)] = predicted_depth # Use get_loc for robustness
+                        
+                        # Save preview if prediction was successful and limit not reached
+                        if predicted_depth is not None and saved_depth_count < max_depth_saves:
+                            try:
+                                depth_img_array = (predicted_depth * 255).astype(np.uint8)
+                                depth_pil_preview = Image.fromarray(depth_img_array)
+                                depth_save_path = os.path.join(depth_save_dir, f"depth_preview_idx_{original_index}.png")
+                                depth_pil_preview.save(depth_save_path)
+                                
+                                # Save corresponding input preview (retrieve from image_batch_for_depth)
+                                input_img_pil = image_batch_for_depth[i]
+                                input_save_path = os.path.join(depth_save_dir, f"input_preview_idx_{original_index}.png")
+                                input_img_pil.save(input_save_path)
+                                
+                                print(f"Saved depth/input previews for index {original_index}")
+                                saved_depth_count += 1
+                            except Exception as e:
+                                 print(f"Warning: Could not save depth/input preview for index {original_index}: {e}")
+                                 
+                # Clear the batch for the next iteration
+                image_batch_for_depth = []
+                batch_indices = []
+        # --- End Batching Logic ---
         
-        df['depth_map'] = depth_maps
+        df['depth_map'] = all_depth_maps
         # Optional: Drop rows where depth prediction failed
         initial_len = len(df)
         df = df.dropna(subset=['depth_map'])
