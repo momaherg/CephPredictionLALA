@@ -311,6 +311,7 @@ class DataProcessor:
                 print(f"Removed invalid images. Remaining records: {len(self.df)}")
         
         # Try to load pre-generated depth features if a path is provided
+        depth_features_loaded = False
         if self.depth_features_path is not None:
             depth_features_loaded = self.load_depth_features()
             if depth_features_loaded:
@@ -334,6 +335,7 @@ class DataProcessor:
                 # Check if depth features already exist
                 if 'depth_feature' in self.df.columns:
                     print("Depth features already exist in the dataset. Skipping depth generation.")
+                    depth_features_loaded = True
                 else:
                     # Initialize depth feature column
                     self.df['depth_feature'] = None
@@ -432,6 +434,7 @@ class DataProcessor:
                     
                     # Save preprocessed data with depth features
                     if depth_count > 0:
+                        depth_features_loaded = True
                         output_path = self.data_path.replace('.csv', '_with_depth.pkl').replace('.pkl', '_with_depth.pkl')
                         self.df.to_pickle(output_path)
                         print(f"Saved preprocessed data with depth features to {output_path}")
@@ -443,16 +446,66 @@ class DataProcessor:
                         print("4. Try running with a small test dataset to debug")
         
         # Compute patient classes and balance if requested
+        # At this point, depth features should be loaded and ready to be duplicated during balancing
         if balance_classes and self.classifier is not None:
+            # Check if we need to preserve depth features during balancing
+            has_depth_features = 'depth_feature' in self.df.columns
+            depth_features_present = has_depth_features and self.df['depth_feature'].notna().sum() > 0
+            
             print("Computing skeletal classifications for patients...")
             self.df = self.classifier.classify_patients(self.df)
             
+            # Get skeletal class distribution before balancing
+            if 'skeletal_class' in self.df.columns:
+                print("Skeletal Class Distribution:")
+                class_counts = self.df['skeletal_class'].value_counts().to_dict()
+                total = len(self.df)
+                for class_label, count in sorted(class_counts.items()):
+                    percentage = count / total * 100
+                    print(f"  Class {class_label}: {count} patients ({percentage:.1f}%)")
+            
             print("Balancing dataset by upsampling minority classes...")
-            self.df = self.classifier.balance_classes(
+            
+            # Track original indices for reference after balancing
+            self.df['original_index'] = self.df.index
+            
+            # Balance classes
+            balanced_df = self.classifier.balance_classes(
                 self.df, 
                 class_column='skeletal_class', 
                 balance_method='upsample'
             )
+            
+            # After balancing, depth features need to be preserved from the original rows
+            if depth_features_present:
+                print("Preserving depth features during balancing...")
+                # Check if the depth features were preserved correctly
+                if ('depth_feature' not in balanced_df.columns) or (balanced_df['depth_feature'].notna().sum() < balanced_df['original_index'].notna().sum()):
+                    print("Depth features were lost or incomplete during balancing. Restoring from original dataframe...")
+                    
+                    # Create a dictionary to map original indices to depth features
+                    depth_map = {}
+                    for idx, row in self.df.iterrows():
+                        if row['depth_feature'] is not None:
+                            depth_map[idx] = row['depth_feature']
+                    
+                    # Restore depth features based on original_index
+                    for idx, row in balanced_df.iterrows():
+                        orig_idx = row['original_index']
+                        if orig_idx in depth_map:
+                            balanced_df.at[idx, 'depth_feature'] = depth_map[orig_idx]
+            
+            # Remove the temporary column
+            if 'original_index' in balanced_df.columns:
+                balanced_df = balanced_df.drop(columns=['original_index'])
+            
+            # Update the dataframe
+            self.df = balanced_df
+            
+            # Verify depth features after balancing
+            if depth_features_present:
+                depth_count = self.df['depth_feature'].notna().sum()
+                print(f"After balancing: {depth_count}/{len(self.df)} rows have depth features")
         
         return self.df
     
