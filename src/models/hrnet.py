@@ -410,7 +410,7 @@ class LandmarkHeatmapNet(nn.Module):
             
             # Ensure HRNet features match depth features' spatial dimensions before concatenation
             if features.shape[2:] != depth_features.shape[2:]:
-                print(f"Resizing HRNet features from {features.shape[2:]} to {depth_features.shape[2:]}")
+                # print(f"Resizing HRNet features from {features.shape[2:]} to {depth_features.shape[2:]}")
                 features = F.interpolate(features, size=depth_features.shape[2:], mode='bilinear', align_corners=False)
             
             # Concatenate RGB and depth features along channel dimension
