@@ -318,7 +318,8 @@ class LandmarkTrainer:
             if self.log_specific_landmark_indices:
                 per_landmark_med = per_landmark_euclidean_distance(pred_coords, landmarks)
                 for idx in self.log_specific_landmark_indices:
-                    specific_distances[idx].extend(per_landmark_med[:, idx].tolist())
+                    # Fix: per_landmark_med is a 1D tensor of shape (num_landmarks,)
+                    specific_distances[idx].append(per_landmark_med[idx].item())
             
             num_batches += 1
         
@@ -418,7 +419,8 @@ class LandmarkTrainer:
                 if self.log_specific_landmark_indices:
                     per_landmark_med = per_landmark_euclidean_distance(pred_coords, landmarks)
                     for idx in self.log_specific_landmark_indices:
-                        specific_distances[idx].extend(per_landmark_med[:, idx].tolist())
+                        # Fix: per_landmark_med is a 1D tensor of shape (num_landmarks,)
+                        specific_distances[idx].append(per_landmark_med[idx].item())
                 
                 num_batches += 1
         
