@@ -43,19 +43,94 @@ class DataProcessor:
         """
         if self.depth_model is None and self.generate_depth:
             try:
-                from transformers import DepthProImageProcessorFast, DepthProForDepthEstimation
+                print("\nInitializing depth prediction model...")
+                try:
+                    from transformers import DepthProImageProcessorFast, DepthProForDepthEstimation
+                except ImportError:
+                    print("Error: transformers package not found. Installing required packages...")
+                    import subprocess
+                    try:
+                        subprocess.check_call(["pip", "install", "transformers"])
+                        print("Successfully installed transformers package. Continuing with initialization...")
+                        from transformers import DepthProImageProcessorFast, DepthProForDepthEstimation
+                    except Exception as e:
+                        print(f"Failed to install transformers package: {str(e)}")
+                        print("Please manually install the required packages with:")
+                        print("pip install transformers")
+                        self.generate_depth = False
+                        return
                 
-                print("Initializing depth prediction model...")
+                # Check for torch
+                try:
+                    import torch
+                    print(f"Using PyTorch version: {torch.__version__}")
+                except ImportError:
+                    print("Error: PyTorch not found. Please install PyTorch.")
+                    self.generate_depth = False
+                    return
+                
+                # Determine device
                 device = torch.device("cuda" if torch.cuda.is_available() else 
-                                     ("mps" if torch.backends.mps.is_available() else "cpu"))
+                                     ("mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu"))
                 print(f"Using device: {device}")
                 
-                self.depth_processor = DepthProImageProcessorFast.from_pretrained("apple/DepthPro-hf")
-                self.depth_model = DepthProForDepthEstimation.from_pretrained("apple/DepthPro-hf").to(device)
+                # Print debug info about available GPU
+                if device.type == "cuda":
+                    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+                    print(f"Available memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+                elif device.type == "mps":
+                    print("Using Apple Metal Performance Shaders (MPS) backend")
+                
+                print("Downloading depth prediction model from apple/DepthPro-hf...")
+                try:
+                    # First try to load the processor
+                    self.depth_processor = DepthProImageProcessorFast.from_pretrained("apple/DepthPro-hf")
+                    print("✓ Downloaded processor successfully")
+                except Exception as e:
+                    print(f"Error downloading processor: {str(e)}")
+                    self.generate_depth = False
+                    return
+                
+                try:
+                    # Then load the model
+                    self.depth_model = DepthProForDepthEstimation.from_pretrained("apple/DepthPro-hf").to(device)
+                    print("✓ Downloaded model successfully")
+                except Exception as e:
+                    print(f"Error downloading model: {str(e)}")
+                    self.generate_depth = False
+                    return
+                
                 self.device = device
                 print("Depth prediction model initialized successfully.")
-            except ImportError:
-                print("Warning: transformers package not found. Please install it with 'pip install transformers' to use depth prediction.")
+                
+                # Test the model with a small random image
+                try:
+                    print("Testing depth model with a sample image...")
+                    sample_img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
+                    sample_pil = Image.fromarray(sample_img)
+                    
+                    # Process image for depth prediction
+                    inputs = self.depth_processor(images=sample_pil, return_tensors="pt").to(device)
+                    
+                    # Predict depth
+                    with torch.no_grad():
+                        outputs = self.depth_model(**inputs)
+                    
+                    # Post-process depth prediction
+                    post_processed_output = self.depth_processor.post_process_depth_estimation(
+                        outputs, target_sizes=[(sample_pil.height, sample_pil.width)],
+                    )
+                    
+                    # Get depth map
+                    depth = post_processed_output[0]["predicted_depth"]
+                    print("✓ Model test successful")
+                except Exception as e:
+                    print(f"Error testing model: {str(e)}")
+                    print("Model initialization completed, but model test failed. Proceeding anyway.")
+            except ImportError as e:
+                print(f"Error importing required packages: {str(e)}")
+                print("Please install required packages with:")
+                print("pip install transformers torch")
                 self.generate_depth = False
             except Exception as e:
                 print(f"Error initializing depth prediction model: {str(e)}")
@@ -196,14 +271,76 @@ class DataProcessor:
                     # Process images
                     if 'Image' in self.df.columns:
                         # Process in-memory images
+                        image_types_found = {}
+                        depth_features_generated = 0
+                        
                         for idx, row in tqdm(self.df.iterrows(), total=len(self.df), desc="Generating depth features"):
                             img_data = row['Image']
-                            if isinstance(img_data, np.ndarray):
-                                depth_map = self._predict_depth(img_data)
+                            
+                            # Track types of image data for debugging
+                            data_type = type(img_data).__name__
+                            if data_type not in image_types_found:
+                                image_types_found[data_type] = 1
+                            else:
+                                image_types_found[data_type] += 1
+                            
+                            # Handle different image formats
+                            try:
+                                if isinstance(img_data, np.ndarray):
+                                    # Direct numpy array
+                                    image_to_process = img_data
+                                elif isinstance(img_data, list):
+                                    # Convert list to numpy array
+                                    if all(isinstance(p, list) for p in img_data):
+                                        # Nested list structure
+                                        image_to_process = np.array(img_data)
+                                    else:
+                                        # Flat list - try to reshape based on expected dimensions
+                                        image_to_process = np.array(img_data).reshape(self.image_size[0], self.image_size[1], -1)
+                                elif hasattr(img_data, 'numpy'):
+                                    # PyTorch tensor or similar
+                                    image_to_process = img_data.numpy()
+                                else:
+                                    # Unknown format - skip
+                                    continue
+                                
+                                # Make sure image has correct dimensions (H, W, C)
+                                if len(image_to_process.shape) == 2:
+                                    # Single channel image - add channel dimension
+                                    image_to_process = np.expand_dims(image_to_process, axis=2)
+                                    # Convert to 3 channels if needed
+                                    image_to_process = np.repeat(image_to_process, 3, axis=2)
+                                elif image_to_process.shape[2] == 1:
+                                    # Single channel image - convert to 3 channels
+                                    image_to_process = np.repeat(image_to_process, 3, axis=2)
+                                
+                                # Ensure image shape is as expected
+                                if image_to_process.shape[0] != self.image_size[0] or image_to_process.shape[1] != self.image_size[1]:
+                                    # Resize to expected dimensions
+                                    image_to_process = cv2.resize(image_to_process, (self.image_size[1], self.image_size[0]))
+                                
+                                # Actually predict depth
+                                depth_map = self._predict_depth(image_to_process)
                                 if depth_map is not None:
                                     self.df.at[idx, 'depth_feature'] = depth_map
+                                    depth_features_generated += 1
+                                    
+                                    # Log progress occasionally
+                                    if depth_features_generated % 10 == 0:
+                                        print(f"Generated {depth_features_generated} depth features so far...")
+                            
+                            except Exception as e:
+                                print(f"Error processing image at index {idx}: {str(e)}")
+                        
+                        # Print debug information
+                        print("\nImage data types found in dataset:")
+                        for data_type, count in image_types_found.items():
+                            print(f"  {data_type}: {count} images")
+                        
                     elif 'image_path' in self.df.columns:
                         # Process images from file paths
+                        depth_features_generated = 0
+                        
                         for idx, row in tqdm(self.df.iterrows(), total=len(self.df), desc="Generating depth features"):
                             img_path = row['image_path']
                             try:
@@ -211,6 +348,11 @@ class DataProcessor:
                                 depth_map = self._predict_depth(img)
                                 if depth_map is not None:
                                     self.df.at[idx, 'depth_feature'] = depth_map
+                                    depth_features_generated += 1
+                                    
+                                    # Log progress occasionally
+                                    if depth_features_generated % 10 == 0:
+                                        print(f"Generated {depth_features_generated} depth features so far...")
                             except Exception as e:
                                 print(f"Error processing image {img_path}: {str(e)}")
                     
@@ -223,6 +365,12 @@ class DataProcessor:
                         output_path = self.data_path.replace('.csv', '_with_depth.pkl').replace('.pkl', '_with_depth.pkl')
                         self.df.to_pickle(output_path)
                         print(f"Saved preprocessed data with depth features to {output_path}")
+                    else:
+                        print("\nNo depth features were generated. Please check the following:")
+                        print("1. Make sure the transformers package is installed: pip install transformers")
+                        print("2. Verify that you have internet access to download the model")
+                        print("3. Check that your images are in a supported format")
+                        print("4. Try running with a small test dataset to debug")
         
         # Compute patient classes and balance if requested
         if balance_classes and self.classifier is not None:
