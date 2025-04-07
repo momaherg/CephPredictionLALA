@@ -157,6 +157,125 @@ class HRNet(nn.Module):
         return self.backbone(x)
 
 
+class DepthCNN(nn.Module):
+    """
+    Lightweight CNN for processing depth features.
+    
+    Takes a single-channel depth map and extracts features that can be fused
+    with RGB features from the HRNet backbone.
+    """
+    def __init__(self, output_channels=128, output_size=(64, 64)):
+        """
+        Initialize the Depth CNN
+        
+        Args:
+            output_channels (int): Number of output channels for the depth features
+            output_size (tuple): Target output spatial dimensions (height, width)
+        """
+        super(DepthCNN, self).__init__()
+        
+        self.output_channels = output_channels
+        self.output_size = output_size
+        
+        # Define a lightweight CNN for depth processing
+        # Using a ResNet-style architecture with fewer parameters
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        
+        # ResNet-style blocks with fewer channels
+        self.layer1 = self._make_layer(32, 32, 2, stride=1)
+        self.layer2 = self._make_layer(32, 64, 2, stride=2)
+        self.layer3 = self._make_layer(64, output_channels, 2, stride=2)
+        
+        # Final projection to ensure proper channel count
+        self.final_conv = nn.Conv2d(output_channels, output_channels, kernel_size=1)
+        self.final_bn = nn.BatchNorm2d(output_channels)
+    
+    def _make_layer(self, in_channels, out_channels, blocks, stride=1):
+        """Create a sequence of ResNet-style blocks"""
+        layers = []
+        
+        # First block handles downsampling if needed
+        downsample = None
+        if stride != 1 or in_channels != out_channels:
+            downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+        
+        # Add first block with potential downsampling
+        layers.append(self._resnet_block(in_channels, out_channels, stride, downsample))
+        
+        # Add remaining blocks
+        for _ in range(1, blocks):
+            layers.append(self._resnet_block(out_channels, out_channels))
+        
+        return nn.Sequential(*layers)
+    
+    def _resnet_block(self, in_channels, out_channels, stride=1, downsample=None):
+        """Create a single ResNet block"""
+        class ResBlock(nn.Module):
+            def __init__(self, in_channels, out_channels, stride, downsample):
+                super(ResBlock, self).__init__()
+                self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+                self.bn1 = nn.BatchNorm2d(out_channels)
+                self.relu = nn.ReLU(inplace=True)
+                self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+                self.bn2 = nn.BatchNorm2d(out_channels)
+                self.downsample = downsample
+            
+            def forward(self, x):
+                residual = x
+                out = self.conv1(x)
+                out = self.bn1(out)
+                out = self.relu(out)
+                out = self.conv2(out)
+                out = self.bn2(out)
+                
+                if self.downsample is not None:
+                    residual = self.downsample(x)
+                
+                out += residual
+                out = self.relu(out)
+                return out
+        
+        return ResBlock(in_channels, out_channels, stride, downsample)
+    
+    def forward(self, x):
+        """
+        Forward pass through depth CNN
+        
+        Args:
+            x (torch.Tensor): Input depth map tensor of shape (batch_size, 1, height, width)
+        
+        Returns:
+            torch.Tensor: Depth features of shape (batch_size, output_channels, output_size[0], output_size[1])
+        """
+        # Basic feature extraction
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        
+        # ResNet-style blocks
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        
+        # Final projection
+        x = self.final_conv(x)
+        x = self.final_bn(x)
+        x = self.relu(x)
+        
+        # Resize to match desired output dimensions if needed
+        if x.shape[2:] != self.output_size:
+            x = F.interpolate(x, size=self.output_size, mode='bilinear', align_corners=False)
+        
+        return x
+
+
 class RefinementMLP(nn.Module):
     """
     Refinement MLP for landmark coordinates
@@ -230,38 +349,48 @@ class RefinementMLP(nn.Module):
 
 class LandmarkHeatmapNet(nn.Module):
     """
-    Landmark detection network using heatmap regression with refinement MLP
+    Landmark detection network using heatmap regression with refinement MLP and optional depth features.
     
     Architecture:
-    1. HRNet backbone (W32 or W48)
-    2. 1x1 convolution to output heatmaps (one per landmark)
-    3. Coordinate extraction from heatmaps
-    4. Refinement MLP to improve coordinate predictions
+    1. HRNet backbone (W32 or W48) for RGB image
+    2. Optional DepthCNN for depth features
+    3. Feature fusion (concatenation)
+    4. 1x1 convolution to output heatmaps (one per landmark)
+    5. Coordinate extraction from heatmaps
+    6. Refinement MLP to improve coordinate predictions
     """
-    def __init__(self, num_landmarks=19, output_size=(64, 64), pretrained=True, use_refinement=True, hrnet_type='w32'):
+    def __init__(self, num_landmarks=19, output_size=(64, 64), pretrained=True, 
+                 use_refinement=True, hrnet_type='w32', use_depth=False, depth_channels=64):
         super(LandmarkHeatmapNet, self).__init__()
         
         self.num_landmarks = num_landmarks
         self.output_size = output_size
         self.use_refinement = use_refinement
         self.hrnet_type = hrnet_type
+        self.use_depth = use_depth
+        self.depth_channels = depth_channels
         
-        # HRNet backbone
+        # HRNet backbone for RGB
         self.hrnet = HRNet(pretrained=pretrained, hrnet_type=hrnet_type)
         
-        # We'll create the heatmap layer after we know the channel size
+        # Depth CNN for depth features (if enabled)
+        if use_depth:
+            self.depth_cnn = DepthCNN(output_channels=depth_channels, output_size=output_size)
+        
+        # We'll create the heatmap layer after we know the channel size in forward()
         self.heatmap_layer = None
         
         # Refinement MLP
         if use_refinement:
             self.refinement_mlp = RefinementMLP(num_landmarks)
     
-    def forward(self, x):
+    def forward(self, x, depth=None):
         """
         Forward pass to generate heatmaps
         
         Args:
-            x (torch.Tensor): Input images of shape (batch_size, channels, height, width)
+            x (torch.Tensor): Input RGB images of shape (batch_size, 3, height, width)
+            depth (torch.Tensor, optional): Input depth maps of shape (batch_size, 1, height, width)
             
         Returns:
             dict: Dictionary containing heatmaps and optionally refined coordinates
@@ -274,7 +403,15 @@ class LandmarkHeatmapNet(nn.Module):
             # Use the highest resolution features (last in the list)
             features = features[-1]
         
-        # Create the heatmap layer if it doesn't exist or if the channel dimension doesn't match
+        # Process depth features if available and enabled
+        depth_features = None
+        if self.use_depth and depth is not None:
+            depth_features = self.depth_cnn(depth)
+            
+            # Concatenate RGB and depth features along channel dimension
+            features = torch.cat([features, depth_features], dim=1)
+        
+        # Create or update the heatmap layer if needed
         if self.heatmap_layer is None or self.heatmap_layer.in_channels != features.shape[1]:
             in_channels = features.shape[1]
             self.heatmap_layer = nn.Conv2d(in_channels, self.num_landmarks, kernel_size=1, stride=1, padding=0)
@@ -347,12 +484,13 @@ class LandmarkHeatmapNet(nn.Module):
         """
         return soft_argmax(heatmaps, beta=beta)
     
-    def predict_landmarks(self, x, use_soft_argmax=True, beta=100):
+    def predict_landmarks(self, x, depth=None, use_soft_argmax=True, beta=100):
         """
         Predict landmark coordinates from input images
         
         Args:
-            x (torch.Tensor): Input images of shape (batch_size, channels, height, width)
+            x (torch.Tensor): Input RGB images of shape (batch_size, channels, height, width)
+            depth (torch.Tensor, optional): Input depth maps of shape (batch_size, 1, height, width)
             use_soft_argmax (bool): Whether to use soft-argmax for sub-pixel accuracy
             beta (float): Temperature parameter for softmax (only used if use_soft_argmax=True)
             
@@ -360,7 +498,7 @@ class LandmarkHeatmapNet(nn.Module):
             torch.Tensor: Predicted landmark coordinates of shape (batch_size, num_landmarks, 2)
         """
         # Get model output
-        output = self(x)
+        output = self(x, depth)
         
         # If using refinement, return refined coordinates
         if self.use_refinement and 'refined_coords' in output:
@@ -376,7 +514,8 @@ class LandmarkHeatmapNet(nn.Module):
         return coords
 
 
-def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, hrnet_type='w32'):
+def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, 
+                       hrnet_type='w32', use_depth=False, depth_channels=64):
     """
     Create a HRNet-based landmark detection model
     
@@ -385,6 +524,8 @@ def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, h
         pretrained (bool): Whether to use pretrained weights for the backbone
         use_refinement (bool): Whether to use refinement MLP
         hrnet_type (str): HRNet variant to use ('w32' or 'w48')
+        use_depth (bool): Whether to use depth features
+        depth_channels (int): Number of channels for depth features
         
     Returns:
         LandmarkHeatmapNet: The created model
@@ -394,6 +535,8 @@ def create_hrnet_model(num_landmarks=19, pretrained=True, use_refinement=True, h
         output_size=(64, 64),
         pretrained=pretrained,
         use_refinement=use_refinement,
-        hrnet_type=hrnet_type
+        hrnet_type=hrnet_type,
+        use_depth=use_depth,
+        depth_channels=depth_channels
     )
     return model 

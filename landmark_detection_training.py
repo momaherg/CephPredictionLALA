@@ -75,6 +75,10 @@ USE_REFINEMENT = True  # Whether to use refinement MLP
 MAX_DELTA = 2.0  # Maximum allowed delta for refinement
 HRNET_TYPE = 'w32'  # HRNet variant: 'w32' (default) or 'w48' (larger model)
 
+# Depth feature parameters
+DEPTH_CHANNELS = 64  # Number of channels for depth features in the depth CNN
+DEPTH_FUSION = 'late'  # Fusion strategy: 'early', 'late', or 'multi' 
+
 # Loss parameters
 HEATMAP_WEIGHT = 1.0  # Weight for heatmap loss (used when not using weight scheduling)
 COORD_WEIGHT = 0.1  # Weight for coordinate loss (used when not using weight scheduling)
@@ -267,6 +271,9 @@ trainer = LandmarkTrainer(
     coord_weight=COORD_WEIGHT,
     use_mps=USE_MPS,
     hrnet_type=HRNET_TYPE,
+    # Depth feature parameters
+    use_depth=USE_DEPTH_FEATURES,
+    depth_channels=DEPTH_CHANNELS,
     # Weight scheduling parameters
     use_weight_schedule=USE_WEIGHT_SCHEDULE,
     initial_heatmap_weight=INITIAL_HEATMAP_WEIGHT,

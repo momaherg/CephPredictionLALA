@@ -22,184 +22,80 @@ class LandmarkTrainer:
     """
     Trainer for landmark detection model
     """
-    def __init__(self, num_landmarks=19, 
-                 learning_rate=1e-4, 
-                 weight_decay=1e-5,
-                 device=None,
-                 output_dir='./outputs',
-                 use_refinement=True,
-                 heatmap_weight=1.0,
-                 coord_weight=1.0,
-                 use_mps=False,
-                 hrnet_type='w32',
-                 use_weight_schedule=False,
-                 initial_heatmap_weight=1.0,
-                 initial_coord_weight=0.1,
-                 final_heatmap_weight=0.5,
-                 final_coord_weight=1.0,
-                 weight_schedule_epochs=30,
-                 scheduler_type=None,
-                 lr_patience=5,
-                 lr_factor=0.5,
-                 lr_min=1e-6,
-                 lr_t_max=10,
-                 # OneCycleLR specific parameters
-                 max_lr=None,
-                 pct_start=0.3,
-                 div_factor=25.0,
-                 final_div_factor=1e4,
-                 # Optimizer parameters
-                 optimizer_type='adam',
-                 momentum=0.9,
-                 nesterov=True,
-                 # Loss normalization parameters
-                 use_loss_normalization=True,
-                 norm_decay=0.99,
-                 norm_epsilon=1e-6,
-                 total_steps=None,
-                 target_landmark_indices=None,
-                 landmark_weights=None,
-                 log_specific_landmark_indices=None): # Indices for specific MED logging
+    def __init__(self, num_landmarks=19, learning_rate=1e-4, weight_decay=1e-5, 
+                 device=None, output_dir='./outputs', use_refinement=True,
+                 use_depth=False, depth_channels=64,
+                 heatmap_weight=1.0, coord_weight=0.1, use_mps=False, hrnet_type='w32',
+                 # Weight scheduling params
+                 use_weight_schedule=False, initial_heatmap_weight=1.0, initial_coord_weight=0.1,
+                 final_heatmap_weight=0.5, final_coord_weight=1.0, weight_schedule_epochs=30,
+                 # Learning rate scheduler params
+                 scheduler_type=None, lr_patience=5, lr_factor=0.5, lr_min=1e-6, lr_t_max=25,
+                 max_lr=1e-3, pct_start=0.3, div_factor=25.0, final_div_factor=1e4,
+                 # Optimizer params
+                 optimizer_type='adam', momentum=0.9, nesterov=True,
+                 # Loss normalization params
+                 use_loss_normalization=False, norm_decay=0.99, norm_epsilon=1e-6,
+                 # Per-Landmark Weighting/Focusing
+                 target_landmark_indices=None, landmark_weights=None,
+                 # Specific MED Logging
+                 log_specific_landmark_indices=None):
         """
-        Initialize trainer
+        Initialize the landmark trainer
         
         Args:
             num_landmarks (int): Number of landmarks to detect
-            learning_rate (float): Learning rate for optimizer
-            weight_decay (float): Weight decay for optimizer
+            learning_rate (float): Learning rate for the optimizer
+            weight_decay (float): Weight decay for the optimizer
             device (torch.device): Device to use for training
             output_dir (str): Directory to save outputs
             use_refinement (bool): Whether to use refinement MLP
-            heatmap_weight (float): Weight for heatmap loss (used when use_weight_schedule=False)
-            coord_weight (float): Weight for coordinate loss (used when use_weight_schedule=False)
-            use_mps (bool): Whether to use MPS device on Mac
+            use_depth (bool): Whether to use depth features
+            depth_channels (int): Number of channels for depth features
+            heatmap_weight (float): Weight for heatmap loss
+            coord_weight (float): Weight for coordinate loss
+            use_mps (bool): Whether to use Metal Performance Shaders (MPS) for Mac
             hrnet_type (str): HRNet variant to use ('w32' or 'w48')
             use_weight_schedule (bool): Whether to use dynamic weight scheduling
-            initial_heatmap_weight (float): Initial weight for heatmap loss in schedule
-            initial_coord_weight (float): Initial weight for coordinate loss in schedule
-            final_heatmap_weight (float): Final weight for heatmap loss in schedule
-            final_coord_weight (float): Final weight for coordinate loss in schedule
-            weight_schedule_epochs (int): Number of epochs to transition from initial to final weights
-            scheduler_type (str): Type of learning rate scheduler to use ('cosine', 'plateau', 'onecycle', or None)
+            initial_heatmap_weight (float): Initial weight for heatmap loss
+            initial_coord_weight (float): Initial weight for coordinate loss
+            final_heatmap_weight (float): Final weight for heatmap loss after schedule
+            final_coord_weight (float): Final weight for coordinate loss after schedule
+            weight_schedule_epochs (int): Number of epochs for weight scheduling
+            scheduler_type (str): Type of LR scheduler ('plateau', 'cosine', 'onecycle')
             lr_patience (int): Patience for ReduceLROnPlateau scheduler
-            lr_factor (float): Factor by which to reduce learning rate for ReduceLROnPlateau
+            lr_factor (float): Factor for ReduceLROnPlateau scheduler
             lr_min (float): Minimum learning rate for schedulers
-            lr_t_max (int): T_max parameter for CosineAnnealingLR (usually set to num_epochs/2)
-            max_lr (float): Maximum learning rate for OneCycleLR (defaults to 10x learning_rate if None)
-            pct_start (float): Percentage of training spent increasing learning rate for OneCycleLR
-            div_factor (float): Initial learning rate division factor for OneCycleLR
-            final_div_factor (float): Final learning rate division factor for OneCycleLR
-            optimizer_type (str): Type of optimizer to use ('adam', 'adamw', 'sgd')
-            momentum (float): Momentum factor for SGD optimizer
+            lr_t_max (int): T_max for CosineAnnealingLR scheduler
+            max_lr (float): Maximum learning rate for OneCycleLR
+            pct_start (float): Percentage of cycle to increase LR for OneCycleLR
+            div_factor (float): Initial LR division factor for OneCycleLR
+            final_div_factor (float): Final LR division factor for OneCycleLR
+            optimizer_type (str): Type of optimizer ('adam', 'adamw', 'sgd')
+            momentum (float): Momentum for SGD optimizer
             nesterov (bool): Whether to use Nesterov momentum for SGD
-            use_loss_normalization (bool): Normalize loss components before weighting.
-            norm_decay (float): Decay factor for loss normalization running average.
-            norm_epsilon (float): Epsilon for loss normalization stability.
-            total_steps (int, optional): Total number of training steps, required for OneCycleLR if initialized directly.
-            target_landmark_indices (list, optional): Indices of landmarks to focus on during loss calculation.
-            landmark_weights (list or numpy array, optional): Weights to apply to each landmark's loss.
-                                                              Must have length equal to num_landmarks.
-            log_specific_landmark_indices (list, optional): Indices of landmarks to log MED for separately.
-        """
-        # Set device
-        if device is not None:
-            self.device = device
-        else:
-            # Check for MPS (Mac GPU) availability
-            if use_mps and torch.backends.mps.is_available() and platform.system() == 'Darwin':
-                self.device = torch.device('mps')
-                print("Using MPS device (Apple Silicon GPU)")
-            elif torch.cuda.is_available():
-                self.device = torch.device('cuda')
-                print("Using CUDA device")
-            else:
-                self.device = torch.device('cpu')
-                print("Using CPU device")
+            use_loss_normalization (bool): Whether to normalize loss values
+            norm_decay (float): Decay factor for running average in normalization
+            norm_epsilon (float): Epsilon for numerical stability in normalization
+            target_landmark_indices (list): Indices of landmarks to focus on
+            landmark_weights (list): Per-landmark weights for loss calculation
+            log_specific_landmark_indices (list): Indices of landmarks to log specific metrics for
+        """        
+        # Store parameters
+        self.num_landmarks = num_landmarks
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.output_dir = output_dir
+        self.use_refinement = use_refinement
+        self.use_depth = use_depth
+        self.depth_channels = depth_channels
+        self.hrnet_type = hrnet_type
         
-        # Create model
-        self.model = create_hrnet_model(
-            num_landmarks=num_landmarks, 
-            pretrained=True, 
-            use_refinement=use_refinement,
-            hrnet_type=hrnet_type
-        )
-        self.model = self.model.to(self.device)
+        # Loss weighting
+        self.heatmap_weight = heatmap_weight
+        self.coord_weight = coord_weight
         
-        # Create optimizer based on type
-        optimizer_type = optimizer_type.lower()
-        self.optimizer_type = optimizer_type
-        
-        if optimizer_type == 'adam':
-            self.optimizer = optim.Adam(
-                self.model.parameters(), 
-                lr=learning_rate, 
-                weight_decay=weight_decay
-            )
-            print(f"Using Adam optimizer with lr={learning_rate}, weight_decay={weight_decay}")
-        
-        elif optimizer_type == 'adamw':
-            self.optimizer = optim.AdamW(
-                self.model.parameters(), 
-                lr=learning_rate, 
-                weight_decay=weight_decay
-            )
-            print(f"Using AdamW optimizer with lr={learning_rate}, weight_decay={weight_decay}")
-        
-        elif optimizer_type == 'sgd':
-            self.optimizer = optim.SGD(
-                self.model.parameters(), 
-                lr=learning_rate, 
-                momentum=momentum,
-                weight_decay=weight_decay,
-                nesterov=nesterov
-            )
-            print(f"Using SGD optimizer with lr={learning_rate}, momentum={momentum}, "
-                  f"nesterov={nesterov}, weight_decay={weight_decay}")
-        
-        else:
-            raise ValueError(f"Unsupported optimizer type: {optimizer_type}. "
-                            "Choose from 'adam', 'adamw', or 'sgd'.")
-        
-        # Learning rate scheduler parameters
-        self.scheduler_type = scheduler_type
-        self.scheduler = None
-        if scheduler_type == 'cosine':
-            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=lr_t_max, eta_min=lr_min
-            )
-            print(f"Using CosineAnnealingLR scheduler with T_max={lr_t_max}, min_lr={lr_min}")
-        
-        elif scheduler_type == 'plateau':
-            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode='min', factor=lr_factor, 
-                patience=lr_patience, verbose=True, min_lr=lr_min
-            )
-            print(f"Using ReduceLROnPlateau scheduler with patience={lr_patience}, factor={lr_factor}, min_lr={lr_min}")
-            
-        elif scheduler_type == 'onecycle':
-            # If max_lr not specified, use 10x the base learning rate
-            if max_lr is None:
-                max_lr = learning_rate * 10
-            
-            # If total_steps provided (e.g., from external calculation), initialize now
-            if total_steps:
-                self.scheduler = optim.lr_scheduler.OneCycleLR(
-                    self.optimizer, max_lr=max_lr, total_steps=total_steps,
-                    pct_start=pct_start, div_factor=div_factor, 
-                    final_div_factor=final_div_factor
-                )
-                print(f"Using OneCycleLR scheduler initialized directly with total_steps={total_steps}, max_lr={max_lr}")
-            else:
-                # Store parameters for later initialization in train() when total_steps is known
-                self.onecycle_params = {
-                    'max_lr': max_lr,
-                    'pct_start': pct_start,
-                    'div_factor': div_factor,
-                    'final_div_factor': final_div_factor
-                }
-                print(f"OneCycleLR scheduler will be initialized during training with max_lr={max_lr}")
-        
-        # Weight scheduling parameters
+        # Weight scheduling
         self.use_weight_schedule = use_weight_schedule
         self.initial_heatmap_weight = initial_heatmap_weight
         self.initial_coord_weight = initial_coord_weight
@@ -207,59 +103,111 @@ class LandmarkTrainer:
         self.final_coord_weight = final_coord_weight
         self.weight_schedule_epochs = weight_schedule_epochs
         
-        # Set current weights (will be updated if scheduling is used)
-        self.current_heatmap_weight = initial_heatmap_weight if use_weight_schedule else heatmap_weight
-        self.current_coord_weight = initial_coord_weight if use_weight_schedule else coord_weight
+        # Loss normalization
+        self.use_loss_normalization = use_loss_normalization
+        self.norm_decay = norm_decay
+        self.norm_epsilon = norm_epsilon
+        self.running_heatmap_loss = 1.0
+        self.running_coord_loss = 1.0
         
-        # Convert landmark_weights list/array to a tensor if provided
-        self.landmark_weights_tensor = None
-        if landmark_weights is not None:
-            if len(landmark_weights) == num_landmarks:
-                self.landmark_weights_tensor = torch.tensor(landmark_weights, dtype=torch.float32)
-            else:
-                print(f"Warning: landmark_weights length ({len(landmark_weights)}) does not match num_landmarks ({num_landmarks}). Ignoring weights.")
+        # Target landmark indices
         self.target_landmark_indices = target_landmark_indices
+        self.landmark_weights = landmark_weights
         
-        # Store indices for specific logging
+        # Specific MED logging
         self.log_specific_landmark_indices = log_specific_landmark_indices
         
-        # Create loss function
-        if use_refinement:
-            self.criterion = CombinedLoss(
-                heatmap_weight=self.current_heatmap_weight, 
-                coord_weight=self.current_coord_weight,
-                output_size=(64, 64),   # Heatmap size
-                image_size=(224, 224),  # Original image size
-                use_loss_normalization=use_loss_normalization,
-                norm_decay=norm_decay,
-                norm_epsilon=norm_epsilon,
-                target_landmark_indices=self.target_landmark_indices,
-                landmark_weights=self.landmark_weights_tensor
-            )
+        # Set device
+        if device is None:
+            if use_mps and torch.backends.mps.is_available():
+                self.device = torch.device('mps')
+            elif torch.cuda.is_available():
+                self.device = torch.device('cuda')
+            else:
+                self.device = torch.device('cpu')
         else:
-            # Pass weights/indices also to AdaptiveWingLoss if refinement is off
-            self.criterion = AdaptiveWingLoss(
-                 target_landmark_indices=self.target_landmark_indices,
-                 landmark_weights=self.landmark_weights_tensor,
-                 use_loss_normalization=use_loss_normalization,
-                 norm_decay=norm_decay,
-                 norm_epsilon=norm_epsilon
-            )
+            self.device = device
         
-        # Create heatmap generator
-        self.heatmap_generator = GaussianHeatmapGenerator(output_size=(64, 64), sigma=2.5)
-        
-        # Set number of landmarks
-        self.num_landmarks = num_landmarks
-        
-        # Set output directory
-        self.output_dir = output_dir
+        # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
-        # Set whether to use refinement MLP
-        self.use_refinement = use_refinement
+        # Create HRNet model
+        self.model = create_hrnet_model(
+            num_landmarks=num_landmarks,
+            pretrained=True,
+            use_refinement=use_refinement,
+            hrnet_type=hrnet_type,
+            use_depth=use_depth,
+            depth_channels=depth_channels
+        )
+        self.model = self.model.to(self.device)
         
-        # Initialize training history
+        # Define loss function
+        self.criterion = CombinedLoss(
+            num_landmarks=num_landmarks,
+            use_refinement=use_refinement,
+            heatmap_weight=initial_heatmap_weight if use_weight_schedule else heatmap_weight,
+            coord_weight=initial_coord_weight if use_weight_schedule else coord_weight,
+            target_landmark_indices=target_landmark_indices,
+            landmark_weights=landmark_weights
+        )
+        
+        # Create optimizer
+        if optimizer_type.lower() == 'adam':
+            self.optimizer = torch.optim.Adam(
+                self.model.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay
+            )
+        elif optimizer_type.lower() == 'adamw':
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay
+            )
+        elif optimizer_type.lower() == 'sgd':
+            self.optimizer = torch.optim.SGD(
+                self.model.parameters(),
+                lr=learning_rate,
+                momentum=momentum,
+                nesterov=nesterov,
+                weight_decay=weight_decay
+            )
+        else:
+            raise ValueError(f"Unknown optimizer type: {optimizer_type}")
+        
+        # Create learning rate scheduler
+        self.scheduler = None
+        self.scheduler_type = scheduler_type
+        
+        if scheduler_type == 'plateau':
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=lr_factor,
+                patience=lr_patience,
+                verbose=True,
+                min_lr=lr_min
+            )
+        elif scheduler_type == 'cosine':
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, 
+                T_max=lr_t_max,
+                eta_min=lr_min
+            )
+        elif scheduler_type == 'onecycle':
+            # OneCycle starts from lr = max_lr / div_factor, 
+            # peaks at max_lr, and ends at max_lr / (div_factor * final_div_factor)
+            self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                self.optimizer,
+                max_lr=max_lr,
+                total_steps=weight_schedule_epochs,  # Will be updated in train()
+                pct_start=pct_start,
+                div_factor=div_factor,
+                final_div_factor=final_div_factor
+            )
+        
+        # Initialize history
         self.history = {
             'train_loss': [],
             'val_loss': [],
@@ -267,195 +215,229 @@ class LandmarkTrainer:
             'val_heatmap_loss': [],
             'train_coord_loss': [],
             'val_coord_loss': [],
-            'train_med': [],  # Mean Euclidean Distance
-            'val_med': [],    # Mean Euclidean Distance
+            'train_med': [],
+            'val_med': [],
+            'train_med_specific': {},  # Per-landmark MED for training
+            'val_med_specific': {},    # Per-landmark MED for validation
+            'learning_rate': [],
             'heatmap_weight': [],
-            'coord_weight': [],
-            'learning_rate': [],  # Track learning rate changes
-            # History for specific landmarks MED - now stores dict {idx: [med1, med2, ...]}
-            'train_med_specific': {},
-            'val_med_specific': {}
+            'coord_weight': []
         }
+        
+        # Initialize specific landmark MEDs if requested
+        if log_specific_landmark_indices:
+            for idx in log_specific_landmark_indices:
+                if idx < num_landmarks:
+                    self.history['train_med_specific'][idx] = []
+                    self.history['val_med_specific'][idx] = []
     
     def train_epoch(self, train_loader):
         """
-        Train for one epoch
+        Train the model for one epoch
         
         Args:
-            train_loader (DataLoader): DataLoader for training data
+            train_loader (torch.utils.data.DataLoader): Training data loader
             
         Returns:
-            tuple: (average_loss, heatmap_loss, coord_loss, med, med_specific)
-                   med_specific will be None if log_specific_landmark_indices is not set.
+            dict: Training metrics for the epoch
         """
         self.model.train()
         epoch_loss = 0.0
         epoch_heatmap_loss = 0.0
         epoch_coord_loss = 0.0
-        all_predictions = []
-        all_targets = []
         
-        # Use tqdm for progress bar
-        pbar = tqdm(train_loader, desc="Training")
-        for batch_idx, batch in enumerate(pbar):
-            # Get images and landmarks
+        # Track the number of batches for averaging
+        num_batches = 0
+        
+        # Track the total Euclidean distance for all landmarks for MED calculation
+        total_euclidean_distance = 0.0
+        total_samples = 0
+        
+        # Track per-landmark distances if specific logging is enabled
+        specific_distances = {}
+        if self.log_specific_landmark_indices:
+            for idx in self.log_specific_landmark_indices:
+                specific_distances[idx] = []
+        
+        # Training loop
+        for batch in train_loader:
+            # Get inputs and targets
             images = batch['image'].to(self.device)
             landmarks = batch['landmarks'].to(self.device)
             
-            # Generate target heatmaps
-            target_heatmaps = self.heatmap_generator.generate_heatmaps(landmarks).to(self.device)
+            # Get depth maps if available and model uses them
+            depth = None
+            if self.use_depth and 'depth' in batch:
+                depth = batch['depth'].to(self.device)
             
-            # Zero the parameter gradients
+            # Zero gradients
             self.optimizer.zero_grad()
             
             # Forward pass
-            outputs = self.model(images)
+            outputs = self.model(images, depth)
             
-            # Compute loss based on whether refinement is used
-            if self.use_refinement:
-                loss, heatmap_loss, coord_loss = self.criterion(outputs, target_heatmaps, landmarks)
-                epoch_heatmap_loss += heatmap_loss.item()
-                epoch_coord_loss += coord_loss.item()
-            else:
-                loss = self.criterion(outputs['heatmaps'], target_heatmaps)
-                epoch_heatmap_loss += loss.item()  # When not using refinement, all loss is heatmap loss
-                epoch_coord_loss += 0.0  # Set coordinate loss to 0
+            # Compute loss
+            loss_dict = self.criterion(outputs, landmarks)
+            loss = loss_dict['loss']
             
-            # Backward pass and optimize
+            # Backward pass
             loss.backward()
+            
+            # Update weights
             self.optimizer.step()
             
-            # Step OneCycleLR scheduler if used
-            if self.scheduler_type == 'onecycle':
-                self.scheduler.step()
-                # Update progress bar to show current learning rate
-                current_lr = self.optimizer.param_groups[0]['lr']
-                pbar.set_postfix(loss=loss.item(), lr=f"{current_lr:.2e}")
-            else:
-                pbar.set_postfix(loss=loss.item())
-            
-            # Update statistics
+            # Update metrics
             epoch_loss += loss.item()
             
-            # Get landmark predictions for metrics
-            with torch.no_grad():
-                predicted_landmarks = self.model.predict_landmarks(images)
-                all_predictions.append(predicted_landmarks.cpu())
-                all_targets.append(landmarks.cpu())
+            if self.use_refinement:
+                # Track component losses if using refinement
+                epoch_heatmap_loss += loss_dict['heatmap_loss'].item()
+                epoch_coord_loss += loss_dict['coord_loss'].item()
+                
+                # Get final coordinates for MED calculation
+                pred_coords = outputs['refined_coords']
+            else:
+                # Get initial coordinates for MED calculation
+                pred_coords = outputs['initial_coords']
+            
+            # Calculate Euclidean distance for each landmark
+            batch_size = landmarks.size(0)
+            meds = mean_euclidean_distance(pred_coords, landmarks)
+            total_euclidean_distance += meds.sum().item()
+            total_samples += batch_size
+            
+            # Calculate per-landmark MEDs if specified
+            if self.log_specific_landmark_indices:
+                per_landmark_med = per_landmark_euclidean_distance(pred_coords, landmarks)
+                for idx in self.log_specific_landmark_indices:
+                    specific_distances[idx].extend(per_landmark_med[:, idx].tolist())
+            
+            num_batches += 1
         
-        # Compute mean loss
-        epoch_loss /= len(train_loader)
+        # Calculate average metrics
+        avg_loss = epoch_loss / num_batches
+        avg_med = total_euclidean_distance / total_samples
         
-        # Compute mean heatmap and coord losses
-        epoch_heatmap_loss /= len(train_loader)
-        epoch_coord_loss /= len(train_loader)
+        # Calculate average component losses if using refinement
+        avg_heatmap_loss = epoch_heatmap_loss / num_batches if self.use_refinement else 0.0
+        avg_coord_loss = epoch_coord_loss / num_batches if self.use_refinement else 0.0
         
-        # Compute mean Euclidean distance
-        all_predictions = torch.cat(all_predictions, dim=0)
-        all_targets = torch.cat(all_targets, dim=0)
-        med = mean_euclidean_distance(all_predictions, all_targets)
+        # Calculate specific landmark MEDs if requested
+        specific_meds = {}
+        if self.log_specific_landmark_indices:
+            for idx in self.log_specific_landmark_indices:
+                if specific_distances[idx]:  # Check if we have data
+                    specific_meds[idx] = sum(specific_distances[idx]) / len(specific_distances[idx])
         
-        # Compute specific MED if requested
-        med_specific = None
-        if self.log_specific_landmark_indices is not None:
-            try:
-                # Ensure indices are valid
-                num_landmarks = all_predictions.shape[1]
-                valid_indices = [idx for idx in self.log_specific_landmark_indices if 0 <= idx < num_landmarks]
-                if valid_indices:
-                    # Calculate per-landmark MED for all landmarks first
-                    per_lm_meds = per_landmark_euclidean_distance(
-                        all_predictions, all_targets
-                    )
-                    # Create a dictionary mapping the requested index to its MED
-                    med_specific = {idx: per_lm_meds[idx].item() for idx in valid_indices}
-                else:
-                     print("Warning: No valid indices provided for specific MED logging.")
-            except Exception as e:
-                print(f"Warning: Could not compute specific MED - {e}")
+        train_metrics = {
+            'loss': avg_loss,
+            'heatmap_loss': avg_heatmap_loss,
+            'coord_loss': avg_coord_loss,
+            'med': avg_med,
+            'med_specific': specific_meds
+        }
         
-        return epoch_loss, epoch_heatmap_loss, epoch_coord_loss, med, med_specific
+        return train_metrics
     
     def validate(self, val_loader):
         """
-        Validate the model
+        Validate the model on the validation set
         
         Args:
-            val_loader (DataLoader): DataLoader for validation data
+            val_loader (torch.utils.data.DataLoader): Validation data loader
             
         Returns:
-            tuple: (average_loss, heatmap_loss, coord_loss, med, med_specific)
-                   med_specific will be None if log_specific_landmark_indices is not set.
+            dict: Validation metrics
         """
         self.model.eval()
-        val_loss = 0.0
-        val_heatmap_loss = 0.0
-        val_coord_loss = 0.0
-        all_predictions = []
-        all_targets = []
+        epoch_loss = 0.0
+        epoch_heatmap_loss = 0.0
+        epoch_coord_loss = 0.0
         
+        # Track the number of batches for averaging
+        num_batches = 0
+        
+        # Track the total Euclidean distance for all landmarks for MED calculation
+        total_euclidean_distance = 0.0
+        total_samples = 0
+        
+        # Track per-landmark distances if specific logging is enabled
+        specific_distances = {}
+        if self.log_specific_landmark_indices:
+            for idx in self.log_specific_landmark_indices:
+                specific_distances[idx] = []
+        
+        # Validation loop
         with torch.no_grad():
             for batch in val_loader:
-                # Get images and landmarks
+                # Get inputs and targets
                 images = batch['image'].to(self.device)
                 landmarks = batch['landmarks'].to(self.device)
                 
-                # Generate target heatmaps
-                target_heatmaps = self.heatmap_generator.generate_heatmaps(landmarks).to(self.device)
+                # Get depth maps if available and model uses them
+                depth = None
+                if self.use_depth and 'depth' in batch:
+                    depth = batch['depth'].to(self.device)
                 
                 # Forward pass
-                outputs = self.model(images)
+                outputs = self.model(images, depth)
                 
-                # Compute loss based on whether refinement is used
+                # Compute loss
+                loss_dict = self.criterion(outputs, landmarks)
+                loss = loss_dict['loss']
+                
+                # Update metrics
+                epoch_loss += loss.item()
+                
                 if self.use_refinement:
-                    loss, heatmap_loss, coord_loss = self.criterion(outputs, target_heatmaps, landmarks)
-                    val_heatmap_loss += heatmap_loss.item()
-                    val_coord_loss += coord_loss.item()
+                    # Track component losses if using refinement
+                    epoch_heatmap_loss += loss_dict['heatmap_loss'].item()
+                    epoch_coord_loss += loss_dict['coord_loss'].item()
+                    
+                    # Get final coordinates for MED calculation
+                    pred_coords = outputs['refined_coords']
                 else:
-                    loss = self.criterion(outputs['heatmaps'], target_heatmaps)
-                    val_heatmap_loss += loss.item()  # When not using refinement, all loss is heatmap loss
-                    val_coord_loss += 0.0  # Set coordinate loss to 0
+                    # Get initial coordinates for MED calculation
+                    pred_coords = outputs['initial_coords']
                 
-                # Update statistics
-                val_loss += loss.item()
+                # Calculate Euclidean distance for each landmark
+                batch_size = landmarks.size(0)
+                meds = mean_euclidean_distance(pred_coords, landmarks)
+                total_euclidean_distance += meds.sum().item()
+                total_samples += batch_size
                 
-                # Get landmark predictions for metrics
-                predicted_landmarks = self.model.predict_landmarks(images)
-                all_predictions.append(predicted_landmarks.cpu())
-                all_targets.append(landmarks.cpu())
+                # Calculate per-landmark MEDs if specified
+                if self.log_specific_landmark_indices:
+                    per_landmark_med = per_landmark_euclidean_distance(pred_coords, landmarks)
+                    for idx in self.log_specific_landmark_indices:
+                        specific_distances[idx].extend(per_landmark_med[:, idx].tolist())
+                
+                num_batches += 1
         
-        # Compute mean loss
-        val_loss /= len(val_loader)
+        # Calculate average metrics
+        avg_loss = epoch_loss / num_batches
+        avg_med = total_euclidean_distance / total_samples
         
-        # Compute mean heatmap and coord losses
-        val_heatmap_loss /= len(val_loader)
-        val_coord_loss /= len(val_loader)
+        # Calculate average component losses if using refinement
+        avg_heatmap_loss = epoch_heatmap_loss / num_batches if self.use_refinement else 0.0
+        avg_coord_loss = epoch_coord_loss / num_batches if self.use_refinement else 0.0
         
-        # Compute mean Euclidean distance
-        all_predictions = torch.cat(all_predictions, dim=0)
-        all_targets = torch.cat(all_targets, dim=0)
-        med = mean_euclidean_distance(all_predictions, all_targets)
+        # Calculate specific landmark MEDs if requested
+        specific_meds = {}
+        if self.log_specific_landmark_indices:
+            for idx in self.log_specific_landmark_indices:
+                if specific_distances[idx]:  # Check if we have data
+                    specific_meds[idx] = sum(specific_distances[idx]) / len(specific_distances[idx])
         
-        # Compute specific MED if requested
-        med_specific = None
-        if self.log_specific_landmark_indices is not None:
-            try:
-                # Ensure indices are valid
-                num_landmarks = all_predictions.shape[1]
-                valid_indices = [idx for idx in self.log_specific_landmark_indices if 0 <= idx < num_landmarks]
-                if valid_indices:
-                    # Calculate per-landmark MED for all landmarks first
-                    per_lm_meds = per_landmark_euclidean_distance(
-                        all_predictions, all_targets
-                    )
-                    # Create a dictionary mapping the requested index to its MED
-                    med_specific = {idx: per_lm_meds[idx].item() for idx in valid_indices}
-                else:
-                     print("Warning: No valid indices provided for specific MED logging.")
-            except Exception as e:
-                print(f"Warning: Could not compute specific MED - {e}")
+        val_metrics = {
+            'loss': avg_loss,
+            'heatmap_loss': avg_heatmap_loss,
+            'coord_loss': avg_coord_loss,
+            'med': avg_med,
+            'med_specific': specific_meds
+        }
         
-        return val_loss, val_heatmap_loss, val_coord_loss, med, med_specific
+        return val_metrics
     
     def train(self, train_loader, val_loader, num_epochs=50, save_freq=5):
         """
@@ -517,35 +499,35 @@ class LandmarkTrainer:
                 print(f"Epoch {epoch+1}/{num_epochs}: Updated weights - heatmap={self.current_heatmap_weight:.2f}, coord={self.current_coord_weight:.2f}")
             
             # Train one epoch
-            train_loss, train_heatmap_loss, train_coord_loss, train_med, train_med_specific = self.train_epoch(train_loader)
+            train_metrics = self.train_epoch(train_loader)
             
             # Validate
-            val_loss, val_heatmap_loss, val_coord_loss, val_med, val_med_specific = self.validate(val_loader)
+            val_metrics = self.validate(val_loader)
             
             # Get current learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
             
             # Update history
-            self.history['train_loss'].append(train_loss)
-            self.history['val_loss'].append(val_loss)
-            self.history['train_heatmap_loss'].append(train_heatmap_loss)
-            self.history['val_heatmap_loss'].append(val_heatmap_loss)
-            self.history['train_coord_loss'].append(train_coord_loss)
-            self.history['val_coord_loss'].append(val_coord_loss)
-            self.history['train_med'].append(train_med)
-            self.history['val_med'].append(val_med)
+            self.history['train_loss'].append(train_metrics['loss'])
+            self.history['val_loss'].append(val_metrics['loss'])
+            self.history['train_heatmap_loss'].append(train_metrics['heatmap_loss'])
+            self.history['val_heatmap_loss'].append(val_metrics['heatmap_loss'])
+            self.history['train_coord_loss'].append(train_metrics['coord_loss'])
+            self.history['val_coord_loss'].append(val_metrics['coord_loss'])
+            self.history['train_med'].append(train_metrics['med'])
+            self.history['val_med'].append(val_metrics['med'])
             
             # Update specific MED history
             if self.log_specific_landmark_indices:
                 # Train specific MED
-                if train_med_specific is not None:
-                    for idx, med_val in train_med_specific.items():
+                if train_metrics['med_specific'] is not None:
+                    for idx, med_val in train_metrics['med_specific'].items():
                         if idx not in self.history['train_med_specific']:
                             self.history['train_med_specific'][idx] = []
                         self.history['train_med_specific'][idx].append(med_val)
                 # Validation specific MED
-                if val_med_specific is not None:
-                    for idx, med_val in val_med_specific.items():
+                if val_metrics['med_specific'] is not None:
+                    for idx, med_val in val_metrics['med_specific'].items():
                         if idx not in self.history['val_med_specific']:
                             self.history['val_med_specific'][idx] = []
                         self.history['val_med_specific'][idx].append(med_val)
@@ -560,7 +542,7 @@ class LandmarkTrainer:
                 print(f"Learning rate updated to {self.optimizer.param_groups[0]['lr']:.2e}")
             elif self.scheduler_type == 'plateau':
                 # For ReduceLROnPlateau, we use validation MED as the metric to monitor
-                self.scheduler.step(val_med)
+                self.scheduler.step(val_metrics['med'])
             
             # Write metrics to log file
             with open(log_file, 'a') as f:
@@ -589,44 +571,44 @@ class LandmarkTrainer:
                         log_f_rw.seek(0)
                         log_f_rw.write(new_header)
                         # Need to rewrite the first line of data since we overwrote it
-                        log_f_rw.write(f"{epoch+1},{train_loss:.6f},{train_heatmap_loss:.6f},{train_coord_loss:.6f},{train_med:.6f},,"
-                                       f"{val_loss:.6f},{val_heatmap_loss:.6f},{val_coord_loss:.6f},{val_med:.6f},,{current_lr:.8f}\n")
+                        log_f_rw.write(f"{epoch+1},{train_metrics['loss']:.6f},{train_metrics['heatmap_loss']:.6f},{train_metrics['coord_loss']:.6f},{train_metrics['med']:.6f},,"
+                                       f"{val_metrics['loss']:.6f},{val_metrics['heatmap_loss']:.6f},{val_metrics['coord_loss']:.6f},{val_metrics['med']:.6f},,{current_lr:.8f}\n")
                         # Now write the actual first line data with specific MEDs
-                        f.write(f"{epoch+1},{train_loss:.6f},{train_heatmap_loss:.6f},{train_coord_loss:.6f},{train_med:.6f},{train_med_specific_str},"
-                                f"{val_loss:.6f},{val_heatmap_loss:.6f},{val_coord_loss:.6f},{val_med:.6f},{val_med_specific_str},{current_lr:.8f}\n")
+                        f.write(f"{epoch+1},{train_metrics['loss']:.6f},{train_metrics['heatmap_loss']:.6f},{train_metrics['coord_loss']:.6f},{train_metrics['med']:.6f},{train_med_specific_str},"
+                                f"{val_metrics['loss']:.6f},{val_metrics['heatmap_loss']:.6f},{val_metrics['coord_loss']:.6f},{val_metrics['med']:.6f},{val_med_specific_str},{current_lr:.8f}\n")
                 else:
                      # Write data for subsequent epochs
-                    f.write(f"{epoch+1},{train_loss:.6f},{train_heatmap_loss:.6f},{train_coord_loss:.6f},{train_med:.6f},{train_med_specific_str},"
-                            f"{val_loss:.6f},{val_heatmap_loss:.6f},{val_coord_loss:.6f},{val_med:.6f},{val_med_specific_str},{current_lr:.8f}\n")
+                    f.write(f"{epoch+1},{train_metrics['loss']:.6f},{train_metrics['heatmap_loss']:.6f},{train_metrics['coord_loss']:.6f},{train_metrics['med']:.6f},{train_med_specific_str},"
+                            f"{val_metrics['loss']:.6f},{val_metrics['heatmap_loss']:.6f},{val_metrics['coord_loss']:.6f},{val_metrics['med']:.6f},{val_med_specific_str},{current_lr:.8f}\n")
 
             # Print detailed progress with all metrics
             elapsed_time = time.time() - start_time
             
             # More detailed progress log including all metrics
             print(f"Epoch {epoch+1}/{num_epochs} [{elapsed_time:.2f}s]")
-            print(f"  Train: Loss={train_loss:.4f} (Heatmap={self.current_heatmap_weight:.1f}×{train_heatmap_loss:.4f}, Coord={self.current_coord_weight:.1f}×{train_coord_loss:.4f}), MED={train_med:.2f}px")
+            print(f"  Train: Loss={train_metrics['loss']:.4f} (Heatmap={self.current_heatmap_weight:.1f}×{train_metrics['heatmap_loss']:.4f}, Coord={self.current_coord_weight:.1f}×{train_metrics['coord_loss']:.4f}), MED={train_metrics['med']:.2f}px")
             # Print specific train MED if available
-            if train_med_specific is not None:
-                med_str = ", ".join([f"L{idx}: {med:.2f}" for idx, med in train_med_specific.items()])
+            if train_metrics['med_specific'] is not None:
+                med_str = ", ".join([f"L{idx}: {med:.2f}" for idx, med in train_metrics['med_specific'].items()])
                 print(f"         Specific Train MEDs: [{med_str}] px")
-            print(f"  Valid: Loss={val_loss:.4f} (Heatmap={val_heatmap_loss:.4f}, Coord={val_coord_loss:.4f}), MED={val_med:.2f}px")
+            print(f"  Valid: Loss={val_metrics['loss']:.4f} (Heatmap={val_metrics['heatmap_loss']:.4f}, Coord={val_metrics['coord_loss']:.4f}), MED={val_metrics['med']:.2f}px")
             # Print specific validation MED if available
-            if val_med_specific is not None:
-                med_str = ", ".join([f"L{idx}: {med:.2f}" for idx, med in val_med_specific.items()])
+            if val_metrics['med_specific'] is not None:
+                med_str = ", ".join([f"L{idx}: {med:.2f}" for idx, med in val_metrics['med_specific'].items()])
                 print(f"         Specific Valid MEDs: [{med_str}] px")
             print(f"  LR: {current_lr:.2e}")
             
             # Save if best validation loss
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
                 self.save_checkpoint(os.path.join(self.output_dir, 'best_model_loss.pth'))
-                print(f"  Saved best model (by loss) with validation loss: {val_loss:.4f}")
+                print(f"  Saved best model (by loss) with validation loss: {val_metrics['loss']:.4f}")
             
             # Also save if best validation MED (this might be a better metric for landmark detection)
-            if val_med < best_val_med:
-                best_val_med = val_med
+            if val_metrics['med'] < best_val_med:
+                best_val_med = val_metrics['med']
                 self.save_checkpoint(os.path.join(self.output_dir, 'best_model_med.pth'))
-                print(f"  Saved best model (by MED) with validation MED: {val_med:.2f} pixels")
+                print(f"  Saved best model (by MED) with validation MED: {val_metrics['med']:.2f} pixels")
             
             # Save checkpoint periodically
             if (epoch + 1) % save_freq == 0:
@@ -645,71 +627,84 @@ class LandmarkTrainer:
         
         print(f"Training completed in {time.time() - start_time:.2f} seconds")
     
-    def save_checkpoint(self, path):
+    def save_model_info(self, file_path):
+        """
+        Save model information to a file
+        
+        Args:
+            file_path (str): Path to save the model info
+        """
+        info = {
+            'num_landmarks': self.num_landmarks,
+            'use_refinement': self.use_refinement,
+            'use_depth': self.use_depth,
+            'depth_channels': self.depth_channels if self.use_depth else None,
+            'hrnet_type': self.hrnet_type,
+            'heatmap_weight': self.heatmap_weight,
+            'coord_weight': self.coord_weight,
+            'use_weight_schedule': self.use_weight_schedule,
+            'output_size': (64, 64),  # Default heatmap output size
+            'date': time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        # Save as plain text
+        with open(file_path, 'w') as f:
+            for key, value in info.items():
+                f.write(f"{key}: {value}\n")
+    
+    def save_checkpoint(self, file_path):
         """
         Save model checkpoint
         
         Args:
-            path (str): Path to save the checkpoint
+            file_path (str): Path to save the checkpoint
         """
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'optimizer_type': self.optimizer_type,
-            'history': self.history,
+            'num_landmarks': self.num_landmarks,
             'use_refinement': self.use_refinement,
-            'current_heatmap_weight': self.current_heatmap_weight,
-            'current_coord_weight': self.current_coord_weight,
-            'scheduler_type': self.scheduler_type
+            'use_depth': self.use_depth,
+            'depth_channels': self.depth_channels if self.use_depth else None,
+            'hrnet_type': self.hrnet_type
         }
         
-        # Save scheduler state if it exists
+        # Add scheduler state if exists
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
         
-        torch.save(checkpoint, path)
+        torch.save(checkpoint, file_path)
     
-    def load_checkpoint(self, path):
+    def load_checkpoint(self, file_path):
         """
         Load model checkpoint
         
         Args:
-            path (str): Path to the checkpoint
+            file_path (str): Path to the checkpoint file
         """
-        checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        checkpoint = torch.load(file_path, map_location=self.device)
         
-        # Check if optimizers match, warn if they don't
-        saved_optimizer_type = checkpoint.get('optimizer_type', 'adam')  # Default to 'adam' if not specified in older checkpoints
-        if saved_optimizer_type != self.optimizer_type:
-            print(f"Warning: Current optimizer type ({self.optimizer_type}) differs from saved checkpoint ({saved_optimizer_type}).")
-            print("This may lead to suboptimal training. Consider using the same optimizer type.")
+        # Load model parameters
+        self.model.load_state_dict(checkpoint['model_state_dict'])
         
         # Load optimizer state
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
-        # Load history and model settings
-        self.history = checkpoint['history']
-        self.use_refinement = checkpoint.get('use_refinement', False)
-        
-        # Load loss weights
-        self.current_heatmap_weight = checkpoint.get('current_heatmap_weight', 1.0)
-        self.current_coord_weight = checkpoint.get('current_coord_weight', 1.0)
-        
-        # Update loss function weights if using refinement
-        if self.use_refinement:
-            self.criterion.heatmap_weight = self.current_heatmap_weight
-            self.criterion.coord_weight = self.current_coord_weight
-        
-        # Load scheduler state if it exists and matches current config
+        # Load scheduler state if exists
         if 'scheduler_state_dict' in checkpoint and self.scheduler is not None:
-            # Check if scheduler types match
-            if checkpoint.get('scheduler_type') == self.scheduler_type:
-                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                print(f"Loaded scheduler state with current learning rate: {self.optimizer.param_groups[0]['lr']:.2e}")
-            else:
-                print(f"Warning: Current scheduler type ({self.scheduler_type}) differs from saved checkpoint ({checkpoint.get('scheduler_type')}).")
-                print("Scheduler state not loaded.")
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # Verify model parameters
+        if 'num_landmarks' in checkpoint and checkpoint['num_landmarks'] != self.num_landmarks:
+            print(f"Warning: Checkpoint was trained with {checkpoint['num_landmarks']} landmarks, but model is configured for {self.num_landmarks} landmarks.")
+        
+        if 'use_refinement' in checkpoint and checkpoint['use_refinement'] != self.use_refinement:
+            print(f"Warning: Checkpoint was trained with use_refinement={checkpoint['use_refinement']}, but model is configured with use_refinement={self.use_refinement}.")
+        
+        if 'use_depth' in checkpoint and checkpoint['use_depth'] != self.use_depth:
+            print(f"Warning: Checkpoint was trained with use_depth={checkpoint['use_depth']}, but model is configured with use_depth={self.use_depth}.")
+        
+        print(f"Loaded checkpoint from {file_path}")
     
     def plot_training_curves(self):
         """
@@ -856,103 +851,116 @@ class LandmarkTrainer:
         plt.savefig(os.path.join(figures_dir, 'loss_components.png'))
         plt.close()
     
-    def evaluate(self, test_loader, save_visualizations=True, landmark_names=None, landmark_cols=None):
+    def evaluate(self, test_loader, save_visualizations=False, save_predictions=False):
         """
-        Evaluate the model on test data
+        Evaluate the model on the test set
         
         Args:
-            test_loader (DataLoader): DataLoader for test data
-            save_visualizations (bool): Whether to save visualization images
-            landmark_names (list, optional): Names of landmarks for better reporting
-            landmark_cols (list, optional): List of landmark column names for skeletal classification
+            test_loader (torch.utils.data.DataLoader): Test data loader
+            save_visualizations (bool): Whether to save visualizations of predictions
+            save_predictions (bool): Whether to save predicted landmarks to a file
             
         Returns:
-            dict: Evaluation results
+            dict: Evaluation metrics
         """
         self.model.eval()
-        all_predictions = []
-        all_targets = []
         
-        # Create output directory for visualizations and reports
-        eval_dir = os.path.join(self.output_dir, 'evaluation')
-        os.makedirs(eval_dir, exist_ok=True)
+        # Lists to store predictions and ground truth
+        all_pred_landmarks = []
+        all_gt_landmarks = []
         
-        if save_visualizations:
-            vis_dir = os.path.join(eval_dir, 'visualizations')
-            os.makedirs(vis_dir, exist_ok=True)
-        
+        # Evaluation loop
         with torch.no_grad():
             for batch_idx, batch in enumerate(test_loader):
-                # Get images and landmarks
+                # Get inputs and targets
                 images = batch['image'].to(self.device)
                 landmarks = batch['landmarks'].to(self.device)
                 
+                # Get depth maps if available and model uses them
+                depth = None
+                if self.use_depth and 'depth' in batch:
+                    depth = batch['depth'].to(self.device)
+                
                 # Forward pass
-                predicted_landmarks = self.model.predict_landmarks(images)
+                pred_landmarks = self.model.predict_landmarks(images, depth)
                 
-                # Save predictions and targets
-                all_predictions.append(predicted_landmarks.cpu())
-                all_targets.append(landmarks.cpu())
+                # Store predictions and ground truth
+                all_pred_landmarks.append(pred_landmarks.cpu())
+                all_gt_landmarks.append(landmarks.cpu())
                 
-                # Save visualizations for the first few batches
+                # Save visualization of the first few batches
                 if save_visualizations and batch_idx < 5:
-                    self._save_visualizations(images, predicted_landmarks, landmarks, 
-                                             os.path.join(vis_dir, f'batch_{batch_idx}'))
+                    vis_dir = os.path.join(self.output_dir, 'visualizations')
+                    os.makedirs(vis_dir, exist_ok=True)
+                    
+                    # Visualize up to 4 images per batch
+                    num_vis = min(4, images.size(0))
+                    for i in range(num_vis):
+                        # Get image from batch (denormalize)
+                        img = images[i].cpu().permute(1, 2, 0).numpy()
+                        mean = np.array([0.485, 0.456, 0.406])
+                        std = np.array([0.229, 0.224, 0.225])
+                        img = std * img + mean
+                        img = np.clip(img, 0, 1)
+                        
+                        # Get ground truth and predicted landmarks
+                        gt_lm = landmarks[i].cpu().numpy()
+                        pred_lm = pred_landmarks[i].cpu().numpy()
+                        
+                        # Create visualization
+                        self._visualize_landmarks(
+                            img, gt_lm, pred_lm,
+                            save_path=os.path.join(vis_dir, f'batch{batch_idx}_sample{i}.png')
+                        )
         
-        # Concatenate all predictions and targets
-        all_predictions = torch.cat(all_predictions, dim=0)
-        all_targets = torch.cat(all_targets, dim=0)
+        # Concatenate all predictions and ground truth
+        all_pred_landmarks = torch.cat(all_pred_landmarks, dim=0)
+        all_gt_landmarks = torch.cat(all_gt_landmarks, dim=0)
         
-        # Compute standard metrics
-        med = mean_euclidean_distance(all_predictions, all_targets)
-        success_rate_2mm = landmark_success_rate(all_predictions, all_targets, threshold=2.0)
-        success_rate_4mm = landmark_success_rate(all_predictions, all_targets, threshold=4.0)
+        # Calculate Mean Euclidean Distance (MED)
+        med = mean_euclidean_distance(all_pred_landmarks, all_gt_landmarks, reduction='mean').item()
         
-        # Compute per-landmark metrics using our new functions
-        report_dir = os.path.join(eval_dir, 'reports')
-        detailed_report = generate_landmark_evaluation_report(
-            predictions=all_predictions,
-            targets=all_targets,
-            landmark_names=landmark_names,
-            output_dir=report_dir,
-            thresholds=[2.0, 4.0, 6.0],
-            landmark_cols=landmark_cols  # Pass landmark_cols for skeletal classification
-        )
+        # Calculate success rates at different thresholds (2mm, 4mm)
+        success_rate_2mm = landmark_success_rate(all_pred_landmarks, all_gt_landmarks, threshold=2.0).item()
+        success_rate_4mm = landmark_success_rate(all_pred_landmarks, all_gt_landmarks, threshold=4.0).item()
         
-        # Create results dictionary
-        results = {
+        # Calculate per-landmark metrics
+        per_landmark_stats = []
+        for i in range(self.num_landmarks):
+            # Extract landmarks at index i
+            pred_lm_i = all_pred_landmarks[:, i, :]
+            gt_lm_i = all_gt_landmarks[:, i, :]
+            
+            # Calculate MED for this landmark
+            med_i = torch.sqrt(torch.sum((pred_lm_i - gt_lm_i) ** 2, dim=1)).mean().item()
+            
+            # Calculate success rates for this landmark
+            success_2mm_i = (torch.sqrt(torch.sum((pred_lm_i - gt_lm_i) ** 2, dim=1)) < 2.0).float().mean().item()
+            success_4mm_i = (torch.sqrt(torch.sum((pred_lm_i - gt_lm_i) ** 2, dim=1)) < 4.0).float().mean().item()
+            
+            per_landmark_stats.append({
+                'index': i,
+                'med': med_i,
+                'success_rate_2mm': success_2mm_i,
+                'success_rate_4mm': success_4mm_i
+            })
+        
+        # Save predictions to file if requested
+        if save_predictions:
+            pred_file = os.path.join(self.output_dir, 'predictions.pt')
+            torch.save({
+                'predictions': all_pred_landmarks,
+                'ground_truth': all_gt_landmarks
+            }, pred_file)
+            print(f"Saved predictions to {pred_file}")
+        
+        # Return evaluation metrics
+        return {
             'mean_euclidean_distance': med,
             'success_rate_2mm': success_rate_2mm,
             'success_rate_4mm': success_rate_4mm,
-            'per_landmark_metrics': detailed_report
+            'per_landmark_stats': per_landmark_stats
         }
-        
-        # Print detailed results
-        print("\nDetailed Evaluation Results:")
-        print(f"Overall Mean Euclidean Distance (MED): {med:.2f} pixels")
-        print(f"Success Rate (2mm): {success_rate_2mm * 100:.2f}%")
-        print(f"Success Rate (4mm): {success_rate_4mm * 100:.2f}%")
-        
-        # Print worst performing landmarks
-        print("\nTop 3 Worst Performing Landmarks:")
-        worst_landmarks = detailed_report['worst_landmarks']
-        worst_med = detailed_report['worst_landmarks_med']
-        for i, (idx, med_val) in enumerate(zip(worst_landmarks, worst_med)):
-            name = landmark_names[idx] if landmark_names else f"Landmark {idx+1}"
-            print(f"  {i+1}. {name}: {med_val:.2f} pixels")
-        
-        # Print skeletal classification results if available
-        if 'classification' in detailed_report:
-            class_results = detailed_report['classification']
-            print("\nSkeletal Classification Results:")
-            print(f"  Classification Accuracy: {class_results['accuracy']*100:.2f}%")
-            print(f"  Mean ANB Angle Error: {class_results['ANB_error_mean']:.2f}°")
-            print(f"  Mean SNA Angle Error: {class_results['SNA_error_mean']:.2f}°")
-            print(f"  Mean SNB Angle Error: {class_results['SNB_error_mean']:.2f}°")
-        
-        print(f"\nDetailed report saved to: {report_dir}")
-        
-        return results
     
     def _save_visualizations(self, images, predictions, targets, output_dir):
         """

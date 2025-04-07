@@ -422,28 +422,30 @@ class CombinedLoss(nn.Module):
     
     Combines Adaptive Wing Loss for heatmaps with Wing Loss for coordinates
     """
-    def __init__(self, heatmap_weight=1.0, coord_weight=1.0, output_size=(64, 64), image_size=(224, 224),
+    def __init__(self, num_landmarks=19, use_refinement=True, heatmap_weight=1.0, coord_weight=1.0, 
+                 output_size=(64, 64), image_size=(224, 224),
                  use_loss_normalization=True, norm_decay=0.99, norm_epsilon=1e-6,
-                 target_landmark_indices=None,
-                 landmark_weights=None):
+                 target_landmark_indices=None, landmark_weights=None):
         """
         Initialize combined loss
         
         Args:
-            heatmap_weight (float): Overall weight for heatmap loss component.
-            coord_weight (float): Overall weight for coordinate loss component.
-            output_size (tuple): Size of heatmap output (height, width).
-            image_size (tuple): Size of original image (height, width).
-            use_loss_normalization (bool): Whether to enable loss normalization *within* sub-losses.
-            norm_decay (float): Decay factor for running average normalization.
-            norm_epsilon (float): Epsilon for numerical stability in normalization.
-            target_landmark_indices (list, optional): List of landmark indices to compute loss for.
-                                                      Passed down to sub-losses.
-            landmark_weights (torch.Tensor, optional): Tensor of weights for each landmark.
-                                                      Passed down to sub-losses.
+            num_landmarks (int): Number of landmarks to detect
+            use_refinement (bool): Whether to use refinement MLP
+            heatmap_weight (float): Overall weight for heatmap loss component
+            coord_weight (float): Overall weight for coordinate loss component
+            output_size (tuple): Size of heatmap output (height, width)
+            image_size (tuple): Size of original image (height, width)
+            use_loss_normalization (bool): Whether to enable loss normalization within sub-losses
+            norm_decay (float): Decay factor for running average normalization
+            norm_epsilon (float): Epsilon for numerical stability in normalization
+            target_landmark_indices (list, optional): List of landmark indices to compute loss for
+            landmark_weights (torch.Tensor, optional): Tensor of weights for each landmark
         """
         super(CombinedLoss, self).__init__()
         # Store overall weights (may be scheduled by trainer)
+        self.num_landmarks = num_landmarks
+        self.use_refinement = use_refinement
         self.heatmap_weight = heatmap_weight
         self.coord_weight = coord_weight
         self.output_size = output_size
@@ -458,6 +460,9 @@ class CombinedLoss(nn.Module):
         
         # Calculate scale factor
         self.scale_factor = image_size[0] / output_size[0]  # Assuming square aspect ratio
+        
+        # Create heatmap generator
+        self.heatmap_generator = GaussianHeatmapGenerator(output_size=output_size, sigma=2.0)
         
         # Initialize sub-losses, passing all relevant parameters
         self.heatmap_loss_fn = AdaptiveWingLoss(
@@ -484,42 +489,37 @@ class CombinedLoss(nn.Module):
         if hasattr(self, 'norm_updates') and hasattr(self, 'register_buffer'):
              del self._buffers['norm_updates']
 
-    def forward(self, pred_dict, target_heatmaps, target_coords, mask=None):
+    def forward(self, outputs, target_landmarks, mask=None):
         """
-        Forward pass for combined loss.
+        Forward pass for combined loss
         
         Args:
-            pred_dict (dict): Dictionary containing 'heatmaps' and coordinates. 
-                             Expected keys are 'heatmaps' and either 'coords', 'refined_coords', or 'initial_coords'.
-            target_heatmaps (torch.Tensor): Ground truth heatmaps (B, C, H, W).
-            target_coords (torch.Tensor): Ground truth coordinates (B, N, 2) in image space.
-            mask (torch.Tensor, optional): Mask for valid landmarks (B, N).
+            outputs (dict): Dictionary containing model outputs (heatmaps, coordinates)
+            target_landmarks (torch.Tensor): Ground truth landmark coordinates (B, N, 2)
+            mask (torch.Tensor, optional): Mask for valid landmarks (B, N)
             
         Returns:
-            tuple: (total_loss, raw_heatmap_loss, raw_coord_loss) 
-                   The component losses are the raw, un-weighted, un-normalized values.
+            dict: Dictionary with loss values ('loss', 'heatmap_loss', 'coord_loss')
         """
         # Extract predictions - heatmaps are always present
-        pred_heatmaps = pred_dict['heatmaps']
+        pred_heatmaps = outputs['heatmaps']
         
         # For coordinates, check which type is provided (in order of preference)
-        if 'coords' in pred_dict:
-            pred_coords = pred_dict['coords']
-        elif 'refined_coords' in pred_dict:
-            pred_coords = pred_dict['refined_coords']
-        elif 'initial_coords' in pred_dict:
-            pred_coords = pred_dict['initial_coords']
+        if 'refined_coords' in outputs and self.use_refinement:
+            pred_coords = outputs['refined_coords']
         else:
-            raise KeyError("No coordinate predictions found in pred_dict. Expected 'coords', 'refined_coords', or 'initial_coords'.")
+            pred_coords = outputs['initial_coords']
         
-        # Calculate heatmap loss (sub-loss handles internal weighting/normalization)
+        # Generate target heatmaps
+        target_heatmaps = self.heatmap_generator.generate_heatmaps(target_landmarks).to(pred_heatmaps.device)
+        
+        # Calculate heatmap loss
         heatmap_loss = self.heatmap_loss_fn(pred_heatmaps, target_heatmaps)
         
         # Scale target coordinates to match coordinate prediction space (usually heatmap space)
-        scaled_target_coords = target_coords / self.scale_factor
+        scaled_target_coords = target_landmarks / self.scale_factor
         
-        # Calculate coordinate loss (sub-loss handles internal weighting/normalization)
-        # Pass the original mask, WingLoss will filter it if needed
+        # Calculate coordinate loss
         coord_loss = self.coord_loss_fn(pred_coords, scaled_target_coords, mask)
         
         # Handle potential NaNs from sub-losses before applying overall weights
@@ -538,11 +538,12 @@ class CombinedLoss(nn.Module):
         # Calculate final total loss
         total_loss = heatmap_loss_weighted + coord_loss_weighted
         
-        # Return total loss for backprop and the raw component losses for logging
-        # IMPORTANT: Return the UNWEIGHTED, UNNORMALIZED losses from the sub-functions if possible
-        # For simplicity now, returning the weighted values used in total_loss calculation.
-        # TODO: Modify sub-losses to optionally return raw loss if needed for more precise logging.
-        return total_loss, heatmap_loss_weighted, coord_loss_weighted
+        # Return dictionary with all losses
+        return {
+            'loss': total_loss,
+            'heatmap_loss': heatmap_loss,
+            'coord_loss': coord_loss
+        }
 
 
 def soft_argmax(heatmaps, beta=100):
