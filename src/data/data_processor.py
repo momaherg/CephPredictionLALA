@@ -230,36 +230,16 @@ class DataProcessor:
                 print(f"Error: 'depth_map' column not found in {self.depth_features_path}")
                 return False
             
-            # Check for a common key to merge on
-            common_columns = set(self.df.columns) & set(depth_df.columns)
-            id_columns = ['patient_id', 'patient', 'id', 'image_id', 'filename']
-            merge_column = None
+            # Check if sizes match
+            if len(self.df) != len(depth_df):
+                print(f"Warning: Main dataframe has {len(self.df)} rows but depth features file has {len(depth_df)} rows")
+                print("Proceeding anyway, but this might cause issues if the order doesn't match")
             
-            for col in id_columns:
-                if col in common_columns:
-                    merge_column = col
-                    break
-            
-            if merge_column is None:
-                # If no common ID column found, use index
-                if len(self.df) == len(depth_df):
-                    print(f"No common ID column found. Using index to merge depth features.")
-                    self.df['depth_feature'] = depth_df['depth_map'].values
-                else:
-                    print(f"Error: No common ID column found and dataframes have different lengths")
-                    return False
-            else:
-                # Merge based on the common ID column
-                print(f"Merging depth features on column: {merge_column}")
+            # Directly copy the depth_map column to depth_feature
+            print("Directly copying depth_map column to main dataframe (assuming same size and order)")
+            self.df['depth_feature'] = depth_df['depth_map'].values
                 
-                # Create a temporary dataframe with just the ID and depth map
-                temp_df = depth_df[[merge_column, 'depth_map']].copy()
-                temp_df.rename(columns={'depth_map': 'depth_feature'}, inplace=True)
-                
-                # Merge with the main dataframe
-                self.df = self.df.merge(temp_df, on=merge_column, how='left')
-                
-            # Check if depth features were successfully merged
+            # Check if depth features were successfully copied
             depth_count = self.df['depth_feature'].notna().sum()
             print(f"Loaded {depth_count}/{len(self.df)} depth features.")
             
