@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 class DataProcessor:
-    def __init__(self, data_path, landmark_cols=None, image_size=(224, 224), apply_clahe=True, generate_depth=False):
+    def __init__(self, data_path, landmark_cols=None, image_size=(224, 224), apply_clahe=True, generate_depth=False, depth_features_path=None):
         """
         Initialize the data processor
         
@@ -21,12 +21,14 @@ class DataProcessor:
             image_size (tuple): Size of images (height, width)
             apply_clahe (bool): Whether to apply CLAHE for histogram equalization
             generate_depth (bool): Whether to generate depth features from images
+            depth_features_path (str, optional): Path to a pickle file containing pre-generated depth features
         """
         self.data_path = data_path
         self.landmark_cols = landmark_cols
         self.image_size = image_size
         self.apply_clahe = apply_clahe
         self.generate_depth = generate_depth
+        self.depth_features_path = depth_features_path
         self.df = None
         self.depth_model = None
         self.depth_processor = None
@@ -209,6 +211,80 @@ class DataProcessor:
         print(f"Loaded dataset with {len(self.df)} records and {len(self.df.columns)} columns")
         return self.df
     
+    def load_depth_features(self):
+        """
+        Load pre-generated depth features from a pickle file
+        
+        Returns:
+            bool: True if depth features were loaded successfully, False otherwise
+        """
+        if self.depth_features_path is None:
+            return False
+            
+        try:
+            print(f"Loading pre-generated depth features from {self.depth_features_path}")
+            depth_df = pd.read_pickle(self.depth_features_path)
+            
+            # Check if the depth_map column exists
+            if 'depth_map' not in depth_df.columns:
+                print(f"Error: 'depth_map' column not found in {self.depth_features_path}")
+                return False
+            
+            # Check for a common key to merge on
+            common_columns = set(self.df.columns) & set(depth_df.columns)
+            id_columns = ['patient_id', 'patient', 'id', 'image_id', 'filename']
+            merge_column = None
+            
+            for col in id_columns:
+                if col in common_columns:
+                    merge_column = col
+                    break
+            
+            if merge_column is None:
+                # If no common ID column found, use index
+                if len(self.df) == len(depth_df):
+                    print(f"No common ID column found. Using index to merge depth features.")
+                    self.df['depth_feature'] = depth_df['depth_map'].values
+                else:
+                    print(f"Error: No common ID column found and dataframes have different lengths")
+                    return False
+            else:
+                # Merge based on the common ID column
+                print(f"Merging depth features on column: {merge_column}")
+                
+                # Create a temporary dataframe with just the ID and depth map
+                temp_df = depth_df[[merge_column, 'depth_map']].copy()
+                temp_df.rename(columns={'depth_map': 'depth_feature'}, inplace=True)
+                
+                # Merge with the main dataframe
+                self.df = self.df.merge(temp_df, on=merge_column, how='left')
+                
+            # Check if depth features were successfully merged
+            depth_count = self.df['depth_feature'].notna().sum()
+            print(f"Loaded {depth_count}/{len(self.df)} depth features.")
+            
+            # Check dimensions of depth features
+            if depth_count > 0:
+                sample_depth = next(item for item in self.df['depth_feature'] if item is not None)
+                if isinstance(sample_depth, np.ndarray):
+                    print(f"Depth feature shape: {sample_depth.shape}")
+                    
+                    # Resize if necessary
+                    if sample_depth.shape != self.image_size:
+                        print(f"Resizing depth features from {sample_depth.shape} to {self.image_size}")
+                        for idx, row in self.df.iterrows():
+                            if row['depth_feature'] is not None:
+                                self.df.at[idx, 'depth_feature'] = cv2.resize(
+                                    row['depth_feature'], 
+                                    (self.image_size[1], self.image_size[0])
+                                )
+            
+            return depth_count > 0
+            
+        except Exception as e:
+            print(f"Error loading depth features: {str(e)}")
+            return False
+    
     def preprocess_data(self, balance_classes=False):
         """
         Preprocess the loaded dataset
@@ -254,8 +330,22 @@ class DataProcessor:
                 self.df = self.df[valid_images]
                 print(f"Removed invalid images. Remaining records: {len(self.df)}")
         
-        # Generate depth features if requested
-        if self.generate_depth:
+        # Try to load pre-generated depth features if a path is provided
+        if self.depth_features_path is not None:
+            depth_features_loaded = self.load_depth_features()
+            if depth_features_loaded:
+                print("Successfully loaded pre-generated depth features")
+            else:
+                print("Failed to load pre-generated depth features")
+                
+                # Fall back to generating depth features if needed
+                if self.generate_depth:
+                    print("Falling back to generating depth features...")
+                else:
+                    print("Proceeding without depth features")
+        
+        # Generate depth features if requested and not already loaded
+        elif self.generate_depth:
             self._initialize_depth_model()
             
             if self.depth_model is not None:

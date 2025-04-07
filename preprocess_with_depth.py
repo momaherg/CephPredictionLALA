@@ -30,6 +30,10 @@ def parse_args():
     parser.add_argument('--balance_method', type=str, default='upsample', choices=['upsample', 'downsample'], 
                         help='Method to balance classes')
     parser.add_argument('--visualize', action='store_true', help='Visualize sample depth prediction')
+    parser.add_argument('--depth_features_path', type=str, default=None, 
+                        help='Path to a pickle file containing pre-generated depth features')
+    parser.add_argument('--depth_column', type=str, default='depth_map',
+                        help='Column name in the depth features file containing the depth maps (default: depth_map)')
     return parser.parse_args()
 
 def main():
@@ -59,12 +63,31 @@ def main():
         landmark_cols=landmark_cols,
         image_size=(224, 224),
         apply_clahe=args.apply_clahe,
-        generate_depth=True  # Always generate depth features in this script
+        generate_depth=True if args.depth_features_path is None else False,  # Only generate if not loading
+        depth_features_path=args.depth_features_path
     )
     
     # Load and preprocess data
     print("Loading dataset...")
     df = data_processor.load_data()
+    
+    # If using pre-generated depth features with a different column name, rename it
+    if args.depth_features_path and args.depth_column != 'depth_map':
+        print(f"Note: Using '{args.depth_column}' as the depth map column instead of the default 'depth_map'")
+        # We'll need to check the loaded DataFrame for the column and rename it if needed
+        depth_df = pd.read_pickle(args.depth_features_path)
+        if args.depth_column in depth_df.columns:
+            # Create a copy of the DataFrame with the column renamed
+            depth_df_renamed = depth_df.copy()
+            depth_df_renamed.rename(columns={args.depth_column: 'depth_map'}, inplace=True)
+            # Save to a temporary file
+            temp_path = os.path.join(args.output_dir, 'temp_depth_features.pkl')
+            depth_df_renamed.to_pickle(temp_path)
+            # Update the path
+            data_processor.depth_features_path = temp_path
+            print(f"Renamed column '{args.depth_column}' to 'depth_map' in temporary file")
+        else:
+            print(f"Warning: Column '{args.depth_column}' not found in {args.depth_features_path}")
     
     print("Preprocessing dataset with depth features...")
     df = data_processor.preprocess_data(balance_classes=args.balance_classes)

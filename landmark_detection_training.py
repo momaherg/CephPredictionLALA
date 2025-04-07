@@ -66,6 +66,7 @@ DATA_PATH = "data/train_data.csv"  # Path to your dataset
 OUTPUT_DIR = "./outputs"
 APPLY_CLAHE = True  # Whether to apply Contrast Limited Adaptive Histogram Equalization
 USE_DEPTH_FEATURES = False  # Whether to generate and use depth features
+DEPTH_FEATURES_PATH = None  # Path to pre-generated depth features (if available)
 
 # Model parameters
 NUM_LANDMARKS = 19
@@ -177,7 +178,8 @@ data_processor = DataProcessor(
     landmark_cols=landmark_cols,
     image_size=(224, 224),
     apply_clahe=APPLY_CLAHE,
-    generate_depth=USE_DEPTH_FEATURES  # Pass the flag to generate depth features
+    generate_depth=USE_DEPTH_FEATURES,  # Generate depth features if needed
+    depth_features_path=DEPTH_FEATURES_PATH  # Path to pre-generated depth features
 )
 
 # Load and preprocess data
