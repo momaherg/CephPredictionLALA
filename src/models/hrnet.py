@@ -408,6 +408,11 @@ class LandmarkHeatmapNet(nn.Module):
         if self.use_depth and depth is not None:
             depth_features = self.depth_cnn(depth)
             
+            # Ensure HRNet features match depth features' spatial dimensions before concatenation
+            if features.shape[2:] != depth_features.shape[2:]:
+                print(f"Resizing HRNet features from {features.shape[2:]} to {depth_features.shape[2:]}")
+                features = F.interpolate(features, size=depth_features.shape[2:], mode='bilinear', align_corners=False)
+            
             # Concatenate RGB and depth features along channel dimension
             features = torch.cat([features, depth_features], dim=1)
         
