@@ -489,7 +489,7 @@ class LandmarkHeatmapNet(nn.Module):
         """
         return soft_argmax(heatmaps, beta=beta)
     
-    def predict_landmarks(self, x, depth=None, use_soft_argmax=True, beta=100):
+    def predict_landmarks(self, x, depth=None, use_soft_argmax=True, beta=100, scale_factor=None):
         """
         Predict landmark coordinates from input images
         
@@ -498,6 +498,8 @@ class LandmarkHeatmapNet(nn.Module):
             depth (torch.Tensor, optional): Input depth maps of shape (batch_size, 1, height, width)
             use_soft_argmax (bool): Whether to use soft-argmax for sub-pixel accuracy
             beta (float): Temperature parameter for softmax (only used if use_soft_argmax=True)
+            scale_factor (float, optional): Factor to scale coordinates from heatmap to image space.
+                                          If None, uses default 224.0 / output_size[0]
             
         Returns:
             torch.Tensor: Predicted landmark coordinates of shape (batch_size, num_landmarks, 2)
@@ -512,8 +514,11 @@ class LandmarkHeatmapNet(nn.Module):
             # Otherwise, use initial coordinates
             coords = output['initial_coords']
         
-        # Scale coordinates to the original image size (224x224)
-        scale_factor = 224.0 / self.output_size[0]  # Assuming square output
+        # Scale coordinates to the original image size
+        if scale_factor is None:
+            # Default scale factor (assumes square output and 224x224 image size)
+            scale_factor = 224.0 / self.output_size[0]
+        
         coords = coords * scale_factor
         
         return coords

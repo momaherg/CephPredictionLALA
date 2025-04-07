@@ -39,7 +39,9 @@ class LandmarkTrainer:
                  # Per-Landmark Weighting/Focusing
                  target_landmark_indices=None, landmark_weights=None,
                  # Specific MED Logging
-                 log_specific_landmark_indices=None):
+                 log_specific_landmark_indices=None,
+                 # Image and heatmap parameters
+                 output_size=(64, 64), image_size=(224, 224)):
         """
         Initialize the landmark trainer
         
@@ -78,8 +80,10 @@ class LandmarkTrainer:
             norm_decay (float): Decay factor for running average in normalization
             norm_epsilon (float): Epsilon for numerical stability in normalization
             target_landmark_indices (list): Indices of landmarks to focus on
-            landmark_weights (list): Per-landmark weights for loss calculation
+            landmark_weights (torch.Tensor): Per-landmark weights for loss calculation
             log_specific_landmark_indices (list): Indices of landmarks to log specific metrics for
+            output_size (tuple): Size of heatmap output (height, width)
+            image_size (tuple): Size of input images (height, width)
         """        
         # Store parameters
         self.num_landmarks = num_landmarks
@@ -90,6 +94,12 @@ class LandmarkTrainer:
         self.use_depth = use_depth
         self.depth_channels = depth_channels
         self.hrnet_type = hrnet_type
+        
+        # Image and heatmap parameters
+        self.output_size = output_size
+        self.image_size = image_size
+        # Scale factor to convert between heatmap coordinates and image coordinates 
+        self.coord_scale_factor = self.image_size[0] / self.output_size[0]
         
         # Loss weighting
         self.heatmap_weight = heatmap_weight
@@ -308,15 +318,19 @@ class LandmarkTrainer:
                 # Get initial coordinates for MED calculation
                 pred_coords = outputs['initial_coords']
             
-            # Calculate Euclidean distance for each landmark
+            # Scale predicted coordinates from heatmap space to image space before calculating MED
+            # Use the scale factor from the trainer instance for consistency
+            image_space_pred_coords = pred_coords * self.coord_scale_factor
+            
+            # Calculate Euclidean distance for each landmark (now using correctly scaled coordinates)
             batch_size = landmarks.size(0)
-            meds = mean_euclidean_distance(pred_coords, landmarks)
+            meds = mean_euclidean_distance(image_space_pred_coords, landmarks)
             total_euclidean_distance += meds.sum().item()
             total_samples += batch_size
             
             # Calculate per-landmark MEDs if specified
             if self.log_specific_landmark_indices:
-                per_landmark_med = per_landmark_euclidean_distance(pred_coords, landmarks)
+                per_landmark_med = per_landmark_euclidean_distance(image_space_pred_coords, landmarks)
                 for idx in self.log_specific_landmark_indices:
                     # Fix: per_landmark_med is a 1D tensor of shape (num_landmarks,)
                     specific_distances[idx].append(per_landmark_med[idx].item())
@@ -409,15 +423,19 @@ class LandmarkTrainer:
                     # Get initial coordinates for MED calculation
                     pred_coords = outputs['initial_coords']
                 
-                # Calculate Euclidean distance for each landmark
+                # Scale predicted coordinates from heatmap space to image space before calculating MED
+                # Use the scale factor from the trainer instance for consistency
+                image_space_pred_coords = pred_coords * self.coord_scale_factor
+                
+                # Calculate Euclidean distance for each landmark (now using correctly scaled coordinates)
                 batch_size = landmarks.size(0)
-                meds = mean_euclidean_distance(pred_coords, landmarks)
+                meds = mean_euclidean_distance(image_space_pred_coords, landmarks)
                 total_euclidean_distance += meds.sum().item()
                 total_samples += batch_size
                 
                 # Calculate per-landmark MEDs if specified
                 if self.log_specific_landmark_indices:
-                    per_landmark_med = per_landmark_euclidean_distance(pred_coords, landmarks)
+                    per_landmark_med = per_landmark_euclidean_distance(image_space_pred_coords, landmarks)
                     for idx in self.log_specific_landmark_indices:
                         # Fix: per_landmark_med is a 1D tensor of shape (num_landmarks,)
                         specific_distances[idx].append(per_landmark_med[idx].item())
@@ -653,7 +671,8 @@ class LandmarkTrainer:
             'heatmap_weight': self.heatmap_weight,
             'coord_weight': self.coord_weight,
             'use_weight_schedule': self.use_weight_schedule,
-            'output_size': (64, 64),  # Default heatmap output size
+            'output_size': self.output_size,
+            'image_size': self.image_size,
             'date': time.strftime("%Y-%m-%d %H:%M:%S")
         }
         
@@ -676,7 +695,9 @@ class LandmarkTrainer:
             'use_refinement': self.use_refinement,
             'use_depth': self.use_depth,
             'depth_channels': self.depth_channels if self.use_depth else None,
-            'hrnet_type': self.hrnet_type
+            'hrnet_type': self.hrnet_type,
+            'output_size': self.output_size,
+            'image_size': self.image_size
         }
         
         # Add scheduler state if exists
@@ -891,8 +912,8 @@ class LandmarkTrainer:
                 if self.use_depth and 'depth' in batch:
                     depth = batch['depth'].to(self.device)
                 
-                # Forward pass
-                pred_landmarks = self.model.predict_landmarks(images, depth)
+                # Forward pass - use the trainer's scale factor for consistent scaling
+                pred_landmarks = self.model.predict_landmarks(images, depth, scale_factor=self.coord_scale_factor)
                 
                 # Store predictions and ground truth
                 all_pred_landmarks.append(pred_landmarks.cpu())
