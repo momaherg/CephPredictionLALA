@@ -525,8 +525,17 @@ class DataProcessor:
         Returns:
             tuple: (train_loader, val_loader, test_loader)
         """
-        if self.df is None or balance_classes:  # Re-preprocess if balancing requested
+        # Only preprocess if the dataframe is None
+        if self.df is None:
             self.preprocess_data(balance_classes=balance_classes)
+        # Otherwise, check if we need to balance (and haven't already balanced)
+        elif balance_classes and 'skeletal_class' in self.df.columns:
+            # Check if classes are already balanced
+            class_counts = self.df['skeletal_class'].value_counts().tolist()
+            if len(set(class_counts)) > 1:  # Not balanced yet
+                print("Balancing classes without reloading depth features...")
+                # Simply call balance_dataset instead of full preprocess_data
+                self.balance_dataset(method='upsample', class_column='skeletal_class')
         
         # Create data loaders
         train_loader, val_loader, test_loader = create_dataloaders(
@@ -583,11 +592,67 @@ class DataProcessor:
         if self.classifier is None:
             raise ValueError("Patient classifier is required for dataset balancing")
         
-        self.df = self.classifier.balance_classes(
+        # Check if we need to preserve depth features during balancing
+        has_depth_features = 'depth_feature' in self.df.columns
+        depth_features_present = has_depth_features and self.df['depth_feature'].notna().sum() > 0
+        
+        # Get class distribution before balancing
+        if class_column in self.df.columns:
+            print(f"{class_column.title()} Distribution:")
+            class_counts = self.df[class_column].value_counts().to_dict()
+            total = len(self.df)
+            for class_label, count in sorted(class_counts.items()):
+                percentage = count / total * 100
+                print(f"  Class {class_label}: {count} patients ({percentage:.1f}%)")
+        
+        print(f"Balancing dataset by {method}ing {class_column}...")
+        
+        # Track original indices for reference after balancing
+        self.df['original_index'] = self.df.index
+        
+        # Print original class distribution
+        print(f"Original class distribution: {self.df[class_column].value_counts().to_dict()}")
+        
+        # Balance classes
+        balanced_df = self.classifier.balance_classes(
             self.df,
             class_column=class_column, 
             balance_method=method
         )
+        
+        # Print balanced class distribution
+        print(f"Balanced class distribution: {balanced_df[class_column].value_counts().to_dict()}")
+        
+        # After balancing, depth features need to be preserved from the original rows
+        if depth_features_present:
+            print("Preserving depth features during balancing...")
+            # Check if the depth features were preserved correctly
+            if ('depth_feature' not in balanced_df.columns) or (balanced_df['depth_feature'].notna().sum() < balanced_df['original_index'].notna().sum()):
+                print("Depth features were lost or incomplete during balancing. Restoring from original dataframe...")
+                
+                # Create a dictionary to map original indices to depth features
+                depth_map = {}
+                for idx, row in self.df.iterrows():
+                    if row['depth_feature'] is not None:
+                        depth_map[idx] = row['depth_feature']
+                
+                # Restore depth features based on original_index
+                for idx, row in balanced_df.iterrows():
+                    orig_idx = row['original_index']
+                    if orig_idx in depth_map:
+                        balanced_df.at[idx, 'depth_feature'] = depth_map[orig_idx]
+        
+        # Remove the temporary column
+        if 'original_index' in balanced_df.columns:
+            balanced_df = balanced_df.drop(columns=['original_index'])
+        
+        # Update the dataframe
+        self.df = balanced_df
+        
+        # Verify depth features after balancing
+        if depth_features_present:
+            depth_count = self.df['depth_feature'].notna().sum()
+            print(f"After balancing: {depth_count}/{len(self.df)} rows have depth features")
         
         return self.df
     
