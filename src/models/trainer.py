@@ -103,6 +103,14 @@ class LandmarkTrainer:
         self.final_coord_weight = final_coord_weight
         self.weight_schedule_epochs = weight_schedule_epochs
         
+        # Initialize current weights (fixes missing attribute error)
+        if use_weight_schedule:
+            self.current_heatmap_weight = initial_heatmap_weight
+            self.current_coord_weight = initial_coord_weight
+        else:
+            self.current_heatmap_weight = heatmap_weight
+            self.current_coord_weight = coord_weight
+        
         # Loss normalization
         self.use_loss_normalization = use_loss_normalization
         self.norm_decay = norm_decay
