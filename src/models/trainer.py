@@ -267,9 +267,9 @@ class LandmarkTrainer:
         # Track the number of batches for averaging
         num_batches = 0
         
-        # Track the total Euclidean distance for all landmarks for MED calculation
-        total_euclidean_distance = 0.0
-        total_samples = 0
+        # Track per-landmark distances and overall distances
+        all_pred_landmarks = []
+        all_gt_landmarks = []
         
         # Track per-landmark distances if specific logging is enabled
         specific_distances = {}
@@ -322,11 +322,9 @@ class LandmarkTrainer:
             # Use the scale factor from the trainer instance for consistency
             image_space_pred_coords = pred_coords * self.coord_scale_factor
             
-            # Calculate Euclidean distance for each landmark (now using correctly scaled coordinates)
-            batch_size = landmarks.size(0)
-            meds = mean_euclidean_distance(image_space_pred_coords, landmarks)
-            total_euclidean_distance += meds.sum().item()
-            total_samples += batch_size
+            # Store predictions and ground truth for overall MED calculation
+            all_pred_landmarks.append(image_space_pred_coords.detach().cpu())
+            all_gt_landmarks.append(landmarks.detach().cpu())
             
             # Calculate per-landmark MEDs if specified
             if self.log_specific_landmark_indices:
@@ -337,13 +335,24 @@ class LandmarkTrainer:
             
             num_batches += 1
         
-        # Calculate average metrics
+        # Calculate average loss metrics
         avg_loss = epoch_loss / num_batches
-        avg_med = total_euclidean_distance / total_samples
-        
-        # Calculate average component losses if using refinement
         avg_heatmap_loss = epoch_heatmap_loss / num_batches if self.use_refinement else 0.0
         avg_coord_loss = epoch_coord_loss / num_batches if self.use_refinement else 0.0
+        
+        # Concatenate all predictions and ground truth
+        all_pred_landmarks = torch.cat(all_pred_landmarks, dim=0)
+        all_gt_landmarks = torch.cat(all_gt_landmarks, dim=0)
+        
+        # Calculate overall MED
+        avg_med = mean_euclidean_distance(all_pred_landmarks, all_gt_landmarks).item()
+        
+        # Also calculate the mean of per-landmark MEDs for validation/debugging
+        all_landmark_meds = per_landmark_euclidean_distance(all_pred_landmarks, all_gt_landmarks)
+        avg_of_per_landmark_meds = torch.mean(all_landmark_meds).item()
+        
+        # Log diagnostic info to help debug MED discrepancies
+        print(f"Train Diagnostic - Overall MED: {avg_med:.2f}px, Mean of per-landmark MEDs: {avg_of_per_landmark_meds:.2f}px")
         
         # Calculate specific landmark MEDs if requested
         specific_meds = {}
@@ -380,9 +389,9 @@ class LandmarkTrainer:
         # Track the number of batches for averaging
         num_batches = 0
         
-        # Track the total Euclidean distance for all landmarks for MED calculation
-        total_euclidean_distance = 0.0
-        total_samples = 0
+        # Track per-landmark distances and overall distances
+        all_pred_landmarks = []
+        all_gt_landmarks = []
         
         # Track per-landmark distances if specific logging is enabled
         specific_distances = {}
@@ -427,11 +436,9 @@ class LandmarkTrainer:
                 # Use the scale factor from the trainer instance for consistency
                 image_space_pred_coords = pred_coords * self.coord_scale_factor
                 
-                # Calculate Euclidean distance for each landmark (now using correctly scaled coordinates)
-                batch_size = landmarks.size(0)
-                meds = mean_euclidean_distance(image_space_pred_coords, landmarks)
-                total_euclidean_distance += meds.sum().item()
-                total_samples += batch_size
+                # Store predictions and ground truth for overall MED calculation
+                all_pred_landmarks.append(image_space_pred_coords.detach().cpu())
+                all_gt_landmarks.append(landmarks.detach().cpu())
                 
                 # Calculate per-landmark MEDs if specified
                 if self.log_specific_landmark_indices:
@@ -442,13 +449,24 @@ class LandmarkTrainer:
                 
                 num_batches += 1
         
-        # Calculate average metrics
+        # Calculate average loss metrics
         avg_loss = epoch_loss / num_batches
-        avg_med = total_euclidean_distance / total_samples
-        
-        # Calculate average component losses if using refinement
         avg_heatmap_loss = epoch_heatmap_loss / num_batches if self.use_refinement else 0.0
         avg_coord_loss = epoch_coord_loss / num_batches if self.use_refinement else 0.0
+        
+        # Concatenate all predictions and ground truth
+        all_pred_landmarks = torch.cat(all_pred_landmarks, dim=0)
+        all_gt_landmarks = torch.cat(all_gt_landmarks, dim=0)
+        
+        # Calculate overall MED
+        avg_med = mean_euclidean_distance(all_pred_landmarks, all_gt_landmarks).item()
+        
+        # Also calculate the mean of per-landmark MEDs for validation/debugging
+        all_landmark_meds = per_landmark_euclidean_distance(all_pred_landmarks, all_gt_landmarks)
+        avg_of_per_landmark_meds = torch.mean(all_landmark_meds).item()
+        
+        # Log diagnostic info to help debug MED discrepancies
+        print(f"Valid Diagnostic - Overall MED: {avg_med:.2f}px, Mean of per-landmark MEDs: {avg_of_per_landmark_meds:.2f}px")
         
         # Calculate specific landmark MEDs if requested
         specific_meds = {}

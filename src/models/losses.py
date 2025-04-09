@@ -488,6 +488,16 @@ class CombinedLoss(nn.Module):
              del self._buffers['running_avg_coord']
         if hasattr(self, 'norm_updates') and hasattr(self, 'register_buffer'):
              del self._buffers['norm_updates']
+        
+        # Add monitoring for loss values
+        self.call_count = 0
+        self.print_freq = 50  # Print loss diagnostics every 50 calls
+        self.loss_history = {
+            'heatmap': [],
+            'coord': [],
+            'total': []
+        }
+        self.history_size = 10  # Store last 10 values for trends
 
     def forward(self, outputs, target_landmarks, mask=None):
         """
@@ -537,6 +547,33 @@ class CombinedLoss(nn.Module):
         
         # Calculate final total loss
         total_loss = heatmap_loss_weighted + coord_loss_weighted
+        
+        # Track loss values
+        self.call_count += 1
+        self.loss_history['heatmap'].append(heatmap_loss.item())
+        self.loss_history['coord'].append(coord_loss.item())
+        self.loss_history['total'].append(total_loss.item())
+        
+        # Keep history size manageable
+        if len(self.loss_history['heatmap']) > self.history_size:
+            self.loss_history['heatmap'] = self.loss_history['heatmap'][-self.history_size:]
+            self.loss_history['coord'] = self.loss_history['coord'][-self.history_size:]
+            self.loss_history['total'] = self.loss_history['total'][-self.history_size:]
+        
+        # Occasionally print loss diagnostics
+        if self.call_count % self.print_freq == 0:
+            heatmap_avg = sum(self.loss_history['heatmap']) / len(self.loss_history['heatmap'])
+            coord_avg = sum(self.loss_history['coord']) / len(self.loss_history['coord'])
+            total_avg = sum(self.loss_history['total']) / len(self.loss_history['total'])
+            
+            # Calculate trend (current vs average)
+            heatmap_current = self.loss_history['heatmap'][-1]
+            coord_current = self.loss_history['coord'][-1]
+            
+            print(f"Loss Diagnostic (step {self.call_count}):")
+            print(f"  Heatmap loss: {heatmap_current:.4f} (avg: {heatmap_avg:.4f}, weight: {self.heatmap_weight:.2f})")
+            print(f"  Coord loss: {coord_current:.4f} (avg: {coord_avg:.4f}, weight: {self.coord_weight:.2f})")
+            print(f"  Total loss: {total_loss.item():.4f} (avg: {total_avg:.4f})")
         
         # Return dictionary with all losses
         return {

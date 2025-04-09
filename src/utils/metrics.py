@@ -2,7 +2,7 @@ import numpy as np
 import torch
 
 
-def mean_euclidean_distance(pred, target, mask=None):
+def mean_euclidean_distance(pred, target, mask=None, reduction='mean'):
     """
     Compute the mean Euclidean distance between predicted and target landmarks
     
@@ -10,28 +10,64 @@ def mean_euclidean_distance(pred, target, mask=None):
         pred (torch.Tensor or numpy.ndarray): Predicted landmarks of shape (batch_size, num_landmarks, 2)
         target (torch.Tensor or numpy.ndarray): Target landmarks of shape (batch_size, num_landmarks, 2)
         mask (torch.Tensor or numpy.ndarray, optional): Mask for valid landmarks of shape (batch_size, num_landmarks)
+        reduction (str): Reduction method ('mean' or 'sum' or 'none')
         
     Returns:
-        float: Mean Euclidean distance across all landmarks and samples
+        torch.Tensor or numpy.ndarray: Mean Euclidean distance across landmarks and samples,
+                                     or per-sample distance if reduction='none'
     """
-    # Convert tensors to numpy if needed
-    if isinstance(pred, torch.Tensor):
-        pred = pred.detach().cpu().numpy()
-    if isinstance(target, torch.Tensor):
-        target = target.detach().cpu().numpy()
-    if mask is not None and isinstance(mask, torch.Tensor):
-        mask = mask.detach().cpu().numpy()
+    # Track input type for consistent return type
+    is_tensor = isinstance(pred, torch.Tensor)
     
-    # Compute Euclidean distance for each landmark
-    distances = np.sqrt(np.sum((pred - target) ** 2, axis=-1))  # Shape: (batch_size, num_landmarks)
+    # Convert tensors to numpy if needed
+    if is_tensor:
+        pred_numpy = pred.detach().cpu().numpy()
+        target_numpy = target.detach().cpu().numpy()
+        mask_numpy = mask.detach().cpu().numpy() if mask is not None and isinstance(mask, torch.Tensor) else mask
+    else:
+        pred_numpy = pred
+        target_numpy = target
+        mask_numpy = mask
+    
+    # Compute Euclidean distance for each landmark: shape (batch_size, num_landmarks)
+    distances = np.sqrt(np.sum((pred_numpy - target_numpy) ** 2, axis=-1))
     
     # Apply mask if provided
-    if mask is not None:
-        distances = distances * mask
-        return np.sum(distances) / (np.sum(mask) + 1e-8)
+    if mask_numpy is not None:
+        distances = distances * mask_numpy
     
-    # Return mean distance
-    return np.mean(distances)
+    # Apply reduction
+    if reduction == 'none':
+        # Return per-sample mean distance: shape (batch_size,)
+        if mask_numpy is not None:
+            # For masked data, we need to be careful about the denominator
+            sample_distances = np.sum(distances, axis=1) / (np.sum(mask_numpy, axis=1) + 1e-8)
+        else:
+            sample_distances = np.mean(distances, axis=1)
+            
+        # Convert back to tensor if input was tensor
+        if is_tensor:
+            return torch.tensor(sample_distances, device=pred.device)
+        return sample_distances
+        
+    elif reduction == 'sum':
+        # Return sum of all distances
+        if mask_numpy is not None:
+            result = np.sum(distances)
+        else:
+            result = np.sum(distances)
+            
+    else:  # reduction == 'mean'
+        # Return mean distance
+        if mask_numpy is not None:
+            result = np.sum(distances) / (np.sum(mask_numpy) + 1e-8)
+        else:
+            result = np.mean(distances)
+    
+    # Convert back to tensor if input was tensor
+    if is_tensor:
+        return torch.tensor(result, device=pred.device)
+    return result
 
 
 def landmark_success_rate(pred, target, threshold=2.0, mask=None):
