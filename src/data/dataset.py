@@ -45,6 +45,13 @@ class CephalometricDataset(Dataset):
         if torch.is_tensor(idx):
             idx = idx.tolist()
         
+        # Get patient ID first
+        patient_id = None
+        if 'patient_id' in self.data_frame.columns:
+             patient_id = str(self.data_frame.iloc[idx]['patient_id']) # Ensure it's a string
+        elif 'patient' in self.data_frame.columns: # Fallback to 'patient' column
+             patient_id = str(self.data_frame.iloc[idx]['patient'])
+
         # Get image data
         if 'Image' in self.data_frame.columns:
             # Assuming 'Image' column contains pixel array data
@@ -56,14 +63,24 @@ class CephalometricDataset(Dataset):
                 img_array = img_data
         else:
             # For synthetic data when no actual images are available, create a blank image
-            if self.root_dir is None or 'image_path' in self.data_frame.columns:
+            if self.root_dir is None or 'image_path' not in self.data_frame.columns: # Corrected logic here
                 # Create a synthetic image for demonstration
                 img_array = np.zeros((224, 224, 3), dtype=np.uint8)
                 # Add some random noise to make it more realistic
                 img_array = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
             else:
                 # If images are stored as files
-                img_name = os.path.join(self.root_dir, self.data_frame.iloc[idx]['patient'] + '.jpg')
+                # Use patient_id if available in the path, otherwise use the original logic
+                if patient_id and os.path.exists(os.path.join(self.root_dir, patient_id + '.jpg')):
+                     img_name = os.path.join(self.root_dir, patient_id + '.jpg')
+                elif 'patient' in self.data_frame.columns and os.path.exists(os.path.join(self.root_dir, self.data_frame.iloc[idx]['patient'] + '.jpg')):
+                     img_name = os.path.join(self.root_dir, self.data_frame.iloc[idx]['patient'] + '.jpg')
+                elif 'image_path' in self.data_frame.columns: # Use image_path if available
+                     img_name = os.path.join(self.root_dir or '', self.data_frame.iloc[idx]['image_path']) # Handle case where root_dir might be None
+                else:
+                     # Fallback or raise error if no valid image source found
+                     raise FileNotFoundError(f"Cannot find image source for index {idx}")
+
                 img_array = np.array(Image.open(img_name))
         
         # Ensure image is in the right format (uint8) for OpenCV operations
@@ -122,6 +139,10 @@ class CephalometricDataset(Dataset):
         # Create sample
         sample = {'image': img_array, 'landmarks': landmarks}
         
+        # Add patient_id to the sample
+        if patient_id is not None:
+            sample['patient_id'] = patient_id
+        
         # Add depth feature if available
         if self.use_depth:
             sample['depth'] = depth_feature
@@ -165,6 +186,10 @@ class ToTensor(object):
                 
             result['depth'] = torch.from_numpy(depth).float()
         
+        # Pass patient_id through if it exists
+        if 'patient_id' in sample:
+            result['patient_id'] = sample['patient_id'] # Keep as string
+        
         return result
 
 
@@ -176,18 +201,16 @@ class Normalize(object):
         self.std = std
     
     def __call__(self, sample):
-        image, landmarks = sample['image'], sample['landmarks']
+        image = sample['image']
         
         # Normalize image
         for t, m, s in zip(image, self.mean, self.std):
             t.sub_(m).div_(s)
             
-        result = {'image': image, 'landmarks': landmarks}
+        # Keep other keys, including landmarks, depth, and patient_id
+        result = sample.copy() # Start with a copy of the input sample
+        result['image'] = image # Update the normalized image
         
-        # Pass through depth without normalizing (already normalized)
-        if 'depth' in sample:
-            result['depth'] = sample['depth']
-            
         return result
 
 

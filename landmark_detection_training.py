@@ -77,7 +77,6 @@ HRNET_TYPE = 'w32'  # HRNet variant: 'w32' (default) or 'w48' (larger model)
 
 # Depth feature parameters
 DEPTH_CHANNELS = 64  # Number of channels for depth features in the depth CNN
-DEPTH_FUSION = 'late'  # Fusion strategy: 'early', 'late', or 'multi' 
 
 # Loss parameters
 HEATMAP_WEIGHT = 1.0  # Weight for heatmap loss (used when not using weight scheduling)
@@ -661,4 +660,380 @@ if 'per_landmark_stats' in results:
     plt.savefig(os.path.join(OUTPUT_DIR, 'per_landmark_success_rate.png'))
     plt.show()
 else:
-    print("Per-landmark statistics not available") 
+    print("Per-landmark statistics not available")
+
+# %% [markdown]
+# ## 14. Model Evaluation from Checkpoint
+# 
+# We can load a specific model checkpoint (e.g., best model by MED) and evaluate it on the test set to see detailed metrics.
+
+# %%
+def evaluate_checkpoint(checkpoint_path, data_processor=None, test_loader=None):
+    """
+    Load a specific checkpoint and evaluate it on the test set.
+    
+    Args:
+        checkpoint_path (str): Path to the model checkpoint file.
+        data_processor (DataProcessor, optional): Data processor to create test loader if not provided.
+        test_loader (DataLoader, optional): Test data loader. If None, will be created from data_processor.
+        
+    Returns:
+        tuple: (evaluation_results, trainer) - Evaluation results dictionary and the trainer instance
+    """
+    print(f"Loading checkpoint from {checkpoint_path}")
+    
+    # Create a new trainer instance with the same parameters as the training run
+    # You can customize these parameters if they differ from the training run
+    eval_trainer = LandmarkTrainer(
+        num_landmarks=NUM_LANDMARKS,
+        learning_rate=LEARNING_RATE,
+        device=device,
+        output_dir=OUTPUT_DIR,
+        use_refinement=USE_REFINEMENT,
+        use_depth=USE_DEPTH_FEATURES,
+        depth_channels=DEPTH_CHANNELS,
+        hrnet_type=HRNET_TYPE,
+        output_size=OUTPUT_SIZE if 'OUTPUT_SIZE' in globals() else (64, 64),
+        image_size=IMAGE_SIZE if 'IMAGE_SIZE' in globals() else (224, 224),
+        use_loss_normalization=USE_LOSS_NORMALIZATION
+    )
+    
+    # Set the model to evaluation mode BEFORE the dummy forward pass
+    # This prevents batch normalization issues with batch size 1
+    eval_trainer.model.eval()
+    
+    # Run a dummy forward pass to initialize all model components
+    # This ensures the heatmap_layer is created before loading the checkpoint
+    dummy_input = torch.zeros((1, 3, 224, 224), device=device)
+    dummy_depth = None
+    if USE_DEPTH_FEATURES:
+        dummy_depth = torch.zeros((1, 1, 224, 224), device=device)
+    
+    print("Initializing model components with dummy forward pass...")
+    with torch.no_grad():
+        _ = eval_trainer.model(dummy_input, dummy_depth)
+    print("Model components initialized")
+    
+    # Now load the checkpoint
+    eval_trainer.load_checkpoint(checkpoint_path)
+    print("Model checkpoint loaded successfully")
+    
+    # Create test loader if not provided
+    if test_loader is None:
+        if data_processor is None:
+            raise ValueError("Either test_loader or data_processor must be provided")
+        
+        _, _, test_loader = data_processor.create_data_loaders(
+            batch_size=BATCH_SIZE,
+            num_workers=NUM_WORKERS,
+            balance_classes=False,  # No need to balance for test set
+            use_depth=USE_DEPTH_FEATURES
+        )
+        print(f"Created test loader with {len(test_loader.dataset)} samples")
+    
+    # Evaluate on test set with detailed metrics
+    print("\nEvaluating model on test set and gathering raw pixel predictions...")
+    
+    # Set save_visualizations=False to avoid the _visualize_landmarks error
+    # We need the raw predictions to apply patient-specific calibration
+    model_results = eval_trainer.evaluate(test_loader, save_visualizations=False, save_predictions=True)
+    
+    # IMPROVED CALIBRATION APPROACH
+    # Check if the test dataset has ruler point columns and if we have saved predictions
+    test_df = data_processor.df.copy()
+    if (all(col in test_df.columns for col in ['ruler_point_up_x', 'ruler_point_up_y', 
+                                              'ruler_point_down_x', 'ruler_point_down_y']) and
+        'patient_id' in test_df.columns and
+        'predictions' in model_results):
+        
+        print("\nApplying patient-specific calibration from pixels to millimeters...")
+        
+        # Patients with 20mm rulers instead of 10mm
+        patients_with_20mm_ruler = ["16", "17", "811"]
+        
+        # Create a dictionary to store patient_id -> calibration factor
+        patient_calibration_factors = {}
+        
+        # Calculate calibration factor for each patient with valid ruler points
+        for _, row in test_df.iterrows():
+            patient_id = str(row['patient_id'])
+            
+            if (pd.notna(row['ruler_point_up_x']) and pd.notna(row['ruler_point_up_y']) and 
+                pd.notna(row['ruler_point_down_x']) and pd.notna(row['ruler_point_down_y'])):
+                
+                # Calculate Euclidean distance between ruler points
+                ruler_dist_px = np.sqrt(
+                    (row['ruler_point_up_x'] - row['ruler_point_down_x'])**2 + 
+                    (row['ruler_point_up_y'] - row['ruler_point_down_y'])**2
+                )
+                
+                # Determine ruler size based on patient ID
+                ruler_size_mm = 20.0 if patient_id in patients_with_20mm_ruler else 10.0
+                
+                # Calculate mm/pixel calibration factor for this patient
+                if ruler_dist_px > 0:  # Avoid division by zero
+                    calibration_factor = ruler_size_mm / ruler_dist_px
+                    patient_calibration_factors[patient_id] = calibration_factor
+                    
+                    if patient_id in patients_with_20mm_ruler:
+                        print(f"Patient {patient_id}: 20mm ruler = {ruler_dist_px:.2f}px, factor = {calibration_factor:.5f} mm/px")
+                    
+        print(f"Calculated calibration factors for {len(patient_calibration_factors)} patients")
+        
+        # Now apply patient-specific calibration to saved predictions and recalculate metrics
+        if patient_calibration_factors and 'predictions' in model_results:
+            predictions = model_results['predictions']  # List of prediction dicts
+            
+            # Lists to store calibrated distances
+            all_calibrated_distances = []
+            per_landmark_calibrated_distances = [[] for _ in range(NUM_LANDMARKS)]
+            
+            # Apply calibration to each prediction
+            for pred in predictions:
+                patient_id = str(pred['patient_id']) if 'patient_id' in pred else None
+                
+                if patient_id in patient_calibration_factors:
+                    # Get patient-specific calibration factor
+                    calib_factor = patient_calibration_factors[patient_id]
+                    
+                    # Apply calibration to distances
+                    if 'distances' in pred:
+                        # These are per-landmark distances in pixels
+                        pixel_distances = pred['distances']
+                        
+                        # Convert to mm using patient-specific factor
+                        mm_distances = [dist * calib_factor for dist in pixel_distances]
+                        
+                        # Store calibrated distances for overall and per-landmark statistics
+                        all_calibrated_distances.extend(mm_distances)
+                        
+                        # Store distances by landmark index
+                        for i, dist_mm in enumerate(mm_distances):
+                            if i < len(per_landmark_calibrated_distances):
+                                per_landmark_calibrated_distances[i].append(dist_mm)
+            
+            # Calculate overall MED in mm (mean of all calibrated distances)
+            if all_calibrated_distances:
+                calibrated_med_mm = np.mean(all_calibrated_distances)
+                model_results['mean_euclidean_distance_mm'] = calibrated_med_mm
+                
+                # Calculate success rates in mm (using the same 2mm and 4mm thresholds)
+                success_rate_2mm = np.mean([dist <= 2.0 for dist in all_calibrated_distances])
+                success_rate_4mm = np.mean([dist <= 4.0 for dist in all_calibrated_distances])
+                
+                model_results['success_rate_2mm_mm'] = success_rate_2mm
+                model_results['success_rate_4mm_mm'] = success_rate_4mm
+                
+                # Calculate per-landmark MED and success rates in mm
+                model_results['per_landmark_stats_mm'] = []
+                
+                for i, landmark_distances in enumerate(per_landmark_calibrated_distances):
+                    if landmark_distances:
+                        med_mm = np.mean(landmark_distances)
+                        sr_2mm = np.mean([dist <= 2.0 for dist in landmark_distances])
+                        sr_4mm = np.mean([dist <= 4.0 for dist in landmark_distances])
+                        
+                        model_results['per_landmark_stats_mm'].append({
+                            'landmark_idx': i,
+                            'med_mm': med_mm,
+                            'success_rate_2mm_mm': sr_2mm,
+                            'success_rate_4mm_mm': sr_4mm
+                        })
+                
+                # Print overall metrics in millimeters (patient-specific calibration)
+                print("\nOverall Results (patient-specific calibration to mm):")
+                print(f"Mean Euclidean Distance (MED): {calibrated_med_mm:.2f} mm")
+                print(f"Success Rate (2mm): {success_rate_2mm * 100:.2f}%")
+                print(f"Success Rate (4mm): {success_rate_4mm * 100:.2f}%")
+                
+                # Print per-landmark metrics in millimeters
+                print("\nPer-Landmark Results (patient-specific calibration to mm):")
+                print("{:<4} {:<15} {:<15} {:<15}".format("ID", "MED (mm)", "SR 2mm (%)", "SR 4mm (%)"))
+                print("-" * 50)
+                
+                for stats in model_results['per_landmark_stats_mm']:
+                    print("{:<4} {:<15.2f} {:<15.2f} {:<15.2f}".format(
+                        stats['landmark_idx'], 
+                        stats['med_mm'], 
+                        stats['success_rate_2mm_mm'] * 100,
+                        stats['success_rate_4mm_mm'] * 100
+                    ))
+                
+                # Create visualization of per-landmark MEDs in mm
+                plt.figure(figsize=(12, 6))
+                landmark_indices = [i for i in range(len(model_results['per_landmark_stats_mm']))]
+                med_values_mm = [stats['med_mm'] for stats in model_results['per_landmark_stats_mm']]
+                
+                plt.bar(landmark_indices, med_values_mm)
+                plt.axhline(y=calibrated_med_mm, color='r', linestyle='-', 
+                            label=f'Overall MED: {calibrated_med_mm:.2f} mm')
+                
+                plt.xlabel('Landmark Index')
+                plt.ylabel('MED (mm)')
+                plt.title('Mean Euclidean Distance per Landmark (patient-specific calibration, mm)')
+                plt.xticks(landmark_indices)
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                plt.savefig(os.path.join(OUTPUT_DIR, 'patient_specific_calibration_med_mm.png'))
+                plt.show()
+            else:
+                print("Warning: No calibrated distances calculated. Using original pixel measurements.")
+                # Fall back to using pixel measurements
+                print_pixel_results(model_results)
+        else:
+            print("Warning: No calibration factors or predictions available. Using original pixel measurements.")
+            # Fall back to using pixel measurements
+            print_pixel_results(model_results)
+    else:
+        print("\nRuler point columns or patient IDs not found in test dataset. Reporting results in pixels only.")
+        # Print results in pixels
+        print_pixel_results(model_results)
+    
+    # Return both the evaluation results and the trainer for additional use
+    return model_results, eval_trainer
+
+def print_pixel_results(detailed_results):
+    """Helper function to print evaluation results in pixels"""
+    # Print overall metrics in pixels
+    print("\nOverall Results (in pixels):")
+    print(f"Mean Euclidean Distance (MED): {detailed_results['mean_euclidean_distance']:.2f} pixels")
+    print(f"Success Rate (2mm): {detailed_results['success_rate_2mm'] * 100:.2f}%")
+    print(f"Success Rate (4mm): {detailed_results['success_rate_4mm'] * 100:.2f}%")
+    
+    # Print per-landmark metrics in pixels
+    print("\nPer-Landmark Results (in pixels):")
+    print("{:<4} {:<15} {:<15} {:<15}".format("ID", "MED (pixels)", "SR 2mm (%)", "SR 4mm (%)"))
+    print("-" * 50)
+    
+    for i, stats in enumerate(detailed_results['per_landmark_stats']):
+        print("{:<4} {:<15.2f} {:<15.2f} {:<15.2f}".format(
+            i, 
+            stats['med'], 
+            stats['success_rate_2mm'] * 100,
+            stats['success_rate_4mm'] * 100
+        ))
+    
+    # Create visualization of per-landmark MEDs in pixels
+    plt.figure(figsize=(12, 6))
+    landmark_indices = [i for i in range(len(detailed_results['per_landmark_stats']))]
+    med_values = [stats['med'] for stats in detailed_results['per_landmark_stats']]
+    
+    plt.bar(landmark_indices, med_values)
+    plt.axhline(y=detailed_results['mean_euclidean_distance'], color='r', linestyle='-', 
+                label=f'Overall MED: {detailed_results["mean_euclidean_distance"]:.2f} px')
+    
+    plt.xlabel('Landmark Index')
+    plt.ylabel('MED (pixels)')
+    plt.title('Mean Euclidean Distance per Landmark (pixels)')
+    plt.xticks(landmark_indices)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(OUTPUT_DIR, 'pixel_med.png'))
+    plt.show()
+
+# %%
+# Configuration
+CHECKPOINT_TO_EVALUATE = os.path.join(OUTPUT_DIR, 'best_model_med.pth')  # Path to the checkpoint you want to evaluate
+SAVE_VISUALIZATIONS = True  # Whether to save visualizations of predictions
+
+# Evaluate the checkpoint
+evaluation_results, eval_trainer = evaluate_checkpoint(
+    checkpoint_path=CHECKPOINT_TO_EVALUATE,
+    data_processor=data_processor,
+    test_loader=test_loader
+)
+
+# %% [markdown]
+# ## 15. Visualize Individual Landmark Predictions
+# 
+# We can visualize predictions for specific landmarks or samples to better understand model performance.
+
+# %%
+def visualize_landmark_predictions(trainer, test_loader, num_samples=3, landmark_indices=None):
+    """
+    Visualize predictions for specific landmarks or samples
+    
+    Args:
+        trainer (LandmarkTrainer): Trained model trainer
+        test_loader (DataLoader): Test data loader
+        num_samples (int): Number of samples to visualize
+        landmark_indices (list, optional): List of specific landmark indices to highlight
+    """
+    trainer.model.eval()
+    
+    # Get a batch of data
+    batch = next(iter(test_loader))
+    images = batch['image'].to(trainer.device)
+    gt_landmarks = batch['landmarks']
+    
+    # Get depth maps if available and model uses them
+    depth = None
+    if trainer.use_depth and 'depth' in batch:
+        depth = batch['depth'].to(trainer.device)
+    
+    # Make predictions
+    with torch.no_grad():
+        pred_landmarks = trainer.model.predict_landmarks(images, depth, scale_factor=trainer.coord_scale_factor)
+    
+    # Create visualization output directory
+    vis_dir = os.path.join(OUTPUT_DIR, 'landmark_visualizations')
+    os.makedirs(vis_dir, exist_ok=True)
+    
+    # Visualize predictions for each sample
+    for i in range(min(num_samples, len(images))):
+        # Convert tensors to numpy
+        img = images[i].cpu().permute(1, 2, 0).numpy()
+        gt_lm = gt_landmarks[i].cpu().numpy()
+        pred_lm = pred_landmarks[i].cpu().numpy()
+        
+        # Denormalize image if needed
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        img = std * img + mean
+        img = np.clip(img, 0, 1)
+        
+        # Calculate error for each landmark
+        errors = np.sqrt(np.sum((gt_lm - pred_lm)**2, axis=1))
+        
+        # Create figure
+        plt.figure(figsize=(12, 10))
+        plt.imshow(img)
+        
+        # Plot all ground truth landmarks
+        plt.scatter(gt_lm[:, 0], gt_lm[:, 1], c='green', marker='x', s=100, alpha=0.7, label='Ground Truth')
+        
+        # Plot all predicted landmarks
+        plt.scatter(pred_lm[:, 0], pred_lm[:, 1], c='red', marker='o', s=80, alpha=0.7, label='Prediction')
+        
+        # Highlight specific landmarks if requested
+        if landmark_indices is not None:
+            # Plot connecting lines between GT and predictions for selected landmarks
+            for idx in landmark_indices:
+                if idx < len(gt_lm):
+                    plt.plot([gt_lm[idx, 0], pred_lm[idx, 0]], 
+                             [gt_lm[idx, 1], pred_lm[idx, 1]], 
+                             'b-', alpha=0.5)
+                    
+                    # Add landmark index and error labels
+                    plt.annotate(f"{idx}: {errors[idx]:.1f}px", 
+                                 (pred_lm[idx, 0], pred_lm[idx, 1]),
+                                 xytext=(5, 5), textcoords='offset points',
+                                 color='blue', fontsize=9, fontweight='bold')
+        
+        plt.title(f'Landmark Predictions - Sample {i+1}')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(vis_dir, f'landmark_predictions_sample_{i+1}.png'))
+        plt.show()
+
+# %%
+# Configure which landmarks to highlight
+LANDMARK_INDICES_TO_HIGHLIGHT = [0, 1, 2, 3]  # Customize these indices based on your specific landmarks
+
+# Visualize predictions with highlighted landmarks
+visualize_landmark_predictions(
+    trainer=eval_trainer,  # Use the trainer from the checkpoint evaluation
+    test_loader=test_loader,
+    num_samples=3,
+    landmark_indices=LANDMARK_INDICES_TO_HIGHLIGHT
+) 
