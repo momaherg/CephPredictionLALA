@@ -454,7 +454,10 @@ class CombinedLoss(nn.Module):
         # Pass down parameters to sub-losses
         self.target_landmark_indices = target_landmark_indices
         self.landmark_weights = landmark_weights
-        self.use_loss_normalization = use_loss_normalization
+        # --- Force normalization off for debugging --- 
+        self.use_loss_normalization = False # Override setting
+        print("*** DEBUG: Loss normalization explicitly disabled in CombinedLoss ***")
+        # --- End Override ---
         self.norm_decay = norm_decay
         self.norm_epsilon = norm_epsilon
         
@@ -468,14 +471,14 @@ class CombinedLoss(nn.Module):
         self.heatmap_loss_fn = AdaptiveWingLoss(
             target_landmark_indices=self.target_landmark_indices,
             landmark_weights=self.landmark_weights,
-            use_loss_normalization=self.use_loss_normalization,
+            use_loss_normalization=self.use_loss_normalization, # Pass the overridden value
             norm_decay=self.norm_decay,
             norm_epsilon=self.norm_epsilon
         )
         self.coord_loss_fn = WingLoss(
             target_landmark_indices=self.target_landmark_indices,
             landmark_weights=self.landmark_weights,
-            use_loss_normalization=self.use_loss_normalization,
+            use_loss_normalization=self.use_loss_normalization, # Pass the overridden value
             norm_decay=self.norm_decay,
             norm_epsilon=self.norm_epsilon
         )
