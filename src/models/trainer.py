@@ -912,16 +912,18 @@ class LandmarkTrainer:
         Args:
             test_loader (torch.utils.data.DataLoader): Test data loader
             save_visualizations (bool): Whether to save visualizations of predictions
-            save_predictions (bool): Whether to save predicted landmarks to a file
+            save_predictions (bool): Whether to save detailed predictions including patient_id and distances.
             
         Returns:
-            dict: Evaluation metrics
+            dict: Evaluation metrics, optionally includes 'predictions' list if save_predictions=True.
         """
         self.model.eval()
         
-        # Lists to store predictions and ground truth
-        all_pred_landmarks = []
-        all_gt_landmarks = []
+        # Lists to store predictions and ground truth for overall metrics
+        all_pred_landmarks_agg = []
+        all_gt_landmarks_agg = []
+        # List to store detailed prediction info if save_predictions=True
+        detailed_predictions = []
         
         # Evaluation loop
         with torch.no_grad():
@@ -929,6 +931,7 @@ class LandmarkTrainer:
                 # Get inputs and targets
                 images = batch['image'].to(self.device)
                 landmarks = batch['landmarks'].to(self.device)
+                patient_ids = batch.get('patient_id', [None] * images.size(0)) # Get patient IDs if available
                 
                 # Get depth maps if available and model uses them
                 depth = None
@@ -938,11 +941,29 @@ class LandmarkTrainer:
                 # Forward pass - use the trainer's scale factor for consistent scaling
                 pred_landmarks = self.model.predict_landmarks(images, depth, scale_factor=self.coord_scale_factor)
                 
-                # Store predictions and ground truth
-                all_pred_landmarks.append(pred_landmarks.cpu())
-                all_gt_landmarks.append(landmarks.cpu())
+                # Move results to CPU for aggregation and further processing
+                pred_landmarks_cpu = pred_landmarks.cpu()
+                landmarks_cpu = landmarks.cpu()
                 
-                # Save visualization of the first few batches
+                # Store predictions and ground truth for overall metrics calculation
+                all_pred_landmarks_agg.append(pred_landmarks_cpu)
+                all_gt_landmarks_agg.append(landmarks_cpu)
+                
+                # Store detailed info if requested
+                if save_predictions:
+                    # Calculate per-landmark distances for this batch
+                    batch_distances = torch.sqrt(torch.sum((pred_landmarks_cpu - landmarks_cpu) ** 2, dim=2))
+                    
+                    # Iterate through samples in the batch
+                    for i in range(images.size(0)):
+                        detailed_predictions.append({
+                            'patient_id': patient_ids[i], # Store patient ID
+                            'pred_landmarks': pred_landmarks_cpu[i], # Shape (num_landmarks, 2)
+                            'gt_landmarks': landmarks_cpu[i],       # Shape (num_landmarks, 2)
+                            'distances': batch_distances[i].tolist() # Per-landmark distances (list)
+                        })
+                
+                # Save visualization of the first few batches (using pixel values)
                 if save_visualizations and batch_idx < 5:
                     vis_dir = os.path.join(self.output_dir, 'visualizations')
                     os.makedirs(vis_dir, exist_ok=True)
@@ -957,106 +978,81 @@ class LandmarkTrainer:
                         img = std * img + mean
                         img = np.clip(img, 0, 1)
                         
-                        # Get ground truth and predicted landmarks
-                        gt_lm = landmarks[i].cpu().numpy()
-                        pred_lm = pred_landmarks[i].cpu().numpy()
+                        # Get ground truth and predicted landmarks (pixel values)
+                        gt_lm = landmarks_cpu[i].numpy()
+                        pred_lm = pred_landmarks_cpu[i].numpy()
                         
                         # Create visualization
-                        self._visualize_landmarks(
-                            img, gt_lm, pred_lm,
-                            save_path=os.path.join(vis_dir, f'batch{batch_idx}_sample{i}.png')
-                        )
+                        try:
+                            # Use the correct method name if it exists
+                            if hasattr(self, '_save_visualization'):
+                                self._save_visualization(
+                                    img, gt_lm, pred_lm,
+                                    save_path=os.path.join(vis_dir, f'batch{batch_idx}_sample{i}.png')
+                                )
+                            elif hasattr(self, '_visualize_landmarks'): # Keep fallback just in case
+                                self._visualize_landmarks(
+                                    img, gt_lm, pred_lm,
+                                    save_path=os.path.join(vis_dir, f'batch{batch_idx}_sample{i}.png')
+                                )
+                            else:
+                                if batch_idx == 0 and i == 0: # Print warning only once
+                                     print("Warning: Visualization method not found in trainer.")
+                        except Exception as e:
+                             if batch_idx == 0 and i == 0: # Print warning only once
+                                 print(f"Warning: Error during visualization: {e}")
         
-        # Concatenate all predictions and ground truth
-        all_pred_landmarks = torch.cat(all_pred_landmarks, dim=0)
-        all_gt_landmarks = torch.cat(all_gt_landmarks, dim=0)
+        # Concatenate all predictions and ground truth for overall metrics
+        all_pred_landmarks_agg = torch.cat(all_pred_landmarks_agg, dim=0)
+        all_gt_landmarks_agg = torch.cat(all_gt_landmarks_agg, dim=0)
         
-        # Calculate Mean Euclidean Distance (MED)
-        med = mean_euclidean_distance(all_pred_landmarks, all_gt_landmarks, reduction='mean').item()
+        # Calculate Overall Mean Euclidean Distance (MED) in pixels
+        med = mean_euclidean_distance(all_pred_landmarks_agg, all_gt_landmarks_agg, reduction='mean').item()
         
-        # Calculate success rates at different thresholds (2mm, 4mm)
-        success_rate_2mm = landmark_success_rate(all_pred_landmarks, all_gt_landmarks, threshold=2.0).item()
-        success_rate_4mm = landmark_success_rate(all_pred_landmarks, all_gt_landmarks, threshold=4.0).item()
+        # Calculate overall success rates at different thresholds (in pixels)
+        all_distances_flat = torch.sqrt(torch.sum((all_pred_landmarks_agg - all_gt_landmarks_agg) ** 2, dim=2)).view(-1)
+        # Convert thresholds to pixels (assuming 2mm and 4mm are physical distances)
+        # NOTE: Success rates here are based on *pixel* distances. Calibration happens later.
+        success_rate_2px = (all_distances_flat < 2.0).float().mean().item()
+        success_rate_4px = (all_distances_flat < 4.0).float().mean().item()
         
-        # Calculate per-landmark metrics
+        # Calculate per-landmark metrics (in pixels)
         per_landmark_stats = []
         for i in range(self.num_landmarks):
             # Extract landmarks at index i
-            pred_lm_i = all_pred_landmarks[:, i, :]
-            gt_lm_i = all_gt_landmarks[:, i, :]
+            pred_lm_i = all_pred_landmarks_agg[:, i, :]
+            gt_lm_i = all_gt_landmarks_agg[:, i, :]
             
             # Calculate MED for this landmark
-            med_i = torch.sqrt(torch.sum((pred_lm_i - gt_lm_i) ** 2, dim=1)).mean().item()
+            distances_i = torch.sqrt(torch.sum((pred_lm_i - gt_lm_i) ** 2, dim=1))
+            med_i = distances_i.mean().item()
             
-            # Calculate success rates for this landmark
-            success_2mm_i = (torch.sqrt(torch.sum((pred_lm_i - gt_lm_i) ** 2, dim=1)) < 2.0).float().mean().item()
-            success_4mm_i = (torch.sqrt(torch.sum((pred_lm_i - gt_lm_i) ** 2, dim=1)) < 4.0).float().mean().item()
+            # Calculate success rates for this landmark (pixel thresholds)
+            success_2px_i = (distances_i < 2.0).float().mean().item()
+            success_4px_i = (distances_i < 4.0).float().mean().item()
             
             per_landmark_stats.append({
                 'index': i,
-                'med': med_i,
-                'success_rate_2mm': success_2mm_i,
-                'success_rate_4mm': success_4mm_i
+                'med': med_i,           # Pixel MED
+                'success_rate_2mm': success_2px_i, # Note: Name kept for consistency, but it's 2px
+                'success_rate_4mm': success_4px_i  # Note: Name kept for consistency, but it's 4px
             })
         
-        # Save predictions to file if requested
+        # Prepare results dictionary
+        results = {
+            'mean_euclidean_distance': med, # Overall pixel MED
+            'success_rate_2mm': success_rate_2px, # Overall 2px success rate
+            'success_rate_4mm': success_rate_4px, # Overall 4px success rate
+            'per_landmark_stats': per_landmark_stats # Per-landmark pixel stats
+        }
+        
+        # Add detailed predictions if requested
         if save_predictions:
-            pred_file = os.path.join(self.output_dir, 'predictions.pt')
-            torch.save({
-                'predictions': all_pred_landmarks,
-                'ground_truth': all_gt_landmarks
-            }, pred_file)
-            print(f"Saved predictions to {pred_file}")
+            results['predictions'] = detailed_predictions
+            # Optionally save to file here if needed, but calibration needs it in memory
+            # pred_file = os.path.join(self.output_dir, 'predictions_detailed.pt')
+            # torch.save(detailed_predictions, pred_file)
+            # print(f"Saved detailed predictions to {pred_file}")
         
         # Return evaluation metrics
-        return {
-            'mean_euclidean_distance': med,
-            'success_rate_2mm': success_rate_2mm,
-            'success_rate_4mm': success_rate_4mm,
-            'per_landmark_stats': per_landmark_stats
-        }
-    
-    def _save_visualizations(self, images, predictions, targets, output_dir):
-        """
-        Save visualization images
-        
-        Args:
-            images (torch.Tensor): Input images
-            predictions (torch.Tensor): Predicted landmarks
-            targets (torch.Tensor): Ground truth landmarks
-            output_dir (str): Directory to save visualizations
-        """
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Convert tensors to numpy
-        images = images.cpu().permute(0, 2, 3, 1).numpy()
-        predictions = predictions.cpu().numpy()
-        targets = targets.cpu().numpy()
-        
-        # Denormalize images if needed
-        if images.max() <= 1.0:
-            images = np.clip(images, 0, 1)
-        else:
-            images = np.clip(images / 255.0, 0, 1)
-        
-        # Plot each image in the batch
-        batch_size = images.shape[0]
-        for i in range(min(batch_size, 4)):  # Limit to 4 images per batch
-            plt.figure(figsize=(10, 10))
-            plt.imshow(images[i])
-            
-            # Plot predicted landmarks
-            plt.scatter(predictions[i, :, 0], predictions[i, :, 1], 
-                       c='blue', marker='o', label='Predicted')
-            
-            # Plot ground truth landmarks
-            plt.scatter(targets[i, :, 0], targets[i, :, 1], 
-                       c='red', marker='x', label='Ground Truth')
-            
-            plt.title(f'Landmark Detection Results')
-            plt.legend()
-            plt.axis('off')
-            
-            # Save figure
-            plt.savefig(os.path.join(output_dir, f'sample_{i}.png'))
-            plt.close() 
+        return results 
