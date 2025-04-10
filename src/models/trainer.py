@@ -166,6 +166,11 @@ class LandmarkTrainer:
             use_refinement=use_refinement,
             heatmap_weight=initial_heatmap_weight if use_weight_schedule else heatmap_weight,
             coord_weight=initial_coord_weight if use_weight_schedule else coord_weight,
+            output_size=self.output_size,
+            image_size=self.image_size,
+            use_loss_normalization=self.use_loss_normalization,
+            norm_decay=self.norm_decay,
+            norm_epsilon=self.norm_epsilon,
             target_landmark_indices=target_landmark_indices,
             landmark_weights=landmark_weights
         )
