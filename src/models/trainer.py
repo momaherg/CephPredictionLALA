@@ -696,6 +696,417 @@ class LandmarkTrainer:
                 print(f"Warning: Current scheduler type ({self.scheduler_type}) differs from saved checkpoint ({checkpoint.get('scheduler_type')}).")
                 print("Scheduler state not loaded.")
     
+    def freeze_backbone(self):
+        """
+        Freeze the HRNet backbone parameters so they won't be updated during training.
+        """
+        print("Freezing HRNet backbone parameters...")
+        for param in self.model.hrnet.parameters():
+            param.requires_grad = False
+        
+        # Count trainable parameters to verify
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Model has {trainable_params:,} trainable parameters out of {total_params:,} total parameters.")
+    
+    def unfreeze_backbone(self):
+        """
+        Unfreeze the HRNet backbone parameters so they will be updated during training.
+        """
+        print("Unfreezing HRNet backbone parameters...")
+        for param in self.model.hrnet.parameters():
+            param.requires_grad = True
+        
+        # Count trainable parameters to verify
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Model has {trainable_params:,} trainable parameters out of {total_params:,} total parameters.")
+    
+    def freeze_refinement_mlp(self):
+        """
+        Freeze the refinement MLP parameters so they won't be updated during training.
+        """
+        if not self.use_refinement:
+            print("Warning: Refinement MLP is not enabled, nothing to freeze.")
+            return
+        
+        print("Freezing refinement MLP parameters...")
+        for param in self.model.refinement_mlp.parameters():
+            param.requires_grad = False
+        
+        # Count trainable parameters to verify
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Model has {trainable_params:,} trainable parameters out of {total_params:,} total parameters.")
+    
+    def unfreeze_refinement_mlp(self):
+        """
+        Unfreeze the refinement MLP parameters so they will be updated during training.
+        """
+        if not self.use_refinement:
+            print("Warning: Refinement MLP is not enabled, nothing to unfreeze.")
+            return
+        
+        print("Unfreezing refinement MLP parameters...")
+        for param in self.model.refinement_mlp.parameters():
+            param.requires_grad = True
+        
+        # Count trainable parameters to verify
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Model has {trainable_params:,} trainable parameters out of {total_params:,} total parameters.")
+    
+    def update_learning_rate(self, new_lr):
+        """
+        Update the learning rate of the optimizer
+        
+        Args:
+            new_lr (float): New learning rate
+        """
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = new_lr
+        print(f"Updated learning rate to {new_lr}")
+    
+    def reset_optimizer(self, learning_rate=None):
+        """
+        Reset the optimizer with potentially a new learning rate
+        
+        Args:
+            learning_rate (float, optional): New learning rate. If None, uses the current learning rate.
+        """
+        if learning_rate is None:
+            learning_rate = self.optimizer.param_groups[0]['lr']
+        
+        print(f"Resetting optimizer with learning rate: {learning_rate}")
+        
+        # Create a new optimizer based on the original type
+        if self.optimizer_type == 'adam':
+            self.optimizer = optim.Adam(
+                filter(lambda p: p.requires_grad, self.model.parameters()),
+                lr=learning_rate, 
+                weight_decay=self.optimizer.param_groups[0]['weight_decay']
+            )
+        elif self.optimizer_type == 'adamw':
+            self.optimizer = optim.AdamW(
+                filter(lambda p: p.requires_grad, self.model.parameters()),
+                lr=learning_rate, 
+                weight_decay=self.optimizer.param_groups[0]['weight_decay']
+            )
+        elif self.optimizer_type == 'sgd':
+            self.optimizer = optim.SGD(
+                filter(lambda p: p.requires_grad, self.model.parameters()),
+                lr=learning_rate, 
+                momentum=self.optimizer.param_groups[0].get('momentum', 0.9),
+                weight_decay=self.optimizer.param_groups[0]['weight_decay'],
+                nesterov=self.optimizer.param_groups[0].get('nesterov', False)
+            )
+        
+        # Reset the scheduler if needed
+        if self.scheduler_type:
+            # Need to pass steps_per_epoch and num_epochs for OneCycleLR
+            self._setup_scheduler()
+
+    def _setup_scheduler(self, scheduler_type=None, steps_per_epoch=None, num_epochs=None):
+        """
+        Set up the learning rate scheduler
+        
+        Args:
+            scheduler_type (str, optional): Type of scheduler to use. If None, uses self.scheduler_type.
+            steps_per_epoch (int, optional): Number of steps per epoch. Required for OneCycleLR.
+            num_epochs (int, optional): Number of epochs. Required for OneCycleLR and CosineAnnealing.
+        """
+        scheduler_type = scheduler_type or self.scheduler_type
+        if not scheduler_type:
+            return
+        
+        # Get current optimizer parameters
+        lr = self.optimizer.param_groups[0]['lr']
+        
+        if scheduler_type == 'cosine':
+            t_max = num_epochs if num_epochs else 10
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=t_max, eta_min=lr/10
+            )
+            print(f"Set up CosineAnnealingLR scheduler with T_max={t_max}")
+        
+        elif scheduler_type == 'plateau':
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='min', factor=0.5, 
+                patience=5, verbose=True, min_lr=lr/100
+            )
+            print(f"Set up ReduceLROnPlateau scheduler")
+            
+        elif scheduler_type == 'onecycle':
+            # We need steps_per_epoch and num_epochs for OneCycleLR
+            if steps_per_epoch is None or num_epochs is None:
+                print("WARNING: OneCycleLR requires steps_per_epoch and num_epochs. Scheduler not created.")
+                self.scheduler = None
+                return
+                
+            total_steps = steps_per_epoch * num_epochs
+            max_lr = lr * 10  # Default: 10x the base learning rate
+            
+            self.scheduler = optim.lr_scheduler.OneCycleLR(
+                self.optimizer, max_lr=max_lr, total_steps=total_steps,
+                pct_start=0.3, div_factor=25.0, 
+                final_div_factor=1e4
+            )
+            print(f"Set up OneCycleLR scheduler with total_steps={total_steps}, max_lr={max_lr}")
+    
+    def reset_phase_state(self, learning_rate=None):
+        """
+        Reset the phase-specific state (optimizer, scheduler, loss weights)
+        
+        Args:
+            learning_rate (float, optional): Learning rate for the new phase
+        """
+        # Reset optimizer and scheduler
+        self.reset_optimizer(learning_rate)
+        
+        # Reset loss weights to initial values if using weight scheduling
+        if self.use_weight_schedule:
+            self.current_heatmap_weight = self.initial_heatmap_weight
+            self.current_coord_weight = self.initial_coord_weight
+            # Also update criterion weights
+            if self.use_refinement and hasattr(self.criterion, 'heatmap_weight'):
+                self.criterion.heatmap_weight = self.current_heatmap_weight
+                self.criterion.coord_weight = self.current_coord_weight
+        
+        # Reset history
+        self.history = {
+            'train_loss': [],
+            'val_loss': [],
+            'train_heatmap_loss': [],
+            'val_heatmap_loss': [],
+            'train_coord_loss': [],
+            'val_coord_loss': [],
+            'train_med': [],
+            'val_med': [],
+            'heatmap_weight': [],
+            'coord_weight': [],
+            'learning_rate': [],
+            'train_med_specific': {},
+            'val_med_specific': {}
+        }
+
+    def multi_phase_train(self, train_loader, val_loader, 
+                         phase1_epochs=20, phase1_lr=1e-4,
+                         phase2_epochs=15, phase2_lr=5e-4,
+                         phase3_epochs=10, phase3_lr=1e-5,
+                         scheduler_type=None, save_freq=5):
+        """
+        Train the model using a three-phase approach:
+        1. Train HRNet + heatmap layer with frozen refinement MLP
+        2. Freeze HRNet, train refinement MLP only
+        3. Unfreeze everything and finetune with lower learning rate
+        
+        Args:
+            train_loader (DataLoader): DataLoader for training data
+            val_loader (DataLoader): DataLoader for validation data
+            phase1_epochs (int): Number of epochs for phase 1
+            phase1_lr (float): Learning rate for phase 1
+            phase2_epochs (int): Number of epochs for phase 2
+            phase2_lr (float): Learning rate for phase 2
+            phase3_epochs (int): Number of epochs for phase 3
+            phase3_lr (float): Learning rate for phase 3
+            scheduler_type (str): Type of scheduler to use ('cosine', 'plateau', 'onecycle', or None)
+            save_freq (int): Frequency of saving model checkpoints
+            
+        Returns:
+            dict: Training history with a combined flat structure for plotting
+        """
+        # Override scheduler_type if provided
+        original_scheduler_type = self.scheduler_type
+        if scheduler_type is not None:
+            self.scheduler_type = scheduler_type
+            
+        # Ensure we have a refinement MLP for phases 2 and 3
+        if not self.use_refinement:
+            print("Warning: Refinement MLP is not enabled. Only phase 1 will be meaningful.")
+            
+        # Store separate histories for each phase
+        phase_histories = {
+            'phase1': None,
+            'phase2': None,
+            'phase3': None
+        }
+        
+        # Set up output directories for each phase
+        phase1_dir = os.path.join(self.output_dir, 'phase1_backbone')
+        phase2_dir = os.path.join(self.output_dir, 'phase2_refinement')
+        phase3_dir = os.path.join(self.output_dir, 'phase3_finetune')
+        
+        os.makedirs(phase1_dir, exist_ok=True)
+        os.makedirs(phase2_dir, exist_ok=True)
+        os.makedirs(phase3_dir, exist_ok=True)
+        
+        # Make a copy of the original output directory
+        original_output_dir = self.output_dir
+        
+        # Preserve original history if any
+        original_history = self.history.copy() if self.history else None
+        
+        # Phase 1: Train HRNet backbone with heatmap loss
+        print("\n" + "="*50)
+        print("Phase 1: Training HRNet backbone with heatmap loss")
+        print("="*50)
+        
+        # If refinement MLP exists, freeze it for phase 1
+        if self.use_refinement:
+            self.freeze_refinement_mlp()
+        
+        # Reset phase state with phase 1 learning rate
+        self.reset_phase_state(phase1_lr)
+        
+        # Set output directory to phase 1
+        self.output_dir = phase1_dir
+        
+        # Setup scheduler with appropriate steps_per_epoch for OneCycleLR
+        if self.scheduler_type == 'onecycle':
+            self._setup_scheduler(
+                steps_per_epoch=len(train_loader),
+                num_epochs=phase1_epochs
+            )
+        
+        # Train for phase 1
+        phase1_history = self.train(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            num_epochs=phase1_epochs,
+            save_freq=save_freq
+        )
+        
+        # Save phase 1 model
+        self.save_checkpoint(os.path.join(phase1_dir, 'phase1_final.pth'))
+        phase_histories['phase1'] = phase1_history
+        
+        # Phase 2: Freeze HRNet, train refinement MLP
+        if self.use_refinement:
+            print("\n" + "="*50)
+            print("Phase 2: Freezing HRNet backbone, training refinement MLP only")
+            print("="*50)
+            
+            # Freeze backbone, unfreeze refinement MLP
+            self.freeze_backbone()
+            self.unfreeze_refinement_mlp()
+            
+            # Reset phase state with phase 2 learning rate
+            self.reset_phase_state(phase2_lr)
+            
+            # Set output directory to phase 2
+            self.output_dir = phase2_dir
+            
+            # Setup scheduler with appropriate steps_per_epoch for OneCycleLR
+            if self.scheduler_type == 'onecycle':
+                self._setup_scheduler(
+                    steps_per_epoch=len(train_loader),
+                    num_epochs=phase2_epochs
+                )
+            
+            # Train for phase 2
+            phase2_history = self.train(
+                train_loader=train_loader,
+                val_loader=val_loader,
+                num_epochs=phase2_epochs,
+                save_freq=save_freq
+            )
+            
+            # Save phase 2 model
+            self.save_checkpoint(os.path.join(phase2_dir, 'phase2_final.pth'))
+            phase_histories['phase2'] = phase2_history
+            
+            # Phase 3: Unfreeze everything and finetune
+            print("\n" + "="*50)
+            print("Phase 3: Unfreezing all components and finetuning with lower learning rate")
+            print("="*50)
+            
+            # Unfreeze everything
+            self.unfreeze_backbone()
+            self.unfreeze_refinement_mlp()
+            
+            # Reset phase state with phase 3 learning rate
+            self.reset_phase_state(phase3_lr)
+            
+            # Set output directory to phase 3
+            self.output_dir = phase3_dir
+            
+            # Setup scheduler with appropriate steps_per_epoch for OneCycleLR
+            if self.scheduler_type == 'onecycle':
+                self._setup_scheduler(
+                    steps_per_epoch=len(train_loader),
+                    num_epochs=phase3_epochs
+                )
+            
+            # Train for phase 3
+            phase3_history = self.train(
+                train_loader=train_loader,
+                val_loader=val_loader,
+                num_epochs=phase3_epochs,
+                save_freq=save_freq
+            )
+            
+            # Save phase 3 model
+            self.save_checkpoint(os.path.join(phase3_dir, 'phase3_final.pth'))
+            phase_histories['phase3'] = phase3_history
+        
+        # Restore original output directory
+        self.output_dir = original_output_dir
+        
+        # Restore original scheduler type
+        self.scheduler_type = original_scheduler_type
+        
+        # Save combined final model
+        self.save_checkpoint(os.path.join(original_output_dir, 'final_model.pth'))
+        
+        # If we did the full 3-phase training, save a consolidated model with best weights
+        if self.use_refinement and phase3_epochs > 0:
+            # Find best model from phase 3
+            try:
+                best_model_path = os.path.join(phase3_dir, 'best_model_med.pth')
+                if not os.path.exists(best_model_path):
+                    best_model_path = os.path.join(phase3_dir, 'best_model_loss.pth')
+                if not os.path.exists(best_model_path):
+                    best_model_path = os.path.join(phase3_dir, 'phase3_final.pth')
+                
+                if os.path.exists(best_model_path):
+                    # Load best phase 3 model
+                    self.load_checkpoint(best_model_path)
+                    # Save as best overall model
+                    self.save_checkpoint(os.path.join(original_output_dir, 'best_model.pth'))
+                    print(f"Saved best overall model from phase 3 to {os.path.join(original_output_dir, 'best_model.pth')}")
+                else:
+                    print("Warning: Could not find best phase 3 model.")
+            except Exception as e:
+                print(f"Warning: Error while trying to save best overall model: {str(e)}")
+        
+        # Create a flattened history for plotting
+        # Choose the appropriate phase history to return
+        # By default, use the final phase if available
+        plot_history = None
+        if self.use_refinement:
+            if phase3_epochs > 0 and phase_histories['phase3'] is not None:
+                plot_history = phase_histories['phase3']
+            elif phase2_epochs > 0 and phase_histories['phase2'] is not None:
+                plot_history = phase_histories['phase2']
+            else:
+                plot_history = phase_histories['phase1']
+        else:
+            plot_history = phase_histories['phase1']
+            
+        # Restore original history if it existed
+        if original_history:
+            self.history = original_history.copy()
+        
+        print("\n" + "="*50)
+        print("Multi-phase training completed!")
+        print("="*50)
+        
+        # For convenience, return both the phase-specific histories and the flattened one for plotting
+        return {
+            'phases': phase_histories,
+            'plot': plot_history
+        }
+    
     def evaluate(self, test_loader, save_visualizations=True, landmark_names=None, landmark_cols=None):
         """
         Evaluate the model on test data

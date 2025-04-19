@@ -86,6 +86,20 @@ FINAL_HEATMAP_WEIGHT = 0.5  # Final weight for heatmap loss in schedule
 FINAL_COORD_WEIGHT = 1.0  # Final weight for coordinate loss in schedule
 WEIGHT_SCHEDULE_EPOCHS = 30  # Number of epochs to transition from initial to final weights
 
+# Multi-phase training parameters
+ENABLE_MULTI_PHASE_TRAINING = True  # Whether to use the three-phase training approach
+# Phase 1: HRNet + Heatmap loss
+PHASE1_EPOCHS = 25  # Number of epochs for phase 1
+PHASE1_LR = 1e-4    # Learning rate for phase 1
+# Phase 2: Freeze HRNet, train refinement MLP only
+PHASE2_EPOCHS = 15  # Number of epochs for phase 2
+PHASE2_LR = 5e-4    # Learning rate for phase 2 (can be higher since MLP trains faster)
+# Phase 3: Finetune entire model
+PHASE3_EPOCHS = 10  # Number of epochs for phase 3
+PHASE3_LR = 1e-5    # Learning rate for phase 3 (lower for finetuning)
+# Use same scheduler type for all phases
+PHASE_SCHEDULER_TYPE = SCHEDULER_TYPE  # Can use the same scheduler for all phases
+
 # Class balancing parameters
 BALANCE_CLASSES = True  # Whether to balance training data based on skeletal classes
 BALANCE_METHOD = 'upsample'  # 'upsample' or 'downsample'
@@ -473,12 +487,37 @@ else:
 # %%
 # Train the model
 print("Starting training...")
-history = trainer.train(
-    train_loader=train_loader,
-    val_loader=val_loader,
-    num_epochs=NUM_EPOCHS,
-    save_freq=SAVE_FREQ
-)
+if ENABLE_MULTI_PHASE_TRAINING:
+    print("Using multi-phase training approach:")
+    print(f"  Phase 1: Train backbone - {PHASE1_EPOCHS} epochs, LR={PHASE1_LR}")
+    print(f"  Phase 2: Train refinement MLP - {PHASE2_EPOCHS} epochs, LR={PHASE2_LR}")
+    print(f"  Phase 3: Finetune all - {PHASE3_EPOCHS} epochs, LR={PHASE3_LR}")
+    
+    training_result = trainer.multi_phase_train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        phase1_epochs=PHASE1_EPOCHS,
+        phase1_lr=PHASE1_LR,
+        phase2_epochs=PHASE2_EPOCHS,
+        phase2_lr=PHASE2_LR,
+        phase3_epochs=PHASE3_EPOCHS,
+        phase3_lr=PHASE3_LR,
+        scheduler_type=PHASE_SCHEDULER_TYPE,
+        save_freq=SAVE_FREQ
+    )
+    
+    # Get the flattened history for plotting
+    plot_history = training_result['plot']
+    history = training_result['phases']  # Store full phase histories for reference
+else:
+    print(f"Using standard training approach with {NUM_EPOCHS} epochs")
+    history = trainer.train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        num_epochs=NUM_EPOCHS,
+        save_freq=SAVE_FREQ
+    )
+    plot_history = history
 
 # %% [markdown]
 # ## 9. Evaluate the Model
@@ -503,8 +542,8 @@ plt.figure(figsize=(15, 10))
 
 # Plot loss
 plt.subplot(2, 2, 1)
-plt.plot(history['train_loss'], label='Train Loss')
-plt.plot(history['val_loss'], label='Val Loss')
+plt.plot(plot_history['train_loss'], label='Train Loss')
+plt.plot(plot_history['val_loss'], label='Val Loss')
 plt.title('Training and Validation Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
@@ -512,8 +551,8 @@ plt.legend()
 
 # Plot MED
 plt.subplot(2, 2, 2)
-plt.plot(history['train_med'], label='Train MED')
-plt.plot(history['val_med'], label='Val MED')
+plt.plot(plot_history['train_med'], label='Train MED')
+plt.plot(plot_history['val_med'], label='Val MED')
 plt.title('Mean Euclidean Distance')
 plt.xlabel('Epoch')
 plt.ylabel('Pixels')
@@ -522,26 +561,26 @@ plt.legend()
 if USE_REFINEMENT:
     # Plot component losses
     plt.subplot(2, 2, 3)
-    plt.plot(history['train_heatmap_loss'], label='Train Heatmap Loss')
-    plt.plot(history['val_heatmap_loss'], label='Val Heatmap Loss')
+    plt.plot(plot_history['train_heatmap_loss'], label='Train Heatmap Loss')
+    plt.plot(plot_history['val_heatmap_loss'], label='Val Heatmap Loss')
     plt.title('Heatmap Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
     
     plt.subplot(2, 2, 4)
-    plt.plot(history['train_coord_loss'], label='Train Coord Loss')
-    plt.plot(history['val_coord_loss'], label='Val Coord Loss')
+    plt.plot(plot_history['train_coord_loss'], label='Train Coord Loss')
+    plt.plot(plot_history['val_coord_loss'], label='Val Coord Loss')
     plt.title('Coordinate Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
 
     # Add a figure for weight schedule visualization if using weight scheduling
-    if USE_WEIGHT_SCHEDULE and 'heatmap_weight' in history and 'coord_weight' in history:
+    if USE_WEIGHT_SCHEDULE and 'heatmap_weight' in plot_history and 'coord_weight' in plot_history:
         plt.figure(figsize=(10, 6))
-        plt.plot(history['heatmap_weight'], label='Heatmap Weight')
-        plt.plot(history['coord_weight'], label='Coordinate Weight')
+        plt.plot(plot_history['heatmap_weight'], label='Heatmap Weight')
+        plt.plot(plot_history['coord_weight'], label='Coordinate Weight')
         plt.title('Loss Weight Schedule')
         plt.xlabel('Epoch')
         plt.ylabel('Weight Value')

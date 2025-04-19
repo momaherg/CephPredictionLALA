@@ -259,24 +259,42 @@ class LandmarkHeatmapNet(nn.Module):
             # This is less ideal but works if feature_info is not available
             print("Warning: Backbone does not have feature_info. Performing dummy forward pass to determine heatmap layer input channels.")
             with torch.no_grad():
-                # Create a dummy input tensor on the correct device
-                # Assuming input size 224x224, modify if different
+                # Create a dummy input tensor on CPU first
                 dummy_input = torch.randn(1, 3, 224, 224)
+                
+                # Handle device placement safely
+                # 1. Get the device from the backbone's first parameter if available
                 try:
-                    # Try moving dummy input to model's device (if parameters exist)
-                    model_device = next(self.hrnet.parameters()).device
-                    dummy_input = dummy_input.to(model_device)
-                except StopIteration:
-                    # Model has no parameters yet, use CPU
+                    model_params = list(self.hrnet.parameters())
+                    if model_params:
+                        model_device = model_params[0].device
+                        # Move both the dummy input and model to the same device if needed
+                        dummy_input = dummy_input.to(model_device)
+                    else:
+                        # No parameters yet, default to CPU and move model there explicitly
+                        model_device = torch.device('cpu')
+                        dummy_input = dummy_input.to(model_device)
+                        self.hrnet = self.hrnet.to(model_device)
+                except Exception as e:
+                    print(f"Warning: Error determining device for dummy forward pass: {str(e)}. Using CPU.")
                     model_device = torch.device('cpu')
                     dummy_input = dummy_input.to(model_device)
-                    # Also ensure model is on CPU if it has no parameters yet
-                    self.hrnet = self.hrnet.to(model_device)
+                    # Try to ensure model is on the same device
+                    try:
+                        self.hrnet = self.hrnet.to(model_device)
+                    except:
+                        pass  # If this fails, we'll let the forward pass itself handle errors
                 
-                features = self.hrnet(dummy_input)
-                if isinstance(features, list):
-                    features = features[-1]
-                in_channels = features.shape[1]
+                # Perform dummy forward pass
+                try:
+                    features = self.hrnet(dummy_input)
+                    if isinstance(features, list):
+                        features = features[-1]
+                    in_channels = features.shape[1]
+                except Exception as e:
+                    # If forward pass fails, fall back to a reasonable default
+                    print(f"Warning: Dummy forward pass failed: {str(e)}. Using default channel count of 256.")
+                    in_channels = 256  # Reasonable default for HRNet
         
         # We'll create the heatmap layer after we know the channel size
         # Create the heatmap layer now
