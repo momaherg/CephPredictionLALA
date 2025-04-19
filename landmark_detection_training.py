@@ -25,7 +25,8 @@ from torchvision import transforms
 
 # Add the src directory to the path for imports
 import sys
-sys.path.append('./src')
+sys.path.append('/content/CephPredictionLALA/')
+
 
 # Import model and training components
 from src.models.hrnet import create_hrnet_model
@@ -62,7 +63,7 @@ set_seed(42)
 
 # %%
 # Data parameters
-DATA_PATH = "data/train_data.csv"  # Path to your dataset
+DATA_PATH = "/content/drive/MyDrive/Lala's Masters/preprocessed_data_with_depth.pkl"  # Path to your dataset
 OUTPUT_DIR = "./outputs"
 APPLY_CLAHE = True  # Whether to apply Contrast Limited Adaptive Histogram Equalization
 
@@ -101,7 +102,7 @@ USE_MPS = (platform.system() == 'Darwin')  # Automatically use MPS for Mac
 NUM_WORKERS = 0  # Use 0 for single process (more stable)
 
 # Learning rate scheduler parameters
-SCHEDULER_TYPE = 'cosine'  # 'cosine', 'plateau', 'onecycle', or None
+SCHEDULER_TYPE = 'plateau'  # 'cosine', 'plateau', 'onecycle', or None
 LR_PATIENCE = 5  # Patience for ReduceLROnPlateau
 LR_FACTOR = 0.5  # Factor to reduce learning rate for ReduceLROnPlateau
 LR_MIN = 1e-6  # Minimum learning rate for schedulers
@@ -161,14 +162,14 @@ else:
 # %%
 # Define landmark columns - adjust based on your specific dataset
 landmark_cols = ['sella_x', 'sella_y', 'nasion_x', 'nasion_y', 'A point_x', 'A point_y',
-                'B point_x', 'B point_y', 'upper 1 tip_x', 'upper 1 tip_y',
-                'upper 1 apex_x', 'upper 1 apex_y', 'lower 1 tip_x', 'lower 1 tip_y',
-                'lower 1 apex_x', 'lower 1 apex_y', 'ANS_x', 'ANS_y', 'PNS_x', 'PNS_y',
-                'Gonion _x', 'Gonion _y', 'Menton_x', 'Menton_y', 'ST Nasion_x',
-                'ST Nasion_y', 'Tip of the nose_x', 'Tip of the nose_y', 'Subnasal_x',
-                'Subnasal_y', 'Upper lip_x', 'Upper lip_y', 'Lower lip_x',
-                'Lower lip_y', 'ST Pogonion_x', 'ST Pogonion_y', 'gnathion_x',
-                'gnathion_y']
+       'B point_x', 'B point_y', 'upper 1 tip_x', 'upper 1 tip_y',
+       'upper 1 apex_x', 'upper 1 apex_y', 'lower 1 tip_x', 'lower 1 tip_y',
+       'lower 1 apex_x', 'lower 1 apex_y', 'ANS_x', 'ANS_y', 'PNS_x', 'PNS_y',
+       'Gonion _x', 'Gonion _y', 'Menton_x', 'Menton_y', 'ST Nasion_x',
+       'ST Nasion_y', 'Tip of the nose_x', 'Tip of the nose_y', 'Subnasal_x',
+       'Subnasal_y', 'Upper lip_x', 'Upper lip_y', 'Lower lip_x',
+       'Lower lip_y', 'ST Pogonion_x', 'ST Pogonion_y', 'gnathion_x',
+       'gnathion_y']
 
 # Initialize data processor
 try:
