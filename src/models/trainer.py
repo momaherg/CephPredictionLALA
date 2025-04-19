@@ -89,6 +89,9 @@ class LandmarkTrainer:
             optimizer_type (str): Type of optimizer to use ('adam', 'adamw', 'sgd')
             momentum (float): Momentum factor for SGD optimizer
             nesterov (bool): Whether to use Nesterov momentum for SGD
+            # use_loss_normalization (bool): Normalize loss components before weighting. # Removed
+            # norm_decay (float): Decay factor for loss normalization running average. # Removed
+            # norm_epsilon (float): Epsilon for loss normalization stability. # Removed
             total_steps (int, optional): Total number of training steps, required for OneCycleLR if initialized directly.
             target_landmark_indices (list, optional): Indices of landmarks to focus on during loss calculation.
             landmark_weights (list or numpy array, optional): Weights to apply to each landmark's loss.
@@ -610,7 +613,7 @@ class LandmarkTrainer:
                 self.save_checkpoint(os.path.join(self.output_dir, 'best_model_loss.pth'))
                 print(f"  Saved best model (by loss) with validation loss: {val_loss:.4f}")
             
-            # Also save if best validation MED (this might be a better metric for landmark detection)
+            # Save if best validation MED (this might be a better metric for landmark detection)
             if val_med < best_val_med:
                 best_val_med = val_med
                 self.save_checkpoint(os.path.join(self.output_dir, 'best_model_med.pth'))
@@ -620,16 +623,10 @@ class LandmarkTrainer:
             if (epoch + 1) % save_freq == 0:
                 self.save_checkpoint(os.path.join(self.output_dir, f'checkpoint_epoch_{epoch+1}.pth'))
                 print(f"  Saved checkpoint at epoch {epoch+1}")
-                
-                # Plot training curves at checkpoint epochs
-                self.plot_training_curves()
         
         # Save final model
         self.save_checkpoint(os.path.join(self.output_dir, 'final_model.pth'))
         print(f"Saved final model checkpoint after {num_epochs} epochs")
-        
-        # Plot final training curves
-        self.plot_training_curves()
         
         print(f"Training completed in {time.time() - start_time:.2f} seconds")
     
@@ -698,151 +695,6 @@ class LandmarkTrainer:
             else:
                 print(f"Warning: Current scheduler type ({self.scheduler_type}) differs from saved checkpoint ({checkpoint.get('scheduler_type')}).")
                 print("Scheduler state not loaded.")
-    
-    def plot_training_curves(self):
-        """
-        Plot and save training curves
-        """
-        # Create figures directory
-        figures_dir = os.path.join(self.output_dir, 'figures')
-        os.makedirs(figures_dir, exist_ok=True)
-        
-        # Plot loss curves
-        plt.figure(figsize=(10, 6))
-        plt.plot(self.history['train_loss'], label='Train Loss')
-        plt.plot(self.history['val_loss'], label='Validation Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training and Validation Loss')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(os.path.join(figures_dir, 'loss_curves.png'))
-        plt.close()
-        
-        # Plot heatmap loss curves
-        plt.figure(figsize=(10, 6))
-        plt.plot(self.history['train_heatmap_loss'], label='Train Heatmap Loss')
-        plt.plot(self.history['val_heatmap_loss'], label='Validation Heatmap Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Heatmap Loss')
-        plt.title('Heatmap Loss')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(os.path.join(figures_dir, 'heatmap_loss_curves.png'))
-        plt.close()
-        
-        # Plot coordinate loss curves
-        if self.use_refinement:
-            plt.figure(figsize=(10, 6))
-            plt.plot(self.history['train_coord_loss'], label='Train Coordinate Loss')
-            plt.plot(self.history['val_coord_loss'], label='Validation Coordinate Loss')
-            plt.xlabel('Epoch')
-            plt.ylabel('Coordinate Loss')
-            plt.title('Coordinate Loss')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig(os.path.join(figures_dir, 'coord_loss_curves.png'))
-            plt.close()
-        
-        # Plot MED curves
-        plt.figure(figsize=(10, 6))
-        plt.plot(self.history['train_med'], label='Train MED')
-        plt.plot(self.history['val_med'], label='Validation MED')
-        plt.xlabel('Epoch')
-        plt.ylabel('Mean Euclidean Distance (pixels)')
-        plt.title('Mean Euclidean Distance (MED)')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(os.path.join(figures_dir, 'med_curves.png'))
-        plt.close()
-        
-        # Plot weight schedule if using it
-        if self.use_weight_schedule and len(self.history['heatmap_weight']) > 0:
-            plt.figure(figsize=(10, 6))
-            plt.plot(self.history['heatmap_weight'], label='Heatmap Weight')
-            plt.plot(self.history['coord_weight'], label='Coordinate Weight')
-            plt.xlabel('Epoch')
-            plt.ylabel('Weight Value')
-            plt.title('Loss Weight Schedule')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig(os.path.join(figures_dir, 'weight_schedule.png'))
-            plt.close()
-        
-        # Plot learning rate if available
-        if len(self.history['learning_rate']) > 0:
-            plt.figure(figsize=(10, 6))
-            plt.plot(self.history['learning_rate'])
-            plt.xlabel('Epoch')
-            plt.ylabel('Learning Rate')
-            plt.title(f'Learning Rate Schedule ({self.scheduler_type if self.scheduler_type else "None"})')
-            plt.yscale('log')  # Use log scale to better visualize the changes
-            plt.grid(True)
-            plt.savefig(os.path.join(figures_dir, 'learning_rate_schedule.png'))
-            plt.close()
-            
-        # Plot specific MED if available
-        if self.log_specific_landmark_indices and len(self.history['train_med_specific']) > 0:
-            plt.figure(figsize=(12, 7))
-            num_plots = len(self.log_specific_landmark_indices)
-            # Create subplots dynamically - consider layout if many landmarks
-            cols = min(3, num_plots) # Max 3 columns
-            rows = (num_plots + cols - 1) // cols
-            fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
-            axes = axes.flatten()
-            
-            plot_idx = 0
-            for idx in self.log_specific_landmark_indices:
-                if idx in self.history['train_med_specific'] and idx in self.history['val_med_specific']:
-                    ax = axes[plot_idx]
-                    ax.plot(self.history['train_med_specific'][idx], label=f'Train MED')
-                    ax.plot(self.history['val_med_specific'][idx], label=f'Valid MED')
-                    ax.set_title(f'Landmark {idx} MED')
-                    ax.set_xlabel('Epoch')
-                    ax.set_ylabel('MED (pixels)')
-                    ax.legend()
-                    ax.grid(True)
-                    plot_idx += 1
-            
-            # Hide unused subplots
-            for i in range(plot_idx, len(axes)):
-                fig.delaxes(axes[i])
-                
-            fig.suptitle('Mean Euclidean Distance for Specific Landmarks', fontsize=16)
-            fig.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent title overlap
-            plt.savefig(os.path.join(figures_dir, 'med_specific_curves.png'))
-            plt.close(fig)
-            
-        # Create a combined loss components plot
-        epochs = range(1, len(self.history['train_loss']) + 1)
-        plt.figure(figsize=(12, 8))
-        
-        # Plot combined loss components in one figure for easier comparison
-        plt.subplot(2, 1, 1)
-        plt.plot(epochs, self.history['train_loss'], 'b-', label='Total Loss')
-        plt.plot(epochs, self.history['train_heatmap_loss'], 'g--', label='Heatmap Loss')
-        if self.use_refinement:
-            plt.plot(epochs, self.history['train_coord_loss'], 'r-.', label='Coordinate Loss')
-        plt.title('Training Loss Components')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.grid(True)
-        
-        plt.subplot(2, 1, 2)
-        plt.plot(epochs, self.history['val_loss'], 'b-', label='Total Loss')
-        plt.plot(epochs, self.history['val_heatmap_loss'], 'g--', label='Heatmap Loss')
-        if self.use_refinement:
-            plt.plot(epochs, self.history['val_coord_loss'], 'r-.', label='Coordinate Loss')
-        plt.title('Validation Loss Components')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(figures_dir, 'loss_components.png'))
-        plt.close()
     
     def evaluate(self, test_loader, save_visualizations=True, landmark_names=None, landmark_cols=None):
         """

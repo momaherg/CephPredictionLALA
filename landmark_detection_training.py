@@ -248,11 +248,25 @@ if BALANCE_CLASSES and 'skeletal_class' not in train_df.columns:
     from src.data.patient_classifier import PatientClassifier
     classifier = PatientClassifier(landmark_cols)
     train_df = classifier.classify_patients(train_df)
+    # Also classify val and test sets if using classification later
+    if 'skeletal_class' not in val_df.columns:
+        val_df = classifier.classify_patients(val_df)
+    if 'skeletal_class' not in test_df.columns:
+        test_df = classifier.classify_patients(test_df)
 
 if BALANCE_CLASSES and 'skeletal_class' in train_df.columns:
     print("Balancing training data using skeletal classification...")
-    from src.data.patient_classifier import PatientClassifier
-    classifier = PatientClassifier(landmark_cols)
+    # Classifier should already exist from the check above, or needs to be created if the check wasn't done
+    if 'classifier' not in locals():
+        from src.data.patient_classifier import PatientClassifier
+        classifier = PatientClassifier(landmark_cols)
+        # Ensure val/test are classified if train wasn't classified before balancing
+        if 'skeletal_class' not in train_df.columns:
+             train_df = classifier.classify_patients(train_df)
+        if 'skeletal_class' not in val_df.columns:
+            val_df = classifier.classify_patients(val_df)
+        if 'skeletal_class' not in test_df.columns:
+            test_df = classifier.classify_patients(test_df)
     
     # Show original class distribution
     train_class_counts = train_df['skeletal_class'].value_counts().sort_index()

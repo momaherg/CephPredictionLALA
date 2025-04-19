@@ -249,8 +249,39 @@ class LandmarkHeatmapNet(nn.Module):
         # HRNet backbone
         self.hrnet = HRNet(pretrained=pretrained, hrnet_type=hrnet_type)
         
+        # Determine backbone output channels for heatmap layer
+        # Check if the backbone has feature_info (common in timm models)
+        if hasattr(self.hrnet.backbone, 'feature_info'):
+            # Get the number of channels from the last feature map (highest resolution)
+            in_channels = self.hrnet.backbone.feature_info[-1]['num_chs']
+        else:
+            # Fallback: Perform a dummy forward pass to get the shape
+            # This is less ideal but works if feature_info is not available
+            print("Warning: Backbone does not have feature_info. Performing dummy forward pass to determine heatmap layer input channels.")
+            with torch.no_grad():
+                # Create a dummy input tensor on the correct device
+                # Assuming input size 224x224, modify if different
+                dummy_input = torch.randn(1, 3, 224, 224)
+                try:
+                    # Try moving dummy input to model's device (if parameters exist)
+                    model_device = next(self.hrnet.parameters()).device
+                    dummy_input = dummy_input.to(model_device)
+                except StopIteration:
+                    # Model has no parameters yet, use CPU
+                    model_device = torch.device('cpu')
+                    dummy_input = dummy_input.to(model_device)
+                    # Also ensure model is on CPU if it has no parameters yet
+                    self.hrnet = self.hrnet.to(model_device)
+                
+                features = self.hrnet(dummy_input)
+                if isinstance(features, list):
+                    features = features[-1]
+                in_channels = features.shape[1]
+        
         # We'll create the heatmap layer after we know the channel size
-        self.heatmap_layer = None
+        # Create the heatmap layer now
+        self.heatmap_layer = nn.Conv2d(in_channels, self.num_landmarks, kernel_size=1, stride=1, padding=0)
+        print(f"Created heatmap layer with {in_channels} input channels")
         
         # Refinement MLP
         if use_refinement:
