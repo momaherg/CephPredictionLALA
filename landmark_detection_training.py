@@ -119,11 +119,6 @@ OPTIMIZER_TYPE = 'adam'  # 'adam', 'adamw', or 'sgd'
 MOMENTUM = 0.9  # Momentum factor for SGD optimizer
 NESTEROV = True  # Whether to use Nesterov momentum for SGD optimizer
 
-# Loss Normalization parameters
-USE_LOSS_NORMALIZATION = True  # Normalize losses before weighting
-NORM_DECAY = 0.99  # Decay factor for running average
-NORM_EPSILON = 1e-6  # Epsilon for numerical stability
-
 # Per-Landmark Weighting/Focusing Parameters
 TARGET_LANDMARK_INDICES = None  # e.g., [0, 1, 10] to focus on Sella, Nasion, Gonion
 LANDMARK_WEIGHTS = None # e.g., [2.0, 1.0, ..., 1.0] (list/array of length NUM_LANDMARKS)
@@ -352,10 +347,6 @@ trainer = LandmarkTrainer(
     optimizer_type=OPTIMIZER_TYPE,
     momentum=MOMENTUM,
     nesterov=NESTEROV,
-    # Loss normalization parameters
-    use_loss_normalization=USE_LOSS_NORMALIZATION,
-    norm_decay=NORM_DECAY,
-    norm_epsilon=NORM_EPSILON,
     # Per-Landmark Weighting/Focusing
     target_landmark_indices=TARGET_LANDMARK_INDICES,
     landmark_weights=LANDMARK_WEIGHTS,
@@ -670,9 +661,6 @@ model_config = {
     'optimizer_type': OPTIMIZER_TYPE,
     'momentum': MOMENTUM,
     'nesterov': NESTEROV,
-    'use_loss_normalization': USE_LOSS_NORMALIZATION,
-    'norm_decay': NORM_DECAY,
-    'norm_epsilon': NORM_EPSILON,
     'target_landmark_indices': TARGET_LANDMARK_INDICES,
     'landmark_weights': LANDMARK_WEIGHTS,
     'log_specific_landmark_indices': LOG_SPECIFIC_LANDMARK_INDICES

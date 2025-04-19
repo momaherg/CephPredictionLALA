@@ -52,10 +52,7 @@ class LandmarkTrainer:
                  optimizer_type='adam',
                  momentum=0.9,
                  nesterov=True,
-                 # Loss normalization parameters
-                 use_loss_normalization=True,
-                 norm_decay=0.99,
-                 norm_epsilon=1e-6,
+                 # Loss normalization parameters removed
                  total_steps=None,
                  target_landmark_indices=None,
                  landmark_weights=None,
@@ -92,9 +89,6 @@ class LandmarkTrainer:
             optimizer_type (str): Type of optimizer to use ('adam', 'adamw', 'sgd')
             momentum (float): Momentum factor for SGD optimizer
             nesterov (bool): Whether to use Nesterov momentum for SGD
-            use_loss_normalization (bool): Normalize loss components before weighting.
-            norm_decay (float): Decay factor for loss normalization running average.
-            norm_epsilon (float): Epsilon for loss normalization stability.
             total_steps (int, optional): Total number of training steps, required for OneCycleLR if initialized directly.
             target_landmark_indices (list, optional): Indices of landmarks to focus on during loss calculation.
             landmark_weights (list or numpy array, optional): Weights to apply to each landmark's loss.
@@ -230,9 +224,6 @@ class LandmarkTrainer:
                 coord_weight=self.current_coord_weight,
                 output_size=(64, 64),   # Heatmap size
                 image_size=(224, 224),  # Original image size
-                use_loss_normalization=use_loss_normalization,
-                norm_decay=norm_decay,
-                norm_epsilon=norm_epsilon,
                 target_landmark_indices=self.target_landmark_indices,
                 landmark_weights=self.landmark_weights_tensor
             )
@@ -241,9 +232,6 @@ class LandmarkTrainer:
             self.criterion = AdaptiveWingLoss(
                  target_landmark_indices=self.target_landmark_indices,
                  landmark_weights=self.landmark_weights_tensor,
-                 use_loss_normalization=use_loss_normalization,
-                 norm_decay=norm_decay,
-                 norm_epsilon=norm_epsilon
             )
         
         # Create heatmap generator

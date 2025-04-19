@@ -16,8 +16,7 @@ class AdaptiveWingLoss(nn.Module):
     Regression", ICCV 2019
     """
     def __init__(self, alpha=2.1, omega=14, epsilon=1, theta=0.5, 
-                 target_landmark_indices=None, landmark_weights=None,
-                 use_loss_normalization=False, norm_decay=0.99, norm_epsilon=1e-6):
+                 target_landmark_indices=None, landmark_weights=None):
         """
         Initialize Adaptive Wing Loss
         
@@ -30,9 +29,6 @@ class AdaptiveWingLoss(nn.Module):
                                                     If None, computes loss for all landmarks.
             landmark_weights (torch.Tensor, optional): Tensor of weights for each landmark.
                                                      If None, assumes equal weight 1.0.
-            use_loss_normalization (bool): Whether to normalize loss before applying weights.
-            norm_decay (float): Decay factor for running average normalization.
-            norm_epsilon (float): Epsilon for numerical stability in normalization.
         """
         super(AdaptiveWingLoss, self).__init__()
         self.alpha = alpha
@@ -41,19 +37,9 @@ class AdaptiveWingLoss(nn.Module):
         self.theta = theta
         self.target_landmark_indices = target_landmark_indices
         self.landmark_weights = landmark_weights
-        
-        # Normalization parameters
-        self.use_loss_normalization = use_loss_normalization
-        self.norm_decay = norm_decay
-        self.norm_epsilon = norm_epsilon
-        
-        # Initialize normalization buffers if needed
-        if use_loss_normalization:
-            self.register_buffer('running_avg_loss', torch.tensor(1.0))
-            self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
     
     def _apply_weights_and_normalize(self, losses):
-        """Apply landmark weights and normalization to per-landmark losses."""
+        """Apply landmark weights to per-landmark losses."""
         B, C, H, W = losses.shape
         
         # 1. Apply per-landmark weights
@@ -86,32 +72,6 @@ class AdaptiveWingLoss(nn.Module):
             
             # Apply weights
             losses = losses * weights
-        
-        # 2. Apply normalization if enabled
-        if self.use_loss_normalization:
-            # Calculate batch mean of the (potentially weighted) loss
-            batch_mean = torch.mean(losses)
-            
-            # Initialize running average for the first batch
-            if self.training and self.num_batches_tracked == 0:
-                self.running_avg_loss = batch_mean.detach().clone()
-            
-            # Update running average with decay - only in training mode
-            if self.training:
-                self.num_batches_tracked += 1
-                self.running_avg_loss = (self.norm_decay * self.running_avg_loss + 
-                                        (1 - self.norm_decay) * batch_mean.detach().clone())
-            
-            # Normalize losses - prevent division by very small values
-            # Use bias correction for the running average during the initial phase
-            bias_correction = 1.0 - self.norm_decay ** self.num_batches_tracked if self.training and self.num_batches_tracked > 0 else 1.0
-            avg_loss_corrected = self.running_avg_loss / (bias_correction + 1e-8)
-
-            norm_factor = torch.max(
-                avg_loss_corrected, 
-                torch.tensor(self.norm_epsilon, device=avg_loss_corrected.device)
-            )
-            losses = losses / norm_factor
         
         return losses
         
@@ -240,8 +200,7 @@ class WingLoss(nn.Module):
     Convolutional Neural Networks", CVPR 2018
     """
     def __init__(self, omega=10, epsilon=2,
-                 target_landmark_indices=None, landmark_weights=None,
-                 use_loss_normalization=False, norm_decay=0.99, norm_epsilon=1e-6):
+                 target_landmark_indices=None, landmark_weights=None):
         """
         Initialize Wing Loss
         
@@ -250,9 +209,6 @@ class WingLoss(nn.Module):
             epsilon (float): Parameter that controls the curvature of the non-linear part
             target_landmark_indices (list, optional): List of landmark indices to compute loss for.
             landmark_weights (torch.Tensor, optional): Tensor of weights (shape [N]) for each landmark.
-            use_loss_normalization (bool): Whether loss normalization is active.
-            norm_decay (float): Decay factor if normalization is used.
-            norm_epsilon (float): Epsilon if normalization is used.
         """
         super(WingLoss, self).__init__()
         self.omega = omega
@@ -262,19 +218,9 @@ class WingLoss(nn.Module):
         
         # Pre-compute constant C
         self.C = self.omega - self.omega * np.log(1 + self.omega / self.epsilon)
-        
-        # --- Normalization setup ---
-        self.use_loss_normalization = use_loss_normalization
-        self.norm_decay = norm_decay
-        self.norm_epsilon = norm_epsilon
-        if use_loss_normalization:
-            # Use register_buffer for state that should be saved but not trained
-            self.register_buffer('running_avg_loss', torch.tensor(1.0))
-            self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
-        # --- End Normalization setup ---
-
+    
     def _apply_weights_and_normalize(self, losses):
-        """Helper to apply weights and normalize (if enabled) before mean. Assumes losses shape (B, N, 2)"""
+        """Helper to apply weights (normalization removed). Assumes losses shape (B, N, 2)"""
         B, N, _ = losses.shape
         
         # 1. Apply per-landmark weights
@@ -306,31 +252,6 @@ class WingLoss(nn.Module):
             # Reshape weights for broadcasting: [1, N, 1]
             weights_reshaped = current_weights.view(1, N, 1)
             losses = losses * weights_reshaped # Apply to both x and y
-            
-        # 2. Apply normalization if enabled - similar to AdaptiveWingLoss
-        if self.use_loss_normalization:
-            # Calculate batch mean of weighted loss
-            batch_mean_loss = torch.mean(losses)
-            
-            # Initialize running average for the first batch
-            if self.training and self.num_batches_tracked == 0:
-                self.running_avg_loss = batch_mean_loss.detach().clone()
-            
-            # Update running average (using EMA) - only in training
-            if self.training:
-                self.num_batches_tracked += 1
-                self.running_avg_loss = (self.norm_decay * self.running_avg_loss + 
-                                        (1 - self.norm_decay) * batch_mean_loss.detach().clone())
-            
-            # Normalize losses using a safe denominator with bias correction
-            bias_correction = 1.0 - self.norm_decay ** self.num_batches_tracked if self.training and self.num_batches_tracked > 0 else 1.0
-            avg_loss_corrected = self.running_avg_loss / (bias_correction + 1e-8)
-
-            norm_factor = torch.max(
-                avg_loss_corrected, 
-                torch.tensor(self.norm_epsilon, device=avg_loss_corrected.device)
-            )
-            losses = losses / norm_factor
             
         return losses
 
@@ -423,7 +344,6 @@ class CombinedLoss(nn.Module):
     Combines Adaptive Wing Loss for heatmaps with Wing Loss for coordinates
     """
     def __init__(self, heatmap_weight=1.0, coord_weight=1.0, output_size=(64, 64), image_size=(224, 224),
-                 use_loss_normalization=True, norm_decay=0.99, norm_epsilon=1e-6,
                  target_landmark_indices=None,
                  landmark_weights=None):
         """
@@ -434,9 +354,6 @@ class CombinedLoss(nn.Module):
             coord_weight (float): Overall weight for coordinate loss component.
             output_size (tuple): Size of heatmap output (height, width).
             image_size (tuple): Size of original image (height, width).
-            use_loss_normalization (bool): Whether to enable loss normalization *within* sub-losses.
-            norm_decay (float): Decay factor for running average normalization.
-            norm_epsilon (float): Epsilon for numerical stability in normalization.
             target_landmark_indices (list, optional): List of landmark indices to compute loss for.
                                                       Passed down to sub-losses.
             landmark_weights (torch.Tensor, optional): Tensor of weights for each landmark.
@@ -452,9 +369,6 @@ class CombinedLoss(nn.Module):
         # Pass down parameters to sub-losses
         self.target_landmark_indices = target_landmark_indices
         self.landmark_weights = landmark_weights
-        self.use_loss_normalization = use_loss_normalization
-        self.norm_decay = norm_decay
-        self.norm_epsilon = norm_epsilon
         
         # Calculate scale factor
         self.scale_factor = image_size[0] / output_size[0]  # Assuming square aspect ratio
@@ -463,26 +377,20 @@ class CombinedLoss(nn.Module):
         self.heatmap_loss_fn = AdaptiveWingLoss(
             target_landmark_indices=self.target_landmark_indices,
             landmark_weights=self.landmark_weights,
-            use_loss_normalization=self.use_loss_normalization,
-            norm_decay=self.norm_decay,
-            norm_epsilon=self.norm_epsilon
         )
         self.coord_loss_fn = WingLoss(
             target_landmark_indices=self.target_landmark_indices,
             landmark_weights=self.landmark_weights,
-            use_loss_normalization=self.use_loss_normalization,
-            norm_decay=self.norm_decay,
-            norm_epsilon=self.norm_epsilon
         )
         
         # Remove normalization buffers from CombinedLoss itself if they existed
         # (now handled within sub-losses)
-        if hasattr(self, 'running_avg_heatmap') and hasattr(self, 'register_buffer'): # Check if it's a buffer
-             del self._buffers['running_avg_heatmap']
-        if hasattr(self, 'running_avg_coord') and hasattr(self, 'register_buffer'):
-             del self._buffers['running_avg_coord']
-        if hasattr(self, 'norm_updates') and hasattr(self, 'register_buffer'):
-             del self._buffers['norm_updates']
+        # if hasattr(self, 'running_avg_heatmap') and hasattr(self, 'register_buffer'): # Check if it's a buffer
+             # del self._buffers['running_avg_heatmap']
+        # if hasattr(self, 'running_avg_coord') and hasattr(self, 'register_buffer'):
+             # del self._buffers['running_avg_coord']
+        # if hasattr(self, 'norm_updates') and hasattr(self, 'register_buffer'):
+             # del self._buffers['norm_updates']
 
     def forward(self, pred_dict, target_heatmaps, target_coords, mask=None):
         """
