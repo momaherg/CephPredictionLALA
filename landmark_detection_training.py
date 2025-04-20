@@ -109,6 +109,14 @@ LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
 SAVE_FREQ = 5  # Frequency of saving checkpoints
 
+# Evaluation parameters
+EVAL_CHECKPOINT_PATH = "./outputs/best_model.pth"  # Path to checkpoint for evaluation
+# EVAL_CHECKPOINT_PATH = None  # Set to None to use the model after training
+# Examples:
+# EVAL_CHECKPOINT_PATH = "./outputs/phase3_finetune/best_model_med.pth"  # Phase 3 best model
+# EVAL_CHECKPOINT_PATH = "./outputs/phase2_refinement/best_model_med.pth"  # Phase 2 best model
+# EVAL_CHECKPOINT_PATH = "./outputs/phase1_backbone/best_model_med.pth"   # Phase 1 best model
+
 # Hardware parameters
 USE_MPS = (platform.system() == 'Darwin')  # Automatically use MPS for Mac
 NUM_WORKERS = 0  # Use 0 for single process (more stable)
@@ -523,8 +531,24 @@ else:
 # ## 9. Evaluate the Model
 
 # %%
+# Configuration for evaluation
+# EVAL_CHECKPOINT_PATH = "./outputs/best_model.pth"  # Path to the checkpoint to evaluate
+# Set to None to use the current model (e.g., just after training)
+# EVAL_CHECKPOINT_PATH = None
+
 # Evaluate the model on the test set
 print("Evaluating model on test set...")
+
+# Load checkpoint if specified
+if EVAL_CHECKPOINT_PATH:
+    print(f"Loading checkpoint from: {EVAL_CHECKPOINT_PATH}")
+    try:
+        trainer.load_checkpoint(EVAL_CHECKPOINT_PATH)
+        print(f"Successfully loaded checkpoint.")
+    except Exception as e:
+        print(f"Error loading checkpoint: {str(e)}")
+        print("Proceeding with current model.")
+
 results = trainer.evaluate(test_loader, save_visualizations=True)
 
 # Print evaluation results
@@ -723,6 +747,17 @@ def calibrate_pixels_to_mm(predictions, targets, test_df):
 
 # Extract predictions and targets from test loader for calibration
 print("\nPerforming mm-based calibration using ruler points...")
+
+# Make sure we're using the same evaluation checkpoint
+if EVAL_CHECKPOINT_PATH and not 'checkpoint_loaded' in locals():
+    print(f"Loading checkpoint for mm calibration from: {EVAL_CHECKPOINT_PATH}")
+    try:
+        trainer.load_checkpoint(EVAL_CHECKPOINT_PATH)
+        checkpoint_loaded = True
+        print(f"Successfully loaded checkpoint.")
+    except Exception as e:
+        print(f"Error loading checkpoint: {str(e)}")
+
 all_predictions = []
 all_targets = []
 
