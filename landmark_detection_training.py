@@ -97,8 +97,6 @@ PHASE2_LR = 5e-4    # Learning rate for phase 2 (can be higher since MLP trains 
 # Phase 3: Finetune entire model
 PHASE3_EPOCHS = 10  # Number of epochs for phase 3
 PHASE3_LR = 1e-5    # Learning rate for phase 3 (lower for finetuning)
-# Use same scheduler type for all phases
-PHASE_SCHEDULER_TYPE = SCHEDULER_TYPE  # Can use the same scheduler for all phases
 
 # Class balancing parameters
 BALANCE_CLASSES = True  # Whether to balance training data based on skeletal classes
@@ -121,6 +119,8 @@ LR_PATIENCE = 5  # Patience for ReduceLROnPlateau
 LR_FACTOR = 0.5  # Factor to reduce learning rate for ReduceLROnPlateau
 LR_MIN = 1e-6  # Minimum learning rate for schedulers
 LR_T_MAX = 25  # T_max parameter for CosineAnnealingLR (half of total epochs)
+# Use same scheduler type for all phases
+PHASE_SCHEDULER_TYPE = SCHEDULER_TYPE  # Can use the same scheduler for all phases
 
 # OneCycleLR specific parameters
 MAX_LR = 1e-3  # Maximum learning rate for OneCycleLR (typically 3-10x base learning rate)
@@ -532,6 +532,381 @@ print("\nEvaluation Results:")
 print(f"Mean Euclidean Distance: {results['mean_euclidean_distance']:.2f} pixels")
 print(f"Success Rate (2mm): {results['success_rate_2mm'] * 100:.2f}%")
 print(f"Success Rate (4mm): {results['success_rate_4mm'] * 100:.2f}%")
+
+# %% [markdown]
+# ## 9.1 Calibrated Evaluation (Pixel to mm Conversion)
+# 
+# We use the ruler points from each test image to calibrate the pixel measurements to millimeters.
+# This provides a more accurate error assessment that accounts for individual image scale variations.
+
+# %%
+# Function to calibrate pixel distances to mm using ruler points
+def calibrate_pixels_to_mm(predictions, targets, test_df):
+    """
+    Calibrate pixel distances to millimeters using ruler points for each patient
+    
+    Args:
+        predictions (torch.Tensor): Predicted landmarks (B, N, 2)
+        targets (torch.Tensor): Ground truth landmarks (B, N, 2)
+        test_df (pd.DataFrame): Test dataframe containing ruler point columns
+        
+    Returns:
+        dict: Dictionary with calibrated MED results (overall and per-landmark)
+    """
+    # Convert tensors to numpy arrays
+    predictions = predictions.cpu().numpy()
+    targets = targets.cpu().numpy()
+    
+    # Initialize arrays to store mm-based MEDs
+    batch_size, num_landmarks, _ = predictions.shape
+    patient_meds_mm = []
+    landmark_meds_mm = [[] for _ in range(num_landmarks)]
+    
+    # Reset index to make sure we can iterate directly
+    test_df = test_df.reset_index(drop=True)
+    
+    # Check if ruler point columns exist
+    required_cols = ['ruler_point_up_x', 'ruler_point_up_y', 'ruler_point_down_x', 'ruler_point_down_y']
+    if not all(col in test_df.columns for col in required_cols):
+        print("Warning: Ruler point columns not found in test dataframe. Cannot calibrate to mm.")
+        return None
+    
+    # Special case: Check if patient_id column exists for special ruler lengths
+    has_patient_id = 'patient_id' in test_df.columns
+    
+    # List of patient IDs with 20mm rulers instead of 10mm
+    patients_with_20mm_ruler = ["16", "17", "811"]
+    if has_patient_id:
+        print(f"\nNote: Patients with IDs {', '.join(patients_with_20mm_ruler)} have 20mm rulers instead of 10mm")
+    
+    # Print some statistics about the ruler points
+    print(f"\nRuler point statistics from test_df ({len(test_df)} rows):")
+    for col in required_cols:
+        valid_count = test_df[col].notna().sum()
+        print(f"  {col}: {valid_count}/{len(test_df)} valid values, range: [{test_df[col].min()}-{test_df[col].max()}]")
+    
+    # Count valid patients (with all ruler points)
+    valid_patients = 0
+    invalid_patients = 0
+    skipped_indices = []
+    
+    # Process each patient
+    for i in range(min(batch_size, len(test_df))):
+        try:
+            # Get ruler points (in original 600x600 scale)
+            row = test_df.iloc[i]
+            
+            # Check if all ruler points are valid
+            if any(pd.isna(row[col]) for col in required_cols):
+                print(f"  Skipping patient {i}: Missing ruler point data")
+                skipped_indices.append(i)
+                invalid_patients += 1
+                continue
+                
+            ruler_up_x = float(row['ruler_point_up_x'])
+            ruler_up_y = float(row['ruler_point_up_y'])
+            ruler_down_x = float(row['ruler_point_down_x'])
+            ruler_down_y = float(row['ruler_point_down_y'])
+            
+            # Ensure values are valid
+            if (ruler_up_x <= 0 or ruler_up_y <= 0 or 
+                ruler_down_x <= 0 or ruler_down_y <= 0 or
+                np.isnan(ruler_up_x) or np.isnan(ruler_up_y) or
+                np.isnan(ruler_down_x) or np.isnan(ruler_down_y)):
+                print(f"  Skipping patient {i}: Invalid ruler point values")
+                skipped_indices.append(i)
+                invalid_patients += 1
+                continue
+            
+            # Scale ruler points to 224x224 (same as the landmarks)
+            scale_factor = 224.0 / 600.0
+            scaled_ruler_up_x = ruler_up_x * scale_factor
+            scaled_ruler_up_y = ruler_up_y * scale_factor
+            scaled_ruler_down_x = ruler_down_x * scale_factor
+            scaled_ruler_down_y = ruler_down_y * scale_factor
+            
+            # Calculate pixel distance between ruler points
+            ruler_pixel_distance = np.sqrt(
+                (scaled_ruler_down_x - scaled_ruler_up_x)**2 + 
+                (scaled_ruler_down_y - scaled_ruler_up_y)**2
+            )
+            
+            # Check if ruler pixel distance is valid
+            if ruler_pixel_distance < 1.0:
+                print(f"  Skipping patient {i}: Ruler pixel distance too small ({ruler_pixel_distance:.2f})")
+                skipped_indices.append(i)
+                invalid_patients += 1
+                continue
+            
+            # Determine if this patient has a 20mm ruler based on patient_id
+            ruler_length_mm = 10.0  # Default ruler length
+            if has_patient_id and str(row['patient_id']) in patients_with_20mm_ruler:
+                ruler_length_mm = 20.0
+                print(f"  Using 20mm ruler for patient {i} (ID: {row['patient_id']})")
+            
+            # Calculate mm per pixel ratio (10mm or 20mm depending on patient)
+            mm_per_pixel = ruler_length_mm / ruler_pixel_distance
+            
+            # Calculate per-landmark errors in pixels, then convert to mm
+            pred = predictions[i]
+            target = targets[i]
+            
+            # Calculate Euclidean distances in pixels
+            pixel_distances = np.sqrt(np.sum((pred - target)**2, axis=1))
+            
+            # Convert to mm
+            mm_distances = pixel_distances * mm_per_pixel
+            
+            # Store patient's mean error in mm
+            patient_mean = np.mean(mm_distances)
+            if not np.isnan(patient_mean):
+                patient_meds_mm.append(patient_mean)
+                valid_patients += 1
+            else:
+                print(f"  Skipping patient {i}: NaN in mm distances")
+                skipped_indices.append(i)
+                invalid_patients += 1
+                continue
+            
+            # Store per-landmark errors in mm
+            for j in range(num_landmarks):
+                if not np.isnan(mm_distances[j]):
+                    landmark_meds_mm[j].append(mm_distances[j])
+        except Exception as e:
+            print(f"  Error processing patient {i}: {str(e)}")
+            skipped_indices.append(i)
+            invalid_patients += 1
+    
+    print(f"\nCalibration summary: {valid_patients} valid patients, {invalid_patients} skipped patients")
+    
+    if valid_patients == 0:
+        print("No valid patients with ruler points found. Cannot calibrate to mm.")
+        return None
+    
+    # Calculate overall mean error in mm
+    overall_med_mm = np.mean(patient_meds_mm)
+    
+    # Calculate per-landmark mean errors in mm
+    per_landmark_med_mm = []
+    for landmark_errors in landmark_meds_mm:
+        if landmark_errors:
+            per_landmark_med_mm.append(np.mean(landmark_errors))
+        else:
+            per_landmark_med_mm.append(np.nan)
+    
+    # Flatten the list of landmark errors for calculating success rates
+    all_mm_distances = []
+    for landmark_list in landmark_meds_mm:
+        all_mm_distances.extend(landmark_list)
+    
+    # Calculate success rates using mm values
+    if all_mm_distances:
+        num_landmarks_within_2mm = sum(1 for d in all_mm_distances if d <= 2.0)
+        num_landmarks_within_4mm = sum(1 for d in all_mm_distances if d <= 4.0)
+        total_landmarks = len(all_mm_distances)
+        
+        success_rate_2mm = num_landmarks_within_2mm / total_landmarks
+        success_rate_4mm = num_landmarks_within_4mm / total_landmarks
+    else:
+        success_rate_2mm = 0
+        success_rate_4mm = 0
+    
+    return {
+        'overall_med_mm': overall_med_mm,
+        'per_landmark_med_mm': per_landmark_med_mm,
+        'patient_meds_mm': patient_meds_mm,
+        'success_rate_2mm': success_rate_2mm,
+        'success_rate_4mm': success_rate_4mm,
+        'valid_patients': valid_patients,
+        'invalid_patients': invalid_patients
+    }
+
+# Extract predictions and targets from test loader for calibration
+print("\nPerforming mm-based calibration using ruler points...")
+all_predictions = []
+all_targets = []
+
+with torch.no_grad():
+    for batch in test_loader:
+        # Get images and landmarks
+        images = batch['image'].to(device)
+        target_landmarks = batch['landmarks']
+        
+        # Get predictions
+        predicted_landmarks = trainer.model.predict_landmarks(images)
+        
+        # Store predictions and targets
+        all_predictions.append(predicted_landmarks.cpu())
+        all_targets.append(target_landmarks)
+
+# Concatenate all batches
+all_predictions = torch.cat(all_predictions, dim=0)
+all_targets = torch.cat(all_targets, dim=0)
+
+# Calibrate to mm and calculate metrics
+calibrated_results = calibrate_pixels_to_mm(all_predictions, all_targets, test_df)
+
+if calibrated_results and not np.isnan(calibrated_results['overall_med_mm']):
+    print("\nCalibrated Evaluation Results (in mm):")
+    print(f"Mean Euclidean Distance: {calibrated_results['overall_med_mm']:.2f} mm")
+    print(f"Success Rate (2mm): {calibrated_results['success_rate_2mm'] * 100:.2f}%")
+    print(f"Success Rate (4mm): {calibrated_results['success_rate_4mm'] * 100:.2f}%")
+    print(f"Based on {calibrated_results['valid_patients']} valid patients with ruler calibration")
+    
+    # Print per-landmark MEDs in mm
+    print("\nPer-Landmark Mean Euclidean Distances (mm):")
+    
+    # Get landmark names
+    landmark_names = []
+    for i in range(len(calibrated_results['per_landmark_med_mm'])):
+        if i*2 < len(landmark_cols):
+            name_parts = landmark_cols[i*2].split('_')
+            landmark_names.append(name_parts[0])
+        else:
+            landmark_names.append(f"Landmark {i}")
+    
+    valid_landmarks = []
+    invalid_landmarks = []
+    
+    for i, med_mm in enumerate(calibrated_results['per_landmark_med_mm']):
+        landmark_name = landmark_names[i]
+        if not np.isnan(med_mm):
+            print(f"  {landmark_name}: {med_mm:.2f} mm")
+            valid_landmarks.append((i, landmark_name, med_mm))
+        else:
+            print(f"  {landmark_name}: Could not calculate (insufficient valid data)")
+            invalid_landmarks.append((i, landmark_name))
+    
+    if valid_landmarks:
+        # Create a bar chart of per-landmark MEDs in mm (only for valid landmarks)
+        plt.figure(figsize=(12, 6))
+        valid_indices = [item[0] for item in valid_landmarks]
+        valid_names = [item[1] for item in valid_landmarks]
+        valid_meds = [item[2] for item in valid_landmarks]
+        
+        bars = plt.bar(range(len(valid_meds)), valid_meds)
+        
+        # Color-code bars based on accuracy
+        for i, bar in enumerate(bars):
+            # Green: < 1.5mm, Yellow: 1.5-3mm, Red: > 3mm
+            if valid_meds[i] < 1.5:
+                bar.set_color('green')
+            elif valid_meds[i] < 3.0:
+                bar.set_color('orange')
+            else:
+                bar.set_color('red')
+        
+        plt.axhline(y=calibrated_results['overall_med_mm'], color='blue', linestyle='-', 
+                   label=f'Average: {calibrated_results["overall_med_mm"]:.2f} mm')
+        
+        plt.xticks(range(len(valid_meds)), valid_names, rotation=90)
+        plt.title('Per-Landmark Mean Euclidean Distance (mm)')
+        plt.xlabel('Landmark')
+        plt.ylabel('MED (mm)')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, 'per_landmark_med_mm.png'))
+        plt.show()
+        
+        # Distribution of patient MEDs in mm
+        if len(calibrated_results['patient_meds_mm']) > 1:
+            plt.figure(figsize=(10, 6))
+            plt.hist(calibrated_results['patient_meds_mm'], bins=min(20, len(calibrated_results['patient_meds_mm'])), alpha=0.7)
+            plt.axvline(x=calibrated_results['overall_med_mm'], color='r', linestyle='-',
+                       label=f'Mean: {calibrated_results["overall_med_mm"]:.2f} mm')
+            plt.title('Distribution of Patient Mean Euclidean Distances (mm)')
+            plt.xlabel('MED (mm)')
+            plt.ylabel('Number of Patients')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(OUTPUT_DIR, 'patient_med_distribution_mm.png'))
+            plt.show()
+        
+        # Save calibrated results to a file
+        calibrated_results_df = pd.DataFrame({
+            'landmark': valid_names,
+            'med_mm': valid_meds,
+            'landmark_index': valid_indices
+        })
+        calibrated_results_df.to_csv(os.path.join(OUTPUT_DIR, 'calibrated_results_mm.csv'), index=False)
+        
+        # Add calibrated results to the model config
+        # model_config.update({
+        #     'med_mm': calibrated_results['overall_med_mm'],
+        #     'success_rate_2mm_calibrated': calibrated_results['success_rate_2mm'],
+        #     'success_rate_4mm_calibrated': calibrated_results['success_rate_4mm'],
+        #     'num_calibrated_patients': calibrated_results['valid_patients']
+        # })
+    else:
+        print("No valid landmark measurements after mm calibration.")
+else:
+    print("\nCould not perform accurate mm calibration due to missing or invalid ruler data.")
+    print("Using pixel-based metrics only and approximate mm conversion:")
+    
+    # Fallback: use a standard conversion ratio (approximate)
+    standard_mm_per_pixel = 0.15  # Example value - adjust based on your dataset
+    
+    approx_med_mm = results['mean_euclidean_distance'] * standard_mm_per_pixel
+    print(f"Mean Euclidean Distance (approx): {approx_med_mm:.2f} mm (using standard ratio of {standard_mm_per_pixel} mm/pixel)")
+    
+    # Calculate per-landmark approximate mm metrics
+    if 'per_landmark_stats' in results:
+        print("\nPer-Landmark Approximate Mean Euclidean Distances (mm):")
+        approx_per_landmark_mm = []
+        
+        for i, stats in enumerate(results['per_landmark_stats']):
+            if i*2 < len(landmark_cols):
+                landmark_name = landmark_cols[i*2].split('_')[0]
+            else:
+                landmark_name = f"Landmark {i}"
+                
+            approx_mm = stats['med'] * standard_mm_per_pixel
+            approx_per_landmark_mm.append((i, landmark_name, approx_mm))
+            print(f"  {landmark_name}: {approx_mm:.2f} mm (approx)")
+        
+        # Create a bar chart of approximate per-landmark MEDs in mm
+        plt.figure(figsize=(12, 6))
+        indices = [item[0] for item in approx_per_landmark_mm]
+        names = [item[1] for item in approx_per_landmark_mm]
+        meds = [item[2] for item in approx_per_landmark_mm]
+        
+        bars = plt.bar(range(len(meds)), meds)
+        
+        # Color-code bars based on accuracy
+        for i, bar in enumerate(bars):
+            # Green: < 1.5mm, Yellow: 1.5-3mm, Red: > 3mm
+            if meds[i] < 1.5:
+                bar.set_color('green')
+            elif meds[i] < 3.0:
+                bar.set_color('orange')
+            else:
+                bar.set_color('red')
+                
+        plt.axhline(y=approx_med_mm, color='blue', linestyle='-', 
+                   label=f'Average: {approx_med_mm:.2f} mm (approx)')
+        
+        plt.xticks(range(len(meds)), names, rotation=90)
+        plt.title('Per-Landmark Approximate Mean Euclidean Distance (mm)')
+        plt.xlabel('Landmark')
+        plt.ylabel('MED (mm) - Approximate')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, 'per_landmark_med_mm_approx.png'))
+        plt.show()
+        
+        # Save approximate results to a file
+        approx_results_df = pd.DataFrame({
+            'landmark': names,
+            'med_mm_approx': meds,
+            'landmark_index': indices
+        })
+        approx_results_df.to_csv(os.path.join(OUTPUT_DIR, 'approx_results_mm.csv'), index=False)
+        
+        # Add approximate calibrated results to the model config
+        # model_config.update({
+        #     'med_mm_approx': approx_med_mm,
+        #     'standard_mm_per_pixel': standard_mm_per_pixel
+        # })
 
 # %% [markdown]
 # ## 10. Visualize Results
