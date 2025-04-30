@@ -140,9 +140,7 @@ def train_rgb_stream(data_processor, train_loader, val_loader, config):
         num_landmarks=config['num_landmarks'],
         pretrained=config['pretrained'],
         use_refinement=False,  # No refinement during separate training
-        hrnet_type=config['hrnet_type'],
-        use_rgb_features=True,
-        use_depth=False  # RGB-only
+        hrnet_type=config['hrnet_type']
     )
     
     # Move model to the correct device
@@ -205,9 +203,7 @@ def train_depth_stream(data_processor, train_loader, val_loader, config):
         num_landmarks=config['num_landmarks'],
         pretrained=config['pretrained'],
         use_refinement=False,  # No refinement during separate training
-        hrnet_type=config['hrnet_type'],
-        use_rgb_features=False,  # Depth-only
-        use_depth=True
+        hrnet_type=config['hrnet_type']
     )
     
     # Move model to the correct device
@@ -510,9 +506,7 @@ def run_phased_training(config=None, data_processor=None, train_loader=None, val
             num_landmarks=config['num_landmarks'],
             pretrained=config['pretrained'],
             use_refinement=False,
-            hrnet_type=config['hrnet_type'],
-            use_rgb_features=True,
-            use_depth=False
+            hrnet_type=config['hrnet_type']
         )
         
         # Move model to specified device
@@ -520,7 +514,7 @@ def run_phased_training(config=None, data_processor=None, train_loader=None, val
         
         # Load pretrained weights if path is provided
         if config.get('rgb_model_path'):
-            checkpoint = torch.load(config['rgb_model_path'], map_location=config['device'], weights_only=False)
+            checkpoint = torch.load(config['rgb_model_path'], map_location=config['device'])
             if 'model_state_dict' in checkpoint:
                 rgb_model.load_state_dict(checkpoint['model_state_dict'])
             else:
@@ -541,9 +535,7 @@ def run_phased_training(config=None, data_processor=None, train_loader=None, val
             num_landmarks=config['num_landmarks'],
             pretrained=config['pretrained'],
             use_refinement=False,
-            hrnet_type=config['hrnet_type'],
-            use_rgb_features=False,
-            use_depth=True
+            hrnet_type=config['hrnet_type']
         )
         
         # Move model to specified device
