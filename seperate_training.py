@@ -15,7 +15,7 @@ import sys
 sys.path.append('/content/CephPredictionLALA/')
 
 # Import model components
-from src.models.hrnet import HRNet, DepthHRNet, RefinementMLP, LandmarkHeatmapNet, create_hrnet_model
+from src.models.hrnet import HRNet, RefinementMLP, LandmarkHeatmapNet, create_hrnet_model
 from src.models.losses import AdaptiveWingLoss, WingLoss, CombinedLoss
 from src.models.trainer import LandmarkTrainer
 
@@ -520,7 +520,7 @@ def run_phased_training(config=None, data_processor=None, train_loader=None, val
         
         # Load pretrained weights if path is provided
         if config.get('rgb_model_path'):
-            checkpoint = torch.load(config['rgb_model_path'], map_location=config['device'])
+            checkpoint = torch.load(config['rgb_model_path'], map_location=config['device'], weights_only=False)
             if 'model_state_dict' in checkpoint:
                 rgb_model.load_state_dict(checkpoint['model_state_dict'])
             else:

@@ -661,7 +661,7 @@ class LandmarkTrainer:
         Args:
             path (str): Path to the checkpoint
         """
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        checkpoint = torch.load(path, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         
         # Check if optimizers match, warn if they don't

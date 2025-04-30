@@ -109,14 +109,6 @@ LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
 SAVE_FREQ = 5  # Frequency of saving checkpoints
 
-# Evaluation parameters
-EVAL_CHECKPOINT_PATH = "./outputs/best_model.pth"  # Path to checkpoint for evaluation
-# EVAL_CHECKPOINT_PATH = None  # Set to None to use the model after training
-# Examples:
-# EVAL_CHECKPOINT_PATH = "./outputs/phase3_finetune/best_model_med.pth"  # Phase 3 best model
-# EVAL_CHECKPOINT_PATH = "./outputs/phase2_refinement/best_model_med.pth"  # Phase 2 best model
-# EVAL_CHECKPOINT_PATH = "./outputs/phase1_backbone/best_model_med.pth"   # Phase 1 best model
-
 # Hardware parameters
 USE_MPS = (platform.system() == 'Darwin')  # Automatically use MPS for Mac
 NUM_WORKERS = 0  # Use 0 for single process (more stable)
@@ -529,26 +521,70 @@ else:
 
 # %% [markdown]
 # ## 9. Evaluate the Model
+# 
+# In this section, we evaluate the trained model's performance on the test set.
+# You can optionally specify a checkpoint path to evaluate a previously trained model.
 
 # %%
-# Configuration for evaluation
-# EVAL_CHECKPOINT_PATH = "./outputs/best_model.pth"  # Path to the checkpoint to evaluate
-# Set to None to use the current model (e.g., just after training)
-# EVAL_CHECKPOINT_PATH = None
+# Function to find the best checkpoint in a directory
+def find_best_checkpoint(base_dir, prefer_med=True):
+    """
+    Find the best checkpoint in the specified directory.
+    
+    Args:
+        base_dir (str): Base directory to search for checkpoints
+        prefer_med (bool): If True, prefer 'best_model_med.pth' over 'best_model_loss.pth'
+        
+    Returns:
+        str or None: Path to the best checkpoint or None if not found
+    """
+    # Order of preference
+    if prefer_med:
+        checkpoint_names = ['best_model_med.pth', 'best_model_loss.pth', 'best_model.pth', 'final_model.pth']
+    else:
+        checkpoint_names = ['best_model_loss.pth', 'best_model_med.pth', 'best_model.pth', 'final_model.pth']
+    
+    # If using multi-phase training, prioritize phase3, then phase2, then phase1
+    if ENABLE_MULTI_PHASE_TRAINING:
+        search_dirs = [
+            os.path.join(base_dir, 'phase3_finetune'),
+            os.path.join(base_dir, 'phase2_refinement'),
+            os.path.join(base_dir, 'phase1_backbone'),
+            base_dir
+        ]
+    else:
+        search_dirs = [base_dir]
+    
+    # Find the first available checkpoint based on preference order
+    for directory in search_dirs:
+        if not os.path.exists(directory):
+            continue
+        
+        for checkpoint_name in checkpoint_names:
+            checkpoint_path = os.path.join(directory, checkpoint_name)
+            if os.path.exists(checkpoint_path):
+                return checkpoint_path
+    
+    return None
 
-# Evaluate the model on the test set
-print("Evaluating model on test set...")
+# Checkpoint path for evaluation (set to None to evaluate the just-trained model)
+# If None, will try to find the best available checkpoint in the OUTPUT_DIR
+EVAL_CHECKPOINT_PATH = "path/to/your/checkpoint.pth"
 
-# Load checkpoint if specified
-if EVAL_CHECKPOINT_PATH:
-    print(f"Loading checkpoint from: {EVAL_CHECKPOINT_PATH}")
+# Load checkpoint for evaluation if specified
+if EVAL_CHECKPOINT_PATH is not None:
+    print(f"\nLoading checkpoint for evaluation: {EVAL_CHECKPOINT_PATH}")
     try:
         trainer.load_checkpoint(EVAL_CHECKPOINT_PATH)
-        print(f"Successfully loaded checkpoint.")
+        print("Checkpoint loaded successfully!")
     except Exception as e:
         print(f"Error loading checkpoint: {str(e)}")
-        print("Proceeding with current model.")
+        print("Falling back to the current model state.")
+else:
+    print("\nNo checkpoint specified for evaluation. Using current model state.")
 
+# Evaluate the model on the test set
+print("\nEvaluating model on test set...")
 results = trainer.evaluate(test_loader, save_visualizations=True)
 
 # Print evaluation results
@@ -747,17 +783,6 @@ def calibrate_pixels_to_mm(predictions, targets, test_df):
 
 # Extract predictions and targets from test loader for calibration
 print("\nPerforming mm-based calibration using ruler points...")
-
-# Make sure we're using the same evaluation checkpoint
-if EVAL_CHECKPOINT_PATH and not 'checkpoint_loaded' in locals():
-    print(f"Loading checkpoint for mm calibration from: {EVAL_CHECKPOINT_PATH}")
-    try:
-        trainer.load_checkpoint(EVAL_CHECKPOINT_PATH)
-        checkpoint_loaded = True
-        print(f"Successfully loaded checkpoint.")
-    except Exception as e:
-        print(f"Error loading checkpoint: {str(e)}")
-
 all_predictions = []
 all_targets = []
 
